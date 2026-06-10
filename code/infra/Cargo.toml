@@ -1,0 +1,33 @@
+[package]
+name = "infra"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+domain.path = "../domain"
+reqwest = { version = "0.13.4", features = ["json", "query", "socks"] }
+chrono = "0"
+
+deadpool-postgres = "*"
+refinery = { version = "0", features = ["tokio-postgres"] }
+tokio-postgres = { version = "0", features = ["with-uuid-1", "with-chrono-0_4"] }
+bs58 = "0"
+sha2 = "0"
+hex = "0"
+moka = { version = "0.12", features = ["future"] }
+
+uuid.workspace = true
+tokio.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+
+anyhow.workspace = true
+
+http.workspace = true
+
+bon.workspace = true
+
+async-trait.workspace = true
+alloy.workspace = true
+tracing.workspace = true

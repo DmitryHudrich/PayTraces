@@ -1,0 +1,18 @@
+[package]
+name = "domain"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bytes.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+alloy.workspace = true
+uint.workspace = true
+chrono.workspace  = true
+uuid.workspace = true
+
+hex = "0"
+reqwest = "0" # only errors
+petgraph = "0"

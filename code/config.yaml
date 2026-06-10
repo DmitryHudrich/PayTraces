@@ -1,0 +1,40 @@
+server:
+  host: "0.0.0.0"
+  port: 8080
+
+log:
+  directives:
+    - "warn"
+    - "api=debug"
+    - "infra=debug"
+    - "domain=debug"
+    - "usecase=debug"
+
+moralis:
+  base_url: "https://deep-index.moralis.io/api/v2.2"
+  api_key: ~
+  cache:
+    page_ttl_secs: 86400
+    page_max_capacity: 10000
+    latest_block_ttl_secs: 15
+    block_cache_max_capacity: 5000
+    block_cache_ttl_secs: 604800
+    file_cache:
+      enabled: true
+      dir: "./moralis_cache"
+
+tron:
+  base_url: "https://api.trongrid.io"
+  api_key: ~
+  cache:
+    page_ttl_secs: 86400
+    page_max_capacity: 10000
+    latest_block_ttl_secs: 15
+    block_cache_max_capacity: 5000
+    block_cache_ttl_secs: 604800
+
+proxy:
+  socks_url: "socks5://127.0.0.1:2080"
+
+database:
+  url: "postgres://wallet:wallet@localhost:5432/wallet_db"

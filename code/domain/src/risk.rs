@@ -5,10 +5,10 @@ use chrono::{DateTime, Utc};
 
 #[derive(Debug, Clone)]
 pub struct RiskReport {
-    pub subject: Address,
-    pub overall_score: RiskScore,
-    pub signals: Vec<RiskSignal>,
-    pub generated_at: DateTime<Utc>,
+    subject: Address,
+    overall_score: RiskScore,
+    signals: Vec<RiskSignal>,
+    generated_at: DateTime<Utc>,
 }
 
 impl RiskReport {
@@ -26,8 +26,28 @@ impl RiskReport {
         if signals.is_empty() {
             return RiskScore::CLEAN;
         }
-        let max = signals.iter().map(|s| s.severity.value()).max().unwrap_or(0);
+        let max = signals
+            .iter()
+            .map(|s| s.severity.value())
+            .max()
+            .unwrap_or(0);
         RiskScore::new(max)
+    }
+
+    pub fn subject(&self) -> &Address {
+        &self.subject
+    }
+
+    pub fn overall_score(&self) -> RiskScore {
+        self.overall_score
+    }
+
+    pub fn signals(&self) -> &[RiskSignal] {
+        &self.signals
+    }
+
+    pub fn generated_at(&self) -> DateTime<Utc> {
+        self.generated_at
     }
 
     pub fn is_high_risk(&self) -> bool {
@@ -37,10 +57,42 @@ impl RiskReport {
 
 #[derive(Debug, Clone)]
 pub struct RiskSignal {
-    pub kind: RiskSignalKind,
-    pub severity: RiskScore,
-    pub description: String,
-    pub evidence: RiskEvidence,
+    kind: RiskSignalKind,
+    severity: RiskScore,
+    description: String,
+    evidence: RiskEvidence,
+}
+
+impl RiskSignal {
+    pub fn new(
+        kind: RiskSignalKind,
+        severity: RiskScore,
+        description: String,
+        evidence: RiskEvidence,
+    ) -> Self {
+        Self {
+            kind,
+            severity,
+            description,
+            evidence,
+        }
+    }
+
+    pub fn kind(&self) -> &RiskSignalKind {
+        &self.kind
+    }
+
+    pub fn severity(&self) -> RiskScore {
+        self.severity
+    }
+
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+
+    pub fn evidence(&self) -> &RiskEvidence {
+        &self.evidence
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,4 +115,3 @@ pub enum RiskEvidence {
     TransactionPattern(String),
     Manual(String),
 }
-

@@ -9,8 +9,8 @@ use chrono::{DateTime, Utc};
 
 #[derive(Debug, Clone, Copy)]
 pub struct BlockRange {
-    pub from_height: u64,
-    pub to_height: u64,
+    from_height: u64,
+    to_height: u64,
 }
 
 impl BlockRange {
@@ -27,6 +27,14 @@ impl BlockRange {
             from_height: height,
             to_height: height,
         }
+    }
+
+    pub fn from_height(&self) -> u64 {
+        self.from_height
+    }
+
+    pub fn to_height(&self) -> u64 {
+        self.to_height
     }
 }
 
@@ -50,11 +58,7 @@ pub trait TransferRepository: Send + Sync {
         addr: &Address,
         range: Option<BlockRange>,
     ) -> DomainResult<Vec<Transfer>>;
-    async fn find_by_tx(
-        &self,
-        chain: ChainId,
-        tx_hash: &[u8; 32],
-    ) -> DomainResult<Vec<Transfer>>;
+    async fn find_by_tx(&self, chain: ChainId, tx_hash: &[u8; 32]) -> DomainResult<Vec<Transfer>>;
     async fn find_outgoing(
         &self,
         addr: &Address,
@@ -83,9 +87,5 @@ pub trait AssetRepository: Send + Sync {
 
 #[async_trait]
 pub trait LabelProvider: Send + Sync {
-    async fn resolve(
-        &self,
-        addr: &Address,
-    ) -> DomainResult<Option<crate::entity::EntityLabel>>;
+    async fn resolve(&self, addr: &Address) -> DomainResult<Option<crate::entity::EntityLabel>>;
 }
-

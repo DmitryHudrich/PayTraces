@@ -12,7 +12,7 @@ use domain::transfer::{Finality, Transfer, TransferId, TransferKind};
 use crate::{pg_err, pool_err};
 
 fn addr_str(addr: &Address) -> String {
-    format!("0x{}", hex::encode(&addr.bytes))
+    format!("0x{}", hex::encode(addr.bytes()))
 }
 
 const COLS: &str = "chain_id, tx_hash, idx, from_addr, to_addr, asset_contract, \
@@ -66,42 +66,43 @@ impl TransferRepository for PostgresTransferRepository {
         let mut finalities: Vec<&'static str> = Vec::with_capacity(n);
 
         for t in transfers {
-            chain_ids.push(t.chain.0 as i32);
-            tx_hashes.push(t.tx_ref.hash.to_vec());
-            idxs.push(t.id.index as i32);
-            froms.push(t.from.bytes.clone());
-            tos.push(t.to.bytes.clone());
-            contracts.push(match &t.asset.kind {
+            chain_ids.push(t.chain().value() as i32);
+            tx_hashes.push(t.tx_ref().hash().to_vec());
+            idxs.push(t.id().index() as i32);
+            froms.push(t.from().bytes().to_vec());
+            tos.push(t.to().bytes().to_vec());
+            contracts.push(match t.asset().kind() {
                 AssetKind::Contract(b) => Some(b.clone()),
                 _ => None,
             });
-            amounts.push(t.amount.raw.to_string());
-            decimals.push(t.amount.decimals as i16);
-            heights.push(t.block.height as i64);
-            block_hashes.push(t.block.hash.to_vec());
-            timestamps.push(t.timestamp);
-            kinds.push(match &t.kind {
+            amounts.push(t.amount().raw().to_string());
+            decimals.push(t.amount().decimals() as i16);
+            heights.push(t.block().height() as i64);
+            block_hashes.push(t.block().hash().to_vec());
+            timestamps.push(t.timestamp());
+            kinds.push(match t.kind() {
                 TransferKind::Native => "native",
                 TransferKind::Internal => "internal",
                 TransferKind::Token { .. } => "token",
                 TransferKind::Fee => "fee",
                 TransferKind::UtxoEdge { .. } => "utxo_edge",
             });
-            standards.push(match &t.kind {
+            standards.push(match t.kind() {
                 TransferKind::Token { standard, .. } => {
                     Some(format!("{standard:?}").to_lowercase())
                 }
                 _ => None,
             });
-            let (vin_i, vout_i) = match &t.kind {
-                TransferKind::UtxoEdge { vin_index, vout_index } => {
-                    (Some(*vin_index as i32), Some(*vout_index as i32))
-                }
+            let (vin_i, vout_i) = match t.kind() {
+                TransferKind::UtxoEdge {
+                    vin_index,
+                    vout_index,
+                } => (Some(*vin_index as i32), Some(*vout_index as i32)),
                 _ => (None, None),
             };
             vin_idxs.push(vin_i);
             vout_idxs.push(vout_i);
-            finalities.push(match t.finality {
+            finalities.push(match t.finality() {
                 Finality::Confirmed => "confirmed",
                 Finality::Unconfirmed => "unconfirmed",
                 Finality::Reorged => "reorged",
@@ -161,11 +162,10 @@ impl TransferRepository for PostgresTransferRepository {
     ) -> DomainResult<Vec<Transfer>> {
         let client = self.pool.get().await.map_err(pool_err)?;
 
-        
         let (from_h, to_h) = match range {
             Some(r) => (
-                r.from_height.min(i64::MAX as u64) as i64,
-                r.to_height.min(i64::MAX as u64) as i64,
+                r.from_height().min(i64::MAX as u64) as i64,
+                r.to_height().min(i64::MAX as u64) as i64,
             ),
             None => (0_i64, i64::MAX),
         };
@@ -181,7 +181,12 @@ impl TransferRepository for PostgresTransferRepository {
                        AND block_height BETWEEN $3 AND $4
                      ORDER BY block_height, idx"
                 ),
-                &[&(addr.chain.0 as i32), &addr.bytes, &from_h, &to_h],
+                &[
+                    &(addr.chain().value() as i32),
+                    &addr.bytes(),
+                    &from_h,
+                    &to_h,
+                ],
             )
             .await
             .map_err(pg_err)?;
@@ -193,7 +198,7 @@ impl TransferRepository for PostgresTransferRepository {
     async fn find_by_tx(&self, chain: ChainId, tx_hash: &[u8; 32]) -> DomainResult<Vec<Transfer>> {
         let client = self.pool.get().await.map_err(pool_err)?;
 
-        tracing::debug!(chain = chain.0, tx = %hex::encode(tx_hash), "find_by_tx");
+        tracing::debug!(chain = chain.value(), tx = %hex::encode(tx_hash), "find_by_tx");
 
         let rows = client
             .query(
@@ -202,7 +207,7 @@ impl TransferRepository for PostgresTransferRepository {
                      WHERE chain_id = $1 AND tx_hash = $2
                      ORDER BY idx"
                 ),
-                &[&(chain.0 as i32), &&tx_hash[..]],
+                &[&(chain.value() as i32), &&tx_hash[..]],
             )
             .await
             .map_err(pg_err)?;
@@ -250,7 +255,7 @@ impl PostgresTransferRepository {
                        AND ($3::timestamptz IS NULL OR ts > $3)
                      ORDER BY ts, idx"
                 ),
-                &[&(addr.chain.0 as i32), &addr.bytes, &after],
+                &[&(addr.chain().value() as i32), &addr.bytes(), &after],
             )
             .await
             .map_err(pg_err)?;
@@ -260,12 +265,8 @@ impl PostgresTransferRepository {
     }
 }
 
-
-
-
-
 fn row_to_transfer(row: &tokio_postgres::Row) -> DomainResult<Transfer> {
-    let chain = ChainId(row.get::<_, i32>("chain_id") as u32);
+    let chain = ChainId::new(row.get::<_, i32>("chain_id") as u32);
 
     let tx_hash = bytes32(row.get("tx_hash"), "tx_hash")?;
     let idx = row.get::<_, i32>("idx") as u32;
@@ -275,10 +276,7 @@ fn row_to_transfer(row: &tokio_postgres::Row) -> DomainResult<Transfer> {
 
     let asset_contract: Option<Vec<u8>> = row.get("asset_contract");
     let asset = match &asset_contract {
-        Some(b) => AssetId {
-            chain,
-            kind: AssetKind::Contract(b.clone()),
-        },
+        Some(b) => AssetId::contract(chain, b.clone()),
         None => AssetId::native(chain),
     };
 
@@ -286,62 +284,64 @@ fn row_to_transfer(row: &tokio_postgres::Row) -> DomainResult<Transfer> {
         .map_err(|e| DomainError::InsufficientData(format!("amount parse: {e}")))?;
     let amount = Amount::new(raw, row.get::<_, i16>("decimals") as u8);
 
-    let block = BlockRef {
+    let block = BlockRef::new(
         chain,
-        height: row.get::<_, i64>("block_height") as u64,
-        hash: bytes32(row.get("block_hash"), "block_hash")?,
-    };
+        row.get::<_, i64>("block_height") as u64,
+        bytes32(row.get("block_hash"), "block_hash")?,
+    );
 
     let timestamp: DateTime<Utc> = row.get("ts");
 
-    let kind = match row.get::<_, &str>("kind") {
-        "native" => TransferKind::Native,
-        "internal" => TransferKind::Internal,
-        "fee" => TransferKind::Fee,
-        "utxo_edge" => {
-            let vin_index = row
-                .get::<_, Option<i32>>("vin_idx")
-                .ok_or_else(|| DomainError::InsufficientData("utxo_edge missing vin_idx".into()))?
-                as u32;
-            let vout_index = row
-                .get::<_, Option<i32>>("vout_idx")
-                .ok_or_else(|| DomainError::InsufficientData("utxo_edge missing vout_idx".into()))?
-                as u32;
-            TransferKind::UtxoEdge { vin_index, vout_index }
-        }
-        "token" => {
-            let contract_bytes = asset_contract.clone().ok_or_else(|| {
-                DomainError::InsufficientData("token transfer without asset_contract".into())
-            })?;
-            let standard = match row.get::<_, Option<&str>>("token_standard") {
-                Some("erc20") => TokenStandard::Erc20,
-                Some("erc721") => TokenStandard::Erc721,
-                Some("erc1155") => TokenStandard::Erc1155,
-                Some("trc20") => TokenStandard::Trc20,
-                Some("trc10") => TokenStandard::Trc10,
-                Some("spl") => TokenStandard::Spl,
-                Some(other) => {
-                    return Err(DomainError::InsufficientData(format!(
-                        "unknown token standard: {other}"
-                    )));
+    let kind =
+        match row.get::<_, &str>("kind") {
+            "native" => TransferKind::Native,
+            "internal" => TransferKind::Internal,
+            "fee" => TransferKind::Fee,
+            "utxo_edge" => {
+                let vin_index = row.get::<_, Option<i32>>("vin_idx").ok_or_else(|| {
+                    DomainError::InsufficientData("utxo_edge missing vin_idx".into())
+                })? as u32;
+                let vout_index = row.get::<_, Option<i32>>("vout_idx").ok_or_else(|| {
+                    DomainError::InsufficientData("utxo_edge missing vout_idx".into())
+                })? as u32;
+                TransferKind::UtxoEdge {
+                    vin_index,
+                    vout_index,
                 }
-                None => {
-                    return Err(DomainError::InsufficientData(
-                        "token transfer without token_standard".into(),
-                    ));
-                }
-            };
-            TransferKind::Token {
-                contract: Address::new(chain, contract_bytes),
-                standard,
             }
-        }
-        other => {
-            return Err(DomainError::InsufficientData(format!(
-                "unknown transfer kind: {other}"
-            )));
-        }
-    };
+            "token" => {
+                let contract_bytes = asset_contract.clone().ok_or_else(|| {
+                    DomainError::InsufficientData("token transfer without asset_contract".into())
+                })?;
+                let standard = match row.get::<_, Option<&str>>("token_standard") {
+                    Some("erc20") => TokenStandard::Erc20,
+                    Some("erc721") => TokenStandard::Erc721,
+                    Some("erc1155") => TokenStandard::Erc1155,
+                    Some("trc20") => TokenStandard::Trc20,
+                    Some("trc10") => TokenStandard::Trc10,
+                    Some("spl") => TokenStandard::Spl,
+                    Some(other) => {
+                        return Err(DomainError::InsufficientData(format!(
+                            "unknown token standard: {other}"
+                        )));
+                    }
+                    None => {
+                        return Err(DomainError::InsufficientData(
+                            "token transfer without token_standard".into(),
+                        ));
+                    }
+                };
+                TransferKind::Token {
+                    contract: Address::new(chain, contract_bytes),
+                    standard,
+                }
+            }
+            other => {
+                return Err(DomainError::InsufficientData(format!(
+                    "unknown transfer kind: {other}"
+                )));
+            }
+        };
 
     let finality = match row.get::<_, &str>("finality") {
         "confirmed" => Finality::Confirmed,
@@ -355,13 +355,10 @@ fn row_to_transfer(row: &tokio_postgres::Row) -> DomainResult<Transfer> {
         }
     };
 
-    Ok(Transfer {
-        id: TransferId::new(chain, tx_hash, idx),
+    Ok(Transfer::new(
+        TransferId::new(chain, tx_hash, idx),
         chain,
-        tx_ref: TxRef {
-            chain,
-            hash: tx_hash,
-        },
+        TxRef::new(chain, tx_hash),
         from,
         to,
         asset,
@@ -370,7 +367,7 @@ fn row_to_transfer(row: &tokio_postgres::Row) -> DomainResult<Transfer> {
         timestamp,
         kind,
         finality,
-    })
+    ))
 }
 
 fn bytes32(v: Vec<u8>, field: &str) -> DomainResult<[u8; 32]> {

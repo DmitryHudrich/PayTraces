@@ -24,4 +24,3 @@ pub enum DomainError {
 }
 
 pub type DomainResult<T> = Result<T, DomainError>;
-

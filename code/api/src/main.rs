@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use axum::{
     Router,
     extract::{Query, State},
@@ -230,7 +233,7 @@ pub async fn get_graph(
     State(state): State<Arc<AppState>>,
     Query(q): Query<GraphQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let chain = ChainId(q.chain_id.unwrap_or(ChainId::ETH.0));
+    let chain = ChainId::new(q.chain_id.unwrap_or(ChainId::ETH.value()));
     let addr = parse_address(&q.address, chain)?;
 
     let range = match (q.from_block, q.to_block) {
@@ -251,21 +254,21 @@ pub async fn get_graph(
         .await
         .map_err(ApiError::Internal)?;
 
-    let nodes: Vec<_> = graph.nodes.iter().map(|a| hex::encode(&a.bytes)).collect();
+    let nodes: Vec<_> = graph.nodes.iter().map(|a| hex::encode(a.bytes())).collect();
     let edges: Vec<_> = graph
         .edges
         .iter()
         .map(|t| {
             serde_json::json!({
-                "tx_hash":  hex::encode(t.tx_ref.hash),
-                "index":    t.id.index,
-                "from":     hex::encode(&t.from.bytes),
-                "to":       hex::encode(&t.to.bytes),
-                "amount":   t.amount.raw.to_string(),
-                "decimals": t.amount.decimals,
-                "block":    t.block.height,
-                "ts":       t.timestamp.timestamp(),
-                "kind":     format!("{:?}", t.kind),
+                "tx_hash":  hex::encode(t.tx_ref().hash()),
+                "index":    t.id().index(),
+                "from":     hex::encode(t.from().bytes()),
+                "to":       hex::encode(t.to().bytes()),
+                "amount":   t.amount().raw().to_string(),
+                "decimals": t.amount().decimals(),
+                "block":    t.block().height(),
+                "ts":       t.timestamp().timestamp(),
+                "kind":     format!("{:?}", t.kind()),
             })
         })
         .collect();
@@ -297,7 +300,7 @@ pub async fn score_address(
     State(state): State<Arc<AppState>>,
     Query(q): Query<ScoreQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let chain = ChainId(q.chain_id.unwrap_or(ChainId::ETH.0));
+    let chain = ChainId::new(q.chain_id.unwrap_or(ChainId::ETH.value()));
     let addr = parse_address(&q.address, chain)?;
 
     let report = state
@@ -307,23 +310,23 @@ pub async fn score_address(
         .map_err(ApiError::Internal)?;
 
     let signals: Vec<_> = report
-        .signals
+        .signals()
         .iter()
         .map(|s| {
             serde_json::json!({
-                "kind":        format!("{:?}", s.kind),
-                "severity":    s.severity.value(),
-                "description": s.description,
+                "kind":        format!("{:?}", s.kind()),
+                "severity":    s.severity().value(),
+                "description": s.description(),
             })
         })
         .collect();
 
     Ok(axum::Json(serde_json::json!({
-        "address":      hex::encode(&report.subject.bytes),
-        "score":        report.overall_score.value(),
+        "address":      hex::encode(report.subject().bytes()),
+        "score":        report.overall_score().value(),
         "is_high_risk": report.is_high_risk(),
         "signals":      signals,
-        "generated_at": report.generated_at.to_rfc3339(),
+        "generated_at": report.generated_at().to_rfc3339(),
     })))
 }
 
@@ -346,7 +349,7 @@ pub async fn check_sanctions(
     State(state): State<Arc<AppState>>,
     Query(q): Query<SanctionsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let chain = ChainId(q.chain_id.unwrap_or(ChainId::ETH.0));
+    let chain = ChainId::new(q.chain_id.unwrap_or(ChainId::ETH.value()));
     let addr = parse_address(&q.address, chain)?;
 
     let result = state
@@ -356,7 +359,7 @@ pub async fn check_sanctions(
         .map_err(ApiError::Internal)?;
 
     Ok(axum::Json(serde_json::json!({
-        "address":       hex::encode(&result.address.bytes),
+        "address":       hex::encode(result.address.bytes()),
         "is_sanctioned": result.is_sanctioned,
         "sanction_list": result.sanction_list.as_ref().map(|l| format!("{:?}", l)),
         "label":         result.label,
@@ -388,7 +391,7 @@ pub async fn trace_funds(
     State(state): State<Arc<AppState>>,
     Query(q): Query<TraceQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let chain = ChainId(q.chain_id.unwrap_or(ChainId::ETH.0));
+    let chain = ChainId::new(q.chain_id.unwrap_or(ChainId::ETH.value()));
     let addr = parse_address(&q.address, chain)?;
 
     let direction = match q.direction.as_deref().unwrap_or("forward") {
@@ -408,57 +411,57 @@ pub async fn trace_funds(
 
     let result = state
         .trace
-        .execute(TraceRequest {
-            origin: TraceOrigin::Address(addr),
+        .execute(TraceRequest::new(
+            TraceOrigin::Address(addr),
             direction,
             strategy,
-            limits: TraceLimits {
-                max_hops: q.max_hops.unwrap_or(10),
-                max_addresses: q.max_addresses.unwrap_or(1_000),
-                max_paths: 500,
-                min_amount_ratio: Some(Ratio::from_percent(1)),
-            },
-            include_unconfirmed: false,
-        })
+            TraceLimits::new(
+                q.max_hops.unwrap_or(10),
+                q.max_addresses.unwrap_or(1_000),
+                500,
+                Some(Ratio::from_percent(1)),
+            ),
+            false,
+        ))
         .await
         .map_err(ApiError::Internal)?;
 
     let sinks: Vec<_> = result
-        .terminal_sinks
+        .terminal_sinks()
         .iter()
         .map(|s| {
             serde_json::json!({
-                "address":        hex::encode(&s.address.bytes),
-                "kind":           format!("{:?}", s.kind),
+                "address":        hex::encode(s.address().bytes()),
+                "kind":           format!("{:?}", s.kind()),
                 "risk_score":     s.risk_score(),
-                "tainted_amount": s.tainted_amount.raw.to_string(),
-                "taint_ratio":    s.taint_ratio.as_f64(),
+                "tainted_amount": s.tainted_amount().raw().to_string(),
+                "taint_ratio":    s.taint_ratio().as_f64(),
             })
         })
         .collect();
 
     let paths: Vec<_> = result
-        .paths
+        .paths()
         .iter()
         .map(|p| {
             serde_json::json!({
-                "depth":          p.depth,
-                "tainted_amount": p.tainted_amount.raw.to_string(),
-                "taint_ratio":    p.taint_ratio.as_f64(),
-                "hops":           p.hops.len(),
-                "origin":         p.origin().map(|a| hex::encode(&a.bytes)),
-                "destination":    p.destination().map(|a| hex::encode(&a.bytes)),
+                "depth":          p.depth(),
+                "tainted_amount": p.tainted_amount().raw().to_string(),
+                "taint_ratio":    p.taint_ratio().as_f64(),
+                "hops":           p.hops().len(),
+                "origin":         p.origin().map(|a| hex::encode(a.bytes())),
+                "destination":    p.destination().map(|a| hex::encode(a.bytes())),
             })
         })
         .collect();
 
     Ok(axum::Json(serde_json::json!({
         "stats": {
-            "addresses_visited":   result.stats.addresses_visited,
-            "transfers_evaluated": result.stats.transfers_evaluated,
-            "paths_found":         result.stats.paths_found,
-            "depth_reached":       result.stats.depth_reached,
-            "truncated":           result.stats.truncated,
+            "addresses_visited":   result.stats().addresses_visited(),
+            "transfers_evaluated": result.stats().transfers_evaluated(),
+            "paths_found":         result.stats().paths_found(),
+            "depth_reached":       result.stats().depth_reached(),
+            "truncated":           result.stats().truncated(),
         },
         "sinks": sinks,
         "paths": paths,

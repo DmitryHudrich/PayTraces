@@ -2,11 +2,25 @@ use crate::primitives::{Address, Confidence};
 use std::collections::HashSet;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct EntityId(pub uuid::Uuid);
+pub struct EntityId(uuid::Uuid);
 
 impl EntityId {
     pub fn new() -> Self {
         Self(uuid::Uuid::new_v4())
+    }
+
+    pub fn from_uuid(id: uuid::Uuid) -> Self {
+        Self(id)
+    }
+
+    pub fn value(&self) -> uuid::Uuid {
+        self.0
+    }
+}
+
+impl Default for EntityId {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -34,9 +48,27 @@ pub enum SanctionList {
 
 #[derive(Debug, Clone)]
 pub struct EntityLabel {
-    pub name: String,
-    pub url: Option<String>,
-    pub source: LabelSource,
+    name: String,
+    url: Option<String>,
+    source: LabelSource,
+}
+
+impl EntityLabel {
+    pub fn new(name: String, url: Option<String>, source: LabelSource) -> Self {
+        Self { name, url, source }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn url(&self) -> Option<&str> {
+        self.url.as_deref()
+    }
+
+    pub fn source(&self) -> &LabelSource {
+        &self.source
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,11 +81,11 @@ pub enum LabelSource {
 
 #[derive(Debug, Clone)]
 pub struct Entity {
-    pub id: EntityId,
-    pub label: Option<EntityLabel>,
-    pub category: EntityCategory,
-    pub addresses: HashSet<Address>,
-    pub risk_score: RiskScore,
+    id: EntityId,
+    label: Option<EntityLabel>,
+    category: EntityCategory,
+    addresses: HashSet<Address>,
+    risk_score: RiskScore,
 }
 
 impl Entity {
@@ -65,6 +97,46 @@ impl Entity {
             addresses: HashSet::new(),
             risk_score,
         }
+    }
+
+    pub fn from_parts(
+        id: EntityId,
+        label: Option<EntityLabel>,
+        category: EntityCategory,
+        addresses: HashSet<Address>,
+        risk_score: RiskScore,
+    ) -> Self {
+        Self {
+            id,
+            label,
+            category,
+            addresses,
+            risk_score,
+        }
+    }
+
+    pub fn id(&self) -> &EntityId {
+        &self.id
+    }
+
+    pub fn label(&self) -> Option<&EntityLabel> {
+        self.label.as_ref()
+    }
+
+    pub fn set_label(&mut self, label: EntityLabel) {
+        self.label = Some(label);
+    }
+
+    pub fn category(&self) -> &EntityCategory {
+        &self.category
+    }
+
+    pub fn addresses(&self) -> &HashSet<Address> {
+        &self.addresses
+    }
+
+    pub fn risk_score(&self) -> RiskScore {
+        self.risk_score
     }
 
     pub fn add_address(&mut self, addr: Address) {
@@ -98,10 +170,42 @@ impl RiskScore {
 
 #[derive(Debug, Clone)]
 pub struct ClusterEvidence {
-    pub addresses: Vec<Address>,
-    pub heuristic: ClusteringHeuristic,
-    pub confidence: Confidence,
-    pub notes: Option<String>,
+    addresses: Vec<Address>,
+    heuristic: ClusteringHeuristic,
+    confidence: Confidence,
+    notes: Option<String>,
+}
+
+impl ClusterEvidence {
+    pub fn new(
+        addresses: Vec<Address>,
+        heuristic: ClusteringHeuristic,
+        confidence: Confidence,
+        notes: Option<String>,
+    ) -> Self {
+        Self {
+            addresses,
+            heuristic,
+            confidence,
+            notes,
+        }
+    }
+
+    pub fn addresses(&self) -> &[Address] {
+        &self.addresses
+    }
+
+    pub fn heuristic(&self) -> &ClusteringHeuristic {
+        &self.heuristic
+    }
+
+    pub fn confidence(&self) -> Confidence {
+        self.confidence
+    }
+
+    pub fn notes(&self) -> Option<&str> {
+        self.notes.as_deref()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,4 +216,3 @@ pub enum ClusteringHeuristic {
     BehavioralPattern(String),
     Manual,
 }
-

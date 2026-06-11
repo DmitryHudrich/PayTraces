@@ -3,7 +3,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use domain::{
-    asset::{AssetId, AssetKind, TokenStandard},
+    asset::{AssetId, TokenStandard},
     chain::ChainId,
     error::{DomainError, DomainResult},
     ports::{BlockRange, ChainSource},
@@ -83,6 +83,7 @@ impl MoralisEthSource {
     ) -> Self {
         let page_cache = Cache::builder()
             .max_capacity(cache.page_cache_max_capacity)
+            .weigher(|_k: &PageKey, v: &PageValue| v.0.len().max(1) as u32)
             .time_to_live(cache.page_cache_ttl)
             .build();
 
@@ -193,12 +194,10 @@ impl MoralisEthSource {
         let cur = cursor
             .map(|c| c.chars().take(16).collect::<String>())
             .unwrap_or_else(|| "nil".into());
-        let dir_name = dir.join(format!(
+        Some(dir.join(format!(
             "{}__{addr}__{from}__{to}__{cur}.json",
             endpoint.prefix()
-        ));
-        std::fs::create_dir_all(&dir_name).expect("Cannot create cache dir");
-        Some(dir_name)
+        )))
     }
 
     async fn file_read(path: &std::path::Path) -> Option<String> {
@@ -206,11 +205,20 @@ impl MoralisEthSource {
     }
 
     async fn file_write(path: &std::path::Path, body: &str) {
-        if let Some(parent) = path.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
+        if let Some(parent) = path.parent()
+            && let Err(e) = tokio::fs::create_dir_all(parent).await
+        {
+            tracing::warn!(dir = %parent.display(), error = %e, "failed to create cache dir");
+            return;
         }
-
-        let _ = tokio::fs::write(path, body).await;
+        match tokio::fs::write(path, body).await {
+            Ok(_) => {
+                tracing::debug!(path = %path.display(), bytes = body.len(), "cache file written")
+            }
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "failed to write cache file")
+            }
+        }
     }
 
     async fn fetch_native_page(
@@ -460,7 +468,7 @@ impl MoralisEthSource {
 
 fn early_stop(transfers: &[Transfer], from_block: Option<u64>) -> bool {
     from_block.is_some_and(|from| {
-        !transfers.is_empty() && transfers.iter().all(|t| t.block.height < from)
+        !transfers.is_empty() && transfers.iter().all(|t| t.block().height() < from)
     })
 }
 
@@ -472,7 +480,7 @@ impl ChainSource for MoralisEthSource {
 
     async fn latest_block(&self) -> DomainResult<BlockRef> {
         if let Some(cached_height) = self.latest_block_cache.get(&()).await {
-            return self.fetch_block(cached_height).await.map(|b| b.block_ref);
+            return self.fetch_block(cached_height).await.map(|b| b.block_ref());
         }
 
         let url = format!(
@@ -486,7 +494,7 @@ impl ChainSource for MoralisEthSource {
             .map_err(|e| DomainError::InsufficientData(format!("parse dateToBlock: {e}")))?;
 
         self.latest_block_cache.insert((), resp.block).await;
-        self.fetch_block(resp.block).await.map(|b| b.block_ref)
+        self.fetch_block(resp.block).await.map(|b| b.block_ref())
     }
 
     async fn fetch_block(&self, height: u64) -> DomainResult<NormalizedBlock> {
@@ -500,14 +508,14 @@ impl ChainSource for MoralisEthSource {
         addr: &Address,
         range: BlockRange,
     ) -> DomainResult<Vec<Transfer>> {
-        let address_hex = format!("0x{}", hex::encode(&addr.bytes));
-        let from_block = if range.from_height > 0 {
-            Some(range.from_height)
+        let address_hex = format!("0x{}", hex::encode(addr.bytes()));
+        let from_block = if range.from_height() > 0 {
+            Some(range.from_height())
         } else {
             None
         };
-        let to_block = if range.to_height < u64::MAX {
-            Some(range.to_height)
+        let to_block = if range.to_height() < u64::MAX {
+            Some(range.to_height())
         } else {
             None
         };
@@ -618,15 +626,8 @@ fn map_native_transaction(
         .context("block_hash")?
         .unwrap_or(tx_hash_bytes);
 
-    let block_ref = BlockRef {
-        chain: ChainId::ETH,
-        height: block_number,
-        hash: block_hash,
-    };
-    let tx_ref = TxRef {
-        chain: ChainId::ETH,
-        hash: tx_hash_bytes,
-    };
+    let block_ref = BlockRef::new(ChainId::ETH, block_number, block_hash);
+    let tx_ref = TxRef::new(ChainId::ETH, tx_hash_bytes);
 
     let finality = match tx.receipt_status.as_deref() {
         Some("1") => Finality::Confirmed,
@@ -647,19 +648,19 @@ fn map_native_transaction(
     let from = parse_address(&tx.from_address).context("native.from")?;
     let to = parse_address(to_str).context("native.to")?;
 
-    Ok(vec![Transfer {
-        id: TransferId::new(ChainId::ETH, tx_hash_bytes, 0),
-        chain: ChainId::ETH,
+    Ok(vec![Transfer::new(
+        TransferId::new(ChainId::ETH, tx_hash_bytes, 0),
+        ChainId::ETH,
         tx_ref,
         from,
         to,
-        asset: AssetId::native(ChainId::ETH),
-        amount: Amount::new(raw, 18),
-        block: block_ref,
+        AssetId::native(ChainId::ETH),
+        Amount::new(raw, 18),
+        block_ref,
         timestamp,
-        kind: TransferKind::Native,
+        TransferKind::Native,
         finality,
-    }])
+    )])
 }
 
 fn map_erc20_record(
@@ -680,15 +681,8 @@ fn map_erc20_record(
         .context("block_hash")?
         .unwrap_or(tx_hash_bytes);
 
-    let block_ref = BlockRef {
-        chain: ChainId::ETH,
-        height: block_number,
-        hash: block_hash,
-    };
-    let tx_ref = TxRef {
-        chain: ChainId::ETH,
-        hash: tx_hash_bytes,
-    };
+    let block_ref = BlockRef::new(ChainId::ETH, block_number, block_hash);
+    let tx_ref = TxRef::new(ChainId::ETH, tx_hash_bytes);
 
     let raw = parse_u256(&rec.value).context("erc20 value")?;
     let decimals: u8 = rec
@@ -703,23 +697,20 @@ fn map_erc20_record(
     let contract = parse_address(&rec.address).context("erc20.contract")?;
     let log_index = rec.log_index.unwrap_or(0) as u32;
 
-    Ok(Some(Transfer {
-        id: TransferId::new(ChainId::ETH, tx_hash_bytes, log_index),
-        chain: ChainId::ETH,
+    Ok(Some(Transfer::new(
+        TransferId::new(ChainId::ETH, tx_hash_bytes, log_index),
+        ChainId::ETH,
         tx_ref,
         from,
         to,
-        asset: AssetId {
-            chain: ChainId::ETH,
-            kind: AssetKind::Contract(contract.bytes.clone()),
-        },
-        amount: Amount::new(raw, decimals),
-        block: block_ref,
+        AssetId::contract(ChainId::ETH, contract.bytes().to_vec()),
+        Amount::new(raw, decimals),
+        block_ref,
         timestamp,
-        kind: TransferKind::Token {
+        TransferKind::Token {
             contract,
             standard: TokenStandard::Erc20,
         },
-        finality: Finality::Confirmed,
-    }))
+        Finality::Confirmed,
+    )))
 }

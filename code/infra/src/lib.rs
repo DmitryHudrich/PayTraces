@@ -50,13 +50,13 @@ impl EntityRepository for PostgresEntityRepository {
                         e.label_source, e.risk_score
                  FROM entities e
                  WHERE e.id = $1",
-                &[&id.0],
+                &[&id.value()],
             )
             .await
             .map_err(pg_err)?;
 
         let Some(row) = row else { return Ok(None) };
-        let entity_id = EntityId(row.get("id"));
+        let entity_id = EntityId::from_uuid(row.get("id"));
         let addresses = load_addresses(&client, &entity_id).await?;
         Ok(Some(row_to_entity(&row, entity_id, addresses)?))
     }
@@ -64,8 +64,8 @@ impl EntityRepository for PostgresEntityRepository {
     async fn find_by_address(&self, addr: &Address) -> DomainResult<Option<Entity>> {
         let client = self.pool.get().await.map_err(pool_err)?;
 
-        let addr_hex = hex::encode(&addr.bytes);
-        let chain_id = addr.chain.0 as i32;
+        let addr_hex = hex::encode(addr.bytes());
+        let chain_id = addr.chain().value() as i32;
 
         let row = client
             .query_opt(
@@ -81,7 +81,7 @@ impl EntityRepository for PostgresEntityRepository {
             .map_err(pg_err)?;
 
         let Some(row) = row else { return Ok(None) };
-        let entity_id = EntityId(row.get("id"));
+        let entity_id = EntityId::from_uuid(row.get("id"));
         let addresses = load_addresses(&client, &entity_id).await?;
         Ok(Some(row_to_entity(&row, entity_id, addresses)?))
     }
@@ -89,10 +89,10 @@ impl EntityRepository for PostgresEntityRepository {
     async fn save(&self, entity: &Entity) -> DomainResult<()> {
         let client = self.pool.get().await.map_err(pool_err)?;
 
-        let (category_s, sanction_list_s) = category_to_str(&entity.category);
-        let label_name = entity.label.as_ref().map(|l| l.name.as_str());
-        let label_url = entity.label.as_ref().and_then(|l| l.url.as_deref());
-        let label_source = entity.label.as_ref().map(|l| label_source_str(&l.source));
+        let (category_s, sanction_list_s) = category_to_str(entity.category());
+        let label_name = entity.label().map(|l| l.name());
+        let label_url = entity.label().and_then(|l| l.url());
+        let label_source = entity.label().map(|l| label_source_str(l.source()));
 
         client
             .execute(
@@ -107,13 +107,13 @@ impl EntityRepository for PostgresEntityRepository {
                         label_source = EXCLUDED.label_source,
                         risk_score   = EXCLUDED.risk_score",
                 &[
-                    &entity.id.0,
+                    &entity.id().value(),
                     &category_s,
                     &sanction_list_s,
                     &label_name,
                     &label_url,
                     &label_source,
-                    &(entity.risk_score.value() as i16),
+                    &(entity.risk_score().value() as i16),
                 ],
             )
             .await
@@ -122,19 +122,26 @@ impl EntityRepository for PostgresEntityRepository {
         client
             .execute(
                 "DELETE FROM entity_addresses WHERE entity_id = $1",
-                &[&entity.id.0],
+                &[&entity.id().value()],
             )
             .await
             .map_err(pg_err)?;
 
-        if !entity.addresses.is_empty() {
-            let entity_ids: Vec<uuid::Uuid> =
-                entity.addresses.iter().map(|_| entity.id.0).collect();
-            let chain_ids: Vec<i32> = entity.addresses.iter().map(|a| a.chain.0 as i32).collect();
-            let addrs: Vec<String> = entity
-                .addresses
+        if !entity.addresses().is_empty() {
+            let entity_ids: Vec<uuid::Uuid> = entity
+                .addresses()
                 .iter()
-                .map(|a| hex::encode(&a.bytes))
+                .map(|_| entity.id().value())
+                .collect();
+            let chain_ids: Vec<i32> = entity
+                .addresses()
+                .iter()
+                .map(|a| a.chain().value() as i32)
+                .collect();
+            let addrs: Vec<String> = entity
+                .addresses()
+                .iter()
+                .map(|a| hex::encode(a.bytes()))
                 .collect();
 
             client
@@ -167,7 +174,7 @@ impl EntityRepository for PostgresEntityRepository {
 
         let mut entities = Vec::with_capacity(rows.len());
         for row in &rows {
-            let entity_id = EntityId(row.get("id"));
+            let entity_id = EntityId::from_uuid(row.get("id"));
             let addresses = load_addresses(&client, &entity_id).await?;
             entities.push(row_to_entity(row, entity_id, addresses)?);
         }
@@ -182,14 +189,14 @@ async fn load_addresses(
     let rows = client
         .query(
             "SELECT chain_id, address FROM entity_addresses WHERE entity_id = $1",
-            &[&entity_id.0],
+            &[&entity_id.value()],
         )
         .await
         .map_err(pg_err)?;
 
     rows.iter()
         .map(|r| {
-            let chain = ChainId(r.get::<_, i32>("chain_id") as u32);
+            let chain = ChainId::new(r.get::<_, i32>("chain_id") as u32);
             let bytes = hex::decode(r.get::<_, &str>("address"))
                 .map_err(|e| DomainError::InsufficientData(format!("address hex: {e}")))?;
             Ok(Address::new(chain, bytes))
@@ -204,23 +211,19 @@ fn row_to_entity(
 ) -> DomainResult<Entity> {
     let category = str_to_category(row.get("category"), row.get("sanction_list"))?;
 
-    let label = row
-        .get::<_, Option<&str>>("label_name")
-        .map(|name| EntityLabel {
-            name: name.to_string(),
-            url: row.get::<_, Option<&str>>("label_url").map(str::to_string),
-            source: str_to_label_source(row.get("label_source")),
-        });
+    let label = row.get::<_, Option<&str>>("label_name").map(|name| {
+        EntityLabel::new(
+            name.to_string(),
+            row.get::<_, Option<&str>>("label_url").map(str::to_string),
+            str_to_label_source(row.get("label_source")),
+        )
+    });
 
     let risk_score = RiskScore::new(row.get::<_, i16>("risk_score") as u8);
 
-    Ok(Entity {
-        id: entity_id,
-        label,
-        category,
-        addresses,
-        risk_score,
-    })
+    Ok(Entity::from_parts(
+        entity_id, label, category, addresses, risk_score,
+    ))
 }
 
 fn category_to_str(cat: &EntityCategory) -> (&'static str, Option<&'static str>) {

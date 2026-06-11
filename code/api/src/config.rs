@@ -14,8 +14,6 @@ pub struct Cli {
     #[arg(long)]
     moralis_api_key: Option<String>,
     #[arg(long)]
-    trongrid_api_key: Option<String>,
-    #[arg(long)]
     socks_proxy: Option<String>,
     #[arg(long)]
     database_url: Option<String>,
@@ -51,14 +49,6 @@ pub struct MoralisConfig {
 }
 
 #[derive(Deserialize, Debug, Clone)]
-pub struct TronConfig {
-    pub base_url: String,
-    pub api_key: Option<String>,
-    #[serde(default)]
-    pub cache: CacheConfigFile,
-}
-
-#[derive(Deserialize, Debug, Clone)]
 pub struct FileCacheConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -68,7 +58,10 @@ pub struct FileCacheConfig {
 
 impl Default for FileCacheConfig {
     fn default() -> Self {
-        Self { enabled: false, dir: Self::default_dir() }
+        Self {
+            enabled: false,
+            dir: Self::default_dir(),
+        }
     }
 }
 
@@ -86,10 +79,6 @@ pub struct CacheConfigFile {
     pub page_max_capacity: u64,
     #[serde(default = "CacheConfigFile::default_latest_block_ttl_secs")]
     pub latest_block_ttl_secs: u64,
-    #[serde(default = "CacheConfigFile::default_block_cache_max_capacity")]
-    pub block_cache_max_capacity: u64,
-    #[serde(default = "CacheConfigFile::default_block_cache_ttl_secs")]
-    pub block_cache_ttl_secs: u64,
     #[serde(default)]
     pub file_cache: FileCacheConfig,
 }
@@ -100,8 +89,6 @@ impl Default for CacheConfigFile {
             page_ttl_secs: Self::default_page_ttl_secs(),
             page_max_capacity: Self::default_page_max_capacity(),
             latest_block_ttl_secs: Self::default_latest_block_ttl_secs(),
-            block_cache_max_capacity: Self::default_block_cache_max_capacity(),
-            block_cache_ttl_secs: Self::default_block_cache_ttl_secs(),
             file_cache: FileCacheConfig::default(),
         }
     }
@@ -112,16 +99,10 @@ impl CacheConfigFile {
         86_400
     }
     fn default_page_max_capacity() -> u64 {
-        10_000
+        100_000
     }
     fn default_latest_block_ttl_secs() -> u64 {
         15
-    }
-    fn default_block_cache_max_capacity() -> u64 {
-        5_000
-    }
-    fn default_block_cache_ttl_secs() -> u64 {
-        86_400 * 7
     }
 
     pub fn into_domain(self) -> infra::fetch_wallet_api::CacheConfig {
@@ -152,7 +133,6 @@ pub struct ProxyConfig {
 pub struct AppConfig {
     pub server: ServerConfig,
     pub moralis: MoralisConfig,
-    pub tron: TronConfig,
     pub database: DatabaseConfig,
     pub proxy: ProxyConfig,
     pub log: LogConfig,
@@ -172,7 +152,6 @@ impl AppConfig {
             ("server.port", &|c| c.port.map(|p| p.to_string())),
             ("server.host", &|c| c.host.clone()),
             ("moralis.api_key", &|c| c.moralis_api_key.clone()),
-            ("tron.api_key", &|c| c.trongrid_api_key.clone()),
             ("proxy.socks_url", &|c| c.socks_proxy.clone()),
             ("database.url", &|c| c.database_url.clone()),
         ];
@@ -186,4 +165,3 @@ impl AppConfig {
         Ok(builder.build()?.try_deserialize()?)
     }
 }
-

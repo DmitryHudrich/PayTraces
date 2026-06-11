@@ -3,8 +3,8 @@ use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AssetId {
-    pub chain: ChainId,
-    pub kind: AssetKind,
+    chain: ChainId,
+    kind: AssetKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -15,11 +15,25 @@ pub enum AssetKind {
 
 impl AssetId {
     pub fn native(chain: ChainId) -> Self {
-        Self { chain, kind: AssetKind::Native }
+        Self {
+            chain,
+            kind: AssetKind::Native,
+        }
     }
 
     pub fn contract(chain: ChainId, contract_bytes: Vec<u8>) -> Self {
-        Self { chain, kind: AssetKind::Contract(contract_bytes) }
+        Self {
+            chain,
+            kind: AssetKind::Contract(contract_bytes),
+        }
+    }
+
+    pub fn chain(&self) -> ChainId {
+        self.chain
+    }
+
+    pub fn kind(&self) -> &AssetKind {
+        &self.kind
     }
 }
 
@@ -44,13 +58,63 @@ pub enum TokenStandard {
 
 #[derive(Debug, Clone)]
 pub struct AssetMeta {
-    pub id: AssetId,
-    pub symbol: String,
-    pub name: String,
-    pub decimals: u8,
-    pub standard: Option<TokenStandard>,
-    pub is_stablecoin: bool,
-    pub coingecko_id: Option<String>,
+    id: AssetId,
+    symbol: String,
+    name: String,
+    decimals: u8,
+    standard: Option<TokenStandard>,
+    is_stablecoin: bool,
+    coingecko_id: Option<String>,
+}
+
+impl AssetMeta {
+    pub fn new(
+        id: AssetId,
+        symbol: String,
+        name: String,
+        decimals: u8,
+        standard: Option<TokenStandard>,
+        is_stablecoin: bool,
+        coingecko_id: Option<String>,
+    ) -> Self {
+        Self {
+            id,
+            symbol,
+            name,
+            decimals,
+            standard,
+            is_stablecoin,
+            coingecko_id,
+        }
+    }
+
+    pub fn id(&self) -> &AssetId {
+        &self.id
+    }
+
+    pub fn symbol(&self) -> &str {
+        &self.symbol
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn decimals(&self) -> u8 {
+        self.decimals
+    }
+
+    pub fn standard(&self) -> Option<TokenStandard> {
+        self.standard
+    }
+
+    pub fn is_stablecoin(&self) -> bool {
+        self.is_stablecoin
+    }
+
+    pub fn coingecko_id(&self) -> Option<&str> {
+        self.coingecko_id.as_deref()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -60,7 +124,9 @@ pub struct AssetRegistry {
 
 impl AssetRegistry {
     pub fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self {
+            entries: Vec::new(),
+        }
     }
 
     pub fn register(&mut self, meta: AssetMeta) {
@@ -73,3 +139,8 @@ impl AssetRegistry {
     }
 }
 
+impl Default for AssetRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}

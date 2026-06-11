@@ -9,13 +9,21 @@ construct_uint! {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Address {
-    pub chain: ChainId,
-    pub bytes: Vec<u8>,
+    chain: ChainId,
+    bytes: Vec<u8>,
 }
 
 impl Address {
     pub fn new(chain: ChainId, bytes: Vec<u8>) -> Self {
         Self { chain, bytes }
+    }
+
+    pub fn chain(&self) -> ChainId {
+        self.chain
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
     }
 }
 
@@ -27,8 +35,8 @@ impl fmt::Display for Address {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Amount {
-    pub raw: U256,
-    pub decimals: u8,
+    raw: U256,
+    decimals: u8,
 }
 
 impl Amount {
@@ -37,7 +45,18 @@ impl Amount {
     }
 
     pub fn zero(decimals: u8) -> Self {
-        Self { raw: U256::zero(), decimals }
+        Self {
+            raw: U256::zero(),
+            decimals,
+        }
+    }
+
+    pub fn raw(self) -> U256 {
+        self.raw
+    }
+
+    pub fn decimals(self) -> u8 {
+        self.decimals
     }
 
     pub fn is_zero(&self) -> bool {
@@ -46,7 +65,10 @@ impl Amount {
 
     pub fn checked_add(self, other: Self) -> Option<Self> {
         assert_eq!(self.decimals, other.decimals, "decimals mismatch");
-        self.raw.checked_add(other.raw).map(|raw| Self { raw, decimals: self.decimals })
+        self.raw.checked_add(other.raw).map(|raw| Self {
+            raw,
+            decimals: self.decimals,
+        })
     }
 
     pub fn ratio_of(&self, total: &Self) -> Ratio {
@@ -71,7 +93,10 @@ impl Sub for Amount {
     type Output = Self;
     fn sub(self, rhs: Self) -> Self {
         assert_eq!(self.decimals, rhs.decimals);
-        Self { raw: self.raw - rhs.raw, decimals: self.decimals }
+        Self {
+            raw: self.raw - rhs.raw,
+            decimals: self.decimals,
+        }
     }
 }
 
@@ -92,21 +117,60 @@ impl Ratio {
 
     pub fn apply_to(self, amount: Amount) -> Amount {
         let scaled = amount.raw * U256::from(self.0) / U256::from(1_000_000u64);
-        Amount { raw: scaled, decimals: amount.decimals }
+        Amount {
+            raw: scaled,
+            decimals: amount.decimals,
+        }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BlockRef {
-    pub chain: ChainId,
-    pub height: u64,
-    pub hash: [u8; 32],
+    chain: ChainId,
+    height: u64,
+    hash: [u8; 32],
+}
+
+impl BlockRef {
+    pub fn new(chain: ChainId, height: u64, hash: [u8; 32]) -> Self {
+        Self {
+            chain,
+            height,
+            hash,
+        }
+    }
+
+    pub fn chain(self) -> ChainId {
+        self.chain
+    }
+
+    pub fn height(self) -> u64 {
+        self.height
+    }
+
+    pub fn hash(self) -> [u8; 32] {
+        self.hash
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TxRef {
-    pub chain: ChainId,
-    pub hash: [u8; 32],
+    chain: ChainId,
+    hash: [u8; 32],
+}
+
+impl TxRef {
+    pub fn new(chain: ChainId, hash: [u8; 32]) -> Self {
+        Self { chain, hash }
+    }
+
+    pub fn chain(self) -> ChainId {
+        self.chain
+    }
+
+    pub fn hash(self) -> [u8; 32] {
+        self.hash
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -127,4 +191,3 @@ impl Confidence {
         self.0
     }
 }
-

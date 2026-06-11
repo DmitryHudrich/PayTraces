@@ -84,8 +84,6 @@ pub struct NftTransfer {
     pub verified_collection: Option<bool>,
 }
 
-
-
 #[derive(Deserialize)]
 pub struct WalletTransactionsResponse {
     pub cursor: Option<String>,

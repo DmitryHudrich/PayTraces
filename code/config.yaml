@@ -5,10 +5,10 @@ server:
 log:
   directives:
     - "warn"
-    - "api=debug"
-    - "infra=debug"
-    - "domain=debug"
-    - "usecase=debug"
+    # - "api=debug"
+    # - "infra=debug"
+    # - "domain=debug"
+    # - "usecase=debug"
 
 moralis:
   base_url: "https://deep-index.moralis.io/api/v2.2"

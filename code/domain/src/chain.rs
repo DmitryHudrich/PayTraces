@@ -1,13 +1,21 @@
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ChainId(pub u32);
+pub struct ChainId(u32);
 
 impl ChainId {
     pub const ETH: Self = Self(1);
     pub const TRON: Self = Self(195);
     pub const BTC: Self = Self(0);
     pub const SOLANA: Self = Self(501);
+
+    pub fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    pub fn value(self) -> u32 {
+        self.0
+    }
 }
 
 impl fmt::Display for ChainId {
@@ -83,4 +91,3 @@ impl ChainRegistry {
         self.entries.push(meta);
     }
 }
-

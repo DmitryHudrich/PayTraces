@@ -8,5 +8,6 @@ domain.path = "../domain"
 
 thiserror.workspace = true
 anyhow.workspace = true
+async-trait.workspace = true
 tracing.workspace = true
 hex.workspace = true

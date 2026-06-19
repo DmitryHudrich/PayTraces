@@ -1,6 +1,7 @@
-use crate::chain::ChainId;
+use crate::chain::{AddressEncoding, ChainId};
 use std::fmt;
 use std::ops::{Add, Sub};
+use thiserror::Error;
 use uint::construct_uint;
 
 construct_uint! {
@@ -11,6 +12,24 @@ construct_uint! {
 pub struct Address {
     chain: ChainId,
     bytes: Vec<u8>,
+}
+
+#[derive(Debug, Error)]
+pub enum AddressParseError {
+    #[error("invalid hex: {0}")]
+    Hex(String),
+    #[error("invalid Base58Check: {0}")]
+    Base58(String),
+    #[error("invalid Bech32: {0}")]
+    Bech32(String),
+    #[error("invalid address length: expected {expected}, got {actual}")]
+    Length { expected: usize, actual: usize },
+    #[error("invalid Tron version byte: expected 0x41, got 0x{0:02x}")]
+    TronVersion(u8),
+    #[error("unsupported encoding for chain: {0}")]
+    UnsupportedEncoding(ChainId),
+    #[error("empty address")]
+    Empty,
 }
 
 impl Address {
@@ -25,11 +44,86 @@ impl Address {
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
+
+    pub fn hex(&self) -> String {
+        hex::encode(&self.bytes)
+    }
+
+    pub fn parse(chain: ChainId, s: &str) -> Result<Self, AddressParseError> {
+        if s.is_empty() {
+            return Err(AddressParseError::Empty);
+        }
+        let encoding = chain_encoding(chain);
+        match encoding {
+            AddressEncoding::Hex20 => {
+                let stripped = s.strip_prefix("0x").unwrap_or(s);
+                let bytes = hex::decode(stripped)
+                    .map_err(|e| AddressParseError::Hex(e.to_string()))?;
+                if bytes.len() != 20 {
+                    return Err(AddressParseError::Length {
+                        expected: 20,
+                        actual: bytes.len(),
+                    });
+                }
+                Ok(Self { chain, bytes })
+            }
+            AddressEncoding::TronBase58Check => {
+                let bytes = bs58::decode(s)
+                    .with_check(None)
+                    .into_vec()
+                    .map_err(|e| AddressParseError::Base58(e.to_string()))?;
+                if bytes.len() != 21 {
+                    return Err(AddressParseError::Length {
+                        expected: 21,
+                        actual: bytes.len(),
+                    });
+                }
+                if bytes[0] != 0x41 {
+                    return Err(AddressParseError::TronVersion(bytes[0]));
+                }
+                Ok(Self { chain, bytes })
+            }
+            AddressEncoding::Base58 => {
+                let bytes = bs58::decode(s)
+                    .into_vec()
+                    .map_err(|e| AddressParseError::Base58(e.to_string()))?;
+                if bytes.len() != 32 {
+                    return Err(AddressParseError::Length {
+                        expected: 32,
+                        actual: bytes.len(),
+                    });
+                }
+                Ok(Self { chain, bytes })
+            }
+            AddressEncoding::Bech32 => Err(AddressParseError::UnsupportedEncoding(chain)),
+        }
+    }
+
+    pub fn canonical(&self) -> String {
+        match chain_encoding(self.chain) {
+            AddressEncoding::Hex20 => format!("0x{}", hex::encode(&self.bytes)),
+            AddressEncoding::TronBase58Check => {
+                bs58::encode(&self.bytes).with_check().into_string()
+            }
+            AddressEncoding::Base58 => bs58::encode(&self.bytes).into_string(),
+            AddressEncoding::Bech32 => format!("bech32?:0x{}", hex::encode(&self.bytes)),
+        }
+    }
+}
+
+fn chain_encoding(chain: ChainId) -> AddressEncoding {
+    match chain {
+        ChainId::ETH => AddressEncoding::Hex20,
+        ChainId::TRON => AddressEncoding::TronBase58Check,
+        ChainId::BTC => AddressEncoding::Bech32,
+        ChainId::SOLANA => AddressEncoding::Base58,
+        _ => AddressEncoding::Hex20,
+    }
 }
 
 impl fmt::Display for Address {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:0x{}", self.chain, hex::encode(&self.bytes))
+        write!(f, "{}:{}", self.chain, self.canonical())
     }
 }
 
@@ -189,5 +283,35 @@ impl Confidence {
 
     pub fn value(self) -> u8 {
         self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_evm_address() {
+        let a = Address::parse(ChainId::ETH, "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045").unwrap();
+        assert_eq!(a.chain(), ChainId::ETH);
+        assert_eq!(a.bytes().len(), 20);
+        assert!(a.canonical().starts_with("0x"));
+    }
+
+    #[test]
+    fn parse_tron_address() {
+        let a = Address::parse(ChainId::TRON, "TWhC1FvBoycGpu2bf5MSuGYva9oWcUD87A").unwrap();
+        assert_eq!(a.chain(), ChainId::TRON);
+        assert_eq!(a.bytes().len(), 21);
+        assert_eq!(a.bytes()[0], 0x41);
+        assert_eq!(a.canonical(), "TWhC1FvBoycGpu2bf5MSuGYva9oWcUD87A");
+    }
+
+    #[test]
+    fn reject_bad_tron_version() {
+        let bytes = [0x42u8; 21];
+        let s = bs58::encode(&bytes).with_check().into_string();
+        let err = Address::parse(ChainId::TRON, &s).unwrap_err();
+        assert!(matches!(err, AddressParseError::TronVersion(0x42)));
     }
 }

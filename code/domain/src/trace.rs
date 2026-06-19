@@ -51,7 +51,10 @@ impl TraceRequest {
 #[derive(Debug, Clone)]
 pub enum TraceOrigin {
     Address(Address),
-    Transaction([u8; 32]),
+    Transaction {
+        chain: crate::chain::ChainId,
+        hash: [u8; 32],
+    },
     Transfer(crate::transfer::TransferId),
 }
 

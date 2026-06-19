@@ -27,3 +27,6 @@ bon = "3"
 async-trait = "0"
 
 alloy = "2"
+
+[profile.release]
+debug = true

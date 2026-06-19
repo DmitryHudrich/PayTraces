@@ -6,10 +6,28 @@ use serde::Deserialize;
 
 #[derive(Deserialize)]
 pub struct WalletHistoryResponse {
-    pub page: u32,
-    pub page_size: u32,
-    pub cursor: Option<String>,
-    pub result: Vec<WalletHistoryTransaction>,
+    page: u32,
+    page_size: u32,
+    cursor: Option<String>,
+    result: Vec<WalletHistoryTransaction>,
+}
+
+impl WalletHistoryResponse {
+    pub fn page(&self) -> u32 {
+        self.page
+    }
+
+    pub fn page_size(&self) -> u32 {
+        self.page_size
+    }
+
+    pub fn cursor(&self) -> Option<&str> {
+        self.cursor.as_deref()
+    }
+
+    pub fn result(self) -> Vec<WalletHistoryTransaction> {
+        self.result
+    }
 }
 
 #[derive(Deserialize)]
@@ -18,76 +36,174 @@ pub struct DateToBlockResponse {
     pub timestamp: u64,
 }
 
+impl DateToBlockResponse {
+    pub fn block(&self) -> u64 {
+        self.block
+    }
+
+    pub fn timestamp(&self) -> u64 {
+        self.timestamp
+    }
+}
+
 #[derive(Deserialize)]
 pub struct WalletHistoryTransaction {
-    pub hash: String,
-    pub nonce: String,
-    pub from_address: String,
-    pub to_address: Option<String>,
-    pub value: String,
-    pub gas_price: Option<String>,
-    pub receipt_gas_used: Option<String>,
-    pub receipt_status: Option<String>,
-    pub block_timestamp: String,
-    pub block_number: String,
-    pub summary: Option<String>,
-    pub category: Option<String>,
-    pub method_label: Option<String>,
-    pub transaction_fee: Option<String>,
-    pub possible_spam: Option<bool>,
+    hash: String,
+    nonce: String,
+    from_address: String,
+    to_address: Option<String>,
+    value: String,
+    gas_price: Option<String>,
+    receipt_gas_used: Option<String>,
+    receipt_status: Option<String>,
+    block_timestamp: String,
+    block_number: String,
+    summary: Option<String>,
+    category: Option<String>,
+    method_label: Option<String>,
+    transaction_fee: Option<String>,
+    possible_spam: Option<bool>,
     #[serde(default)]
-    pub erc20_transfers: Vec<Erc20Transfer>,
+    erc20_transfers: Vec<Erc20Transfer>,
     #[serde(default)]
-    pub native_transfers: Vec<NativeTransfer>,
+    native_transfers: Vec<NativeTransfer>,
     #[serde(default)]
-    pub nft_transfers: Vec<NftTransfer>,
+    nft_transfers: Vec<NftTransfer>,
+}
+
+impl WalletHistoryTransaction {
+    pub fn hash(&self) -> &str {
+        &self.hash
+    }
+
+    pub fn from_address(&self) -> &str {
+        &self.from_address
+    }
+
+    pub fn to_address(&self) -> Option<&str> {
+        self.to_address.as_deref()
+    }
+
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    pub fn receipt_status(&self) -> Option<&str> {
+        self.receipt_status.as_deref()
+    }
+
+    pub fn block_timestamp(&self) -> &str {
+        &self.block_timestamp
+    }
+
+    pub fn block_number(&self) -> &str {
+        &self.block_number
+    }
+
+    pub fn erc20_transfers(&self) -> &[Erc20Transfer] {
+        &self.erc20_transfers
+    }
+
+    pub fn native_transfers(&self) -> &[NativeTransfer] {
+        &self.native_transfers
+    }
 }
 
 #[derive(Deserialize)]
 pub struct Erc20Transfer {
-    pub address: Option<String>,
-    pub from_address: Option<String>,
-    pub to_address: Option<String>,
-    pub value: Option<String>,
-    pub value_formatted: Option<String>,
-    pub token_name: Option<String>,
-    pub token_symbol: Option<String>,
-    pub token_decimals: Option<String>,
-    pub log_index: Option<u64>,
-    pub possible_spam: Option<bool>,
-    pub verified_contract: Option<bool>,
-    pub direction: Option<String>,
+    address: Option<String>,
+    from_address: Option<String>,
+    to_address: Option<String>,
+    value: Option<String>,
+    value_formatted: Option<String>,
+    token_name: Option<String>,
+    token_symbol: Option<String>,
+    token_decimals: Option<String>,
+    log_index: Option<u64>,
+    possible_spam: Option<bool>,
+    verified_contract: Option<bool>,
+    direction: Option<String>,
+}
+
+impl Erc20Transfer {
+    pub fn address(&self) -> Option<&str> {
+        self.address.as_deref()
+    }
+
+    pub fn from_address(&self) -> Option<&str> {
+        self.from_address.as_deref()
+    }
+
+    pub fn to_address(&self) -> Option<&str> {
+        self.to_address.as_deref()
+    }
+
+    pub fn value(&self) -> Option<&str> {
+        self.value.as_deref()
+    }
+
+    pub fn token_decimals(&self) -> Option<&str> {
+        self.token_decimals.as_deref()
+    }
+
+    pub fn log_index(&self) -> Option<u64> {
+        self.log_index
+    }
 }
 
 #[derive(Deserialize)]
 pub struct NativeTransfer {
-    pub from_address: Option<String>,
-    pub to_address: Option<String>,
-    pub value: Option<String>,
-    pub value_formatted: Option<String>,
-    pub direction: Option<String>,
-    pub internal_transaction: Option<bool>,
-    pub token_symbol: Option<String>,
+    from_address: Option<String>,
+    to_address: Option<String>,
+    value: Option<String>,
+    value_formatted: Option<String>,
+    direction: Option<String>,
+    internal_transaction: Option<bool>,
+    token_symbol: Option<String>,
+}
+
+impl NativeTransfer {
+    pub fn from_address(&self) -> Option<&str> {
+        self.from_address.as_deref()
+    }
+
+    pub fn to_address(&self) -> Option<&str> {
+        self.to_address.as_deref()
+    }
+
+    pub fn value(&self) -> Option<&str> {
+        self.value.as_deref()
+    }
 }
 
 #[derive(Deserialize)]
 pub struct NftTransfer {
-    pub token_address: Option<String>,
-    pub token_id: Option<String>,
-    pub from_address: Option<String>,
-    pub to_address: Option<String>,
-    pub contract_type: Option<String>,
-    pub direction: Option<String>,
-    pub token_name: Option<String>,
-    pub token_symbol: Option<String>,
-    pub possible_spam: Option<bool>,
-    pub verified_collection: Option<bool>,
+    token_address: Option<String>,
+    token_id: Option<String>,
+    from_address: Option<String>,
+    to_address: Option<String>,
+    contract_type: Option<String>,
+    direction: Option<String>,
+    token_name: Option<String>,
+    token_symbol: Option<String>,
+    possible_spam: Option<bool>,
+    verified_collection: Option<bool>,
 }
 
 #[derive(Deserialize)]
 pub struct WalletTransactionsResponse {
-    pub cursor: Option<String>,
-    pub result: Vec<WalletTransaction>,
+    cursor: Option<String>,
+    result: Vec<WalletTransaction>,
+}
+
+impl WalletTransactionsResponse {
+    pub fn cursor(&self) -> Option<&str> {
+        self.cursor.as_deref()
+    }
+
+    pub fn into_result(self) -> Vec<WalletTransaction> {
+        self.result
+    }
 }
 
 #[derive(Deserialize)]
@@ -102,10 +218,54 @@ pub struct WalletTransaction {
     pub block_hash: Option<String>,
 }
 
+impl WalletTransaction {
+    pub fn hash(&self) -> &str {
+        &self.hash
+    }
+
+    pub fn from_address(&self) -> &str {
+        &self.from_address
+    }
+
+    pub fn to_address(&self) -> Option<&str> {
+        self.to_address.as_deref()
+    }
+
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    pub fn receipt_status(&self) -> Option<&str> {
+        self.receipt_status.as_deref()
+    }
+
+    pub fn block_timestamp(&self) -> &str {
+        &self.block_timestamp
+    }
+
+    pub fn block_number(&self) -> &str {
+        &self.block_number
+    }
+
+    pub fn block_hash(&self) -> Option<&str> {
+        self.block_hash.as_deref()
+    }
+}
+
 #[derive(Deserialize)]
 pub struct Erc20TransfersResponse {
-    pub cursor: Option<String>,
-    pub result: Vec<Erc20TransferRecord>,
+    cursor: Option<String>,
+    result: Vec<Erc20TransferRecord>,
+}
+
+impl Erc20TransfersResponse {
+    pub fn cursor(&self) -> Option<&str> {
+        self.cursor.as_deref()
+    }
+
+    pub fn into_result(self) -> Vec<Erc20TransferRecord> {
+        self.result
+    }
 }
 
 #[derive(Deserialize)]
@@ -120,4 +280,46 @@ pub struct Erc20TransferRecord {
     pub block_timestamp: String,
     pub block_number: String,
     pub block_hash: Option<String>,
+}
+
+impl Erc20TransferRecord {
+    pub fn transaction_hash(&self) -> &str {
+        &self.transaction_hash
+    }
+
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+
+    pub fn from_address(&self) -> &str {
+        &self.from_address
+    }
+
+    pub fn to_address(&self) -> &str {
+        &self.to_address
+    }
+
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    pub fn token_decimals(&self) -> Option<&str> {
+        self.token_decimals.as_deref()
+    }
+
+    pub fn log_index(&self) -> Option<u64> {
+        self.log_index
+    }
+
+    pub fn block_timestamp(&self) -> &str {
+        &self.block_timestamp
+    }
+
+    pub fn block_number(&self) -> &str {
+        &self.block_number
+    }
+
+    pub fn block_hash(&self) -> Option<&str> {
+        self.block_hash.as_deref()
+    }
 }

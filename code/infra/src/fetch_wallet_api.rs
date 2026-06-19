@@ -1,5 +1,5 @@
 use anyhow::{Context, anyhow};
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use domain::{
@@ -12,8 +12,12 @@ use domain::{
 };
 use moka::future::Cache;
 
-mod side_api {
+pub mod side_api {
     pub mod moralis {
+        pub mod dto;
+        pub mod endpoints;
+    }
+    pub mod tron {
         pub mod dto;
         pub mod endpoints;
     }
@@ -47,11 +51,26 @@ type PageValue = Arc<(Vec<Transfer>, Option<String>)>;
 
 #[derive(Debug, Clone)]
 pub struct CacheConfig {
-    pub page_cache_max_capacity: u64,
-    pub page_cache_ttl: Duration,
-    pub latest_block_cache_ttl: Duration,
+    page_cache_max_capacity: u64,
+    page_cache_ttl: Duration,
+    latest_block_cache_ttl: Duration,
+    file_cache_dir: Option<PathBuf>,
+}
 
-    pub file_cache_dir: Option<PathBuf>,
+impl CacheConfig {
+    pub fn new(
+        page_cache_max_capacity: u64,
+        page_cache_ttl: Duration,
+        latest_block_cache_ttl: Duration,
+        file_cache_dir: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            page_cache_max_capacity,
+            page_cache_ttl,
+            latest_block_cache_ttl,
+            file_cache_dir,
+        }
+    }
 }
 
 impl Default for CacheConfig {
@@ -65,6 +84,7 @@ impl Default for CacheConfig {
     }
 }
 
+#[derive(Clone)]
 pub struct MoralisEthSource {
     api_key: String,
     base_url: String,
@@ -72,10 +92,11 @@ pub struct MoralisEthSource {
     page_cache: Cache<PageKey, PageValue>,
     latest_block_cache: Cache<(), u64>,
     file_cache_dir: Option<PathBuf>,
+    hot_cache: Arc<HashMap<PathBuf, PageValue>>,
 }
 
 impl MoralisEthSource {
-    pub fn new(
+    pub async fn new(
         api_key: impl Into<String>,
         base_url: impl Into<String>,
         client: reqwest::Client,
@@ -92,6 +113,11 @@ impl MoralisEthSource {
             .time_to_live(cache.latest_block_cache_ttl)
             .build();
 
+        let hot_cache = match &cache.file_cache_dir {
+            Some(dir) => Arc::new(Self::load_hot_cache(dir).await),
+            None => Arc::new(HashMap::new()),
+        };
+
         Self {
             api_key: api_key.into(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
@@ -99,7 +125,50 @@ impl MoralisEthSource {
             page_cache,
             latest_block_cache,
             file_cache_dir: cache.file_cache_dir,
+            hot_cache,
         }
+    }
+
+    async fn load_hot_cache(dir: &PathBuf) -> HashMap<PathBuf, PageValue> {
+        let mut map = HashMap::new();
+        let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+            return map;
+        };
+        let mut files: usize = 0;
+        let mut transfers: usize = 0;
+
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let name = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+
+            let parsed = if name.starts_with("nat__") {
+                Self::file_read(&path)
+                    .await
+                    .and_then(|body| parse_native_response(&body).ok())
+            } else if name.starts_with("erc20__") {
+                Self::file_read(&path)
+                    .await
+                    .and_then(|body| parse_erc20_response(&body).ok())
+            } else {
+                None
+            };
+
+            if let Some(value) = parsed {
+                transfers += value.0.len();
+                map.insert(path, Arc::new(value));
+                files += 1;
+            }
+        }
+
+        tracing::info!(files, transfers, "moralis file cache pre-loaded into memory");
+        map
     }
 
     fn get_req(&self, url: &str) -> reqwest::RequestBuilder {
@@ -191,9 +260,13 @@ impl MoralisEthSource {
             .map(|b| b.to_string())
             .unwrap_or_else(|| "nil".into());
 
-        let cur = cursor
-            .map(|c| c.chars().take(16).collect::<String>())
-            .unwrap_or_else(|| "nil".into());
+        let cur = match cursor {
+            None => "nil".to_string(),
+            Some(c) => {
+                use sha2::{Digest, Sha256};
+                hex::encode(Sha256::digest(c.as_bytes()))
+            }
+        };
         Some(dir.join(format!(
             "{}__{addr}__{from}__{to}__{cur}.json",
             endpoint.prefix()
@@ -249,10 +322,18 @@ impl MoralisEthSource {
             to_block,
         );
 
+        if let Some(ref path) = file_path {
+            if let Some(v) = self.hot_cache.get(path) {
+                tracing::debug!(address = address_hex, "hot cache hit (native)");
+                self.page_cache.insert(key, Arc::clone(v)).await;
+                return Ok(Arc::clone(v));
+            }
+        }
+
         let body = match file_path.as_deref() {
             Some(path) => match Self::file_read(path).await {
                 Some(cached) => {
-                    tracing::debug!(address = address_hex, path = %path.display(), "file cache hit");
+                    tracing::debug!(address = address_hex, path = %path.display(), "file cache hit (disk)");
                     cached
                 }
                 None => {
@@ -320,9 +401,17 @@ impl MoralisEthSource {
             to_block,
         );
 
+        if let Some(ref path) = file_path {
+            if let Some(v) = self.hot_cache.get(path) {
+                tracing::debug!(address = address_hex, "hot cache hit (erc20)");
+                self.page_cache.insert(key, Arc::clone(v)).await;
+                return Ok(Arc::clone(v));
+            }
+        }
+
         let body = if let Some(ref path) = file_path {
             if let Some(cached) = Self::file_read(path).await {
-                tracing::debug!(address = address_hex, path = %path.display(), "file cache hit");
+                tracing::debug!(address = address_hex, path = %path.display(), "file cache hit (disk)");
                 cached
             } else {
                 tracing::debug!(address = address_hex, path = %path.display(), "file cache miss");
@@ -386,6 +475,7 @@ impl MoralisEthSource {
         address_hex: &str,
         from_block: Option<u64>,
         to_block: Option<u64>,
+        max_transfers: usize,
     ) -> DomainResult<Vec<Transfer>> {
         let mut all = Vec::new();
         let mut cursor: Option<String> = None;
@@ -405,7 +495,7 @@ impl MoralisEthSource {
                 endpoint = "native",
                 "paginating"
             );
-            if done {
+            if done || all.len() >= max_transfers {
                 break;
             }
             match page.1.clone() {
@@ -428,6 +518,7 @@ impl MoralisEthSource {
         address_hex: &str,
         from_block: Option<u64>,
         to_block: Option<u64>,
+        max_transfers: usize,
     ) -> DomainResult<Vec<Transfer>> {
         let mut all = Vec::new();
         let mut cursor: Option<String> = None;
@@ -447,7 +538,7 @@ impl MoralisEthSource {
                 endpoint = "erc20",
                 "paginating"
             );
-            if done {
+            if done || all.len() >= max_transfers {
                 break;
             }
             match page.1.clone() {
@@ -493,8 +584,8 @@ impl ChainSource for MoralisEthSource {
         let resp = serde_json::from_str::<side_api::moralis::dto::DateToBlockResponse>(&body)
             .map_err(|e| DomainError::InsufficientData(format!("parse dateToBlock: {e}")))?;
 
-        self.latest_block_cache.insert((), resp.block).await;
-        self.fetch_block(resp.block).await.map(|b| b.block_ref())
+        self.latest_block_cache.insert((), resp.block()).await;
+        self.fetch_block(resp.block()).await.map(|b| b.block_ref())
     }
 
     async fn fetch_block(&self, height: u64) -> DomainResult<NormalizedBlock> {
@@ -507,6 +598,7 @@ impl ChainSource for MoralisEthSource {
         &self,
         addr: &Address,
         range: BlockRange,
+        max_transfers: usize,
     ) -> DomainResult<Vec<Transfer>> {
         let address_hex = format!("0x{}", hex::encode(addr.bytes()));
         let from_block = if range.from_height() > 0 {
@@ -524,12 +616,13 @@ impl ChainSource for MoralisEthSource {
             address = %address_hex,
             from_block,
             to_block,
+            max_transfers,
             "fetching transfers from moralis"
         );
 
         let (native, erc20) = tokio::try_join!(
-            self.collect_native(&address_hex, from_block, to_block),
-            self.collect_erc20(&address_hex, from_block, to_block),
+            self.collect_native(&address_hex, from_block, to_block, max_transfers),
+            self.collect_erc20(&address_hex, from_block, to_block, max_transfers),
         )?;
 
         let total = native.len() + erc20.len();
@@ -551,9 +644,9 @@ fn parse_native_response(body: &str) -> DomainResult<(Vec<Transfer>, Option<Stri
     let resp = serde_json::from_str::<side_api::moralis::dto::WalletTransactionsResponse>(body)
         .map_err(|e| DomainError::InsufficientData(format!("parse native: {e}\n{body}")))?;
 
-    let next_cursor = resp.cursor.clone();
+    let next_cursor = resp.cursor().map(str::to_string);
     let mut transfers = Vec::new();
-    for tx in resp.result {
+    for tx in resp.into_result() {
         let mapped = map_native_transaction(tx)
             .map_err(|e| DomainError::InsufficientData(format!("map native tx: {e}")))?;
         transfers.extend(mapped);
@@ -565,9 +658,9 @@ fn parse_erc20_response(body: &str) -> DomainResult<(Vec<Transfer>, Option<Strin
     let resp = serde_json::from_str::<side_api::moralis::dto::Erc20TransfersResponse>(body)
         .map_err(|e| DomainError::InsufficientData(format!("parse erc20: {e}\n{body}")))?;
 
-    let next_cursor = resp.cursor.clone();
+    let next_cursor = resp.cursor().map(str::to_string);
     let mut transfers = Vec::new();
-    for rec in resp.result {
+    for rec in resp.into_result() {
         if let Some(t) = map_erc20_record(rec)
             .map_err(|e| DomainError::InsufficientData(format!("map erc20 rec: {e}")))?
         {
@@ -611,16 +704,15 @@ fn parse_u256(s: &str) -> anyhow::Result<U256> {
 fn map_native_transaction(
     tx: side_api::moralis::dto::WalletTransaction,
 ) -> anyhow::Result<Vec<Transfer>> {
-    let tx_hash_bytes = parse_hash32(&tx.hash).context("tx hash")?;
-    let block_number: u64 = tx.block_number.parse().context("block_number")?;
+    let tx_hash_bytes = parse_hash32(tx.hash()).context("tx hash")?;
+    let block_number: u64 = tx.block_number().parse().context("block_number")?;
 
-    let timestamp = chrono::DateTime::parse_from_rfc3339(&tx.block_timestamp)
+    let timestamp = chrono::DateTime::parse_from_rfc3339(tx.block_timestamp())
         .context("block_timestamp")?
         .with_timezone(&chrono::Utc);
 
     let block_hash = tx
-        .block_hash
-        .as_deref()
+        .block_hash()
         .map(parse_hash32)
         .transpose()
         .context("block_hash")?
@@ -629,23 +721,23 @@ fn map_native_transaction(
     let block_ref = BlockRef::new(ChainId::ETH, block_number, block_hash);
     let tx_ref = TxRef::new(ChainId::ETH, tx_hash_bytes);
 
-    let finality = match tx.receipt_status.as_deref() {
+    let finality = match tx.receipt_status() {
         Some("1") => Finality::Confirmed,
         Some(_) => Finality::Reorged,
         None => Finality::Unconfirmed,
     };
 
-    let to_str = match tx.to_address.as_deref() {
+    let to_str = match tx.to_address() {
         Some(s) if !s.is_empty() => s,
         _ => return Ok(vec![]),
     };
 
-    let raw = parse_u256(&tx.value).context("native value")?;
+    let raw = parse_u256(tx.value()).context("native value")?;
     if raw.is_zero() {
         return Ok(vec![]);
     }
 
-    let from = parse_address(&tx.from_address).context("native.from")?;
+    let from = parse_address(tx.from_address()).context("native.from")?;
     let to = parse_address(to_str).context("native.to")?;
 
     Ok(vec![Transfer::new(
@@ -666,16 +758,15 @@ fn map_native_transaction(
 fn map_erc20_record(
     rec: side_api::moralis::dto::Erc20TransferRecord,
 ) -> anyhow::Result<Option<Transfer>> {
-    let tx_hash_bytes = parse_hash32(&rec.transaction_hash).context("tx hash")?;
-    let block_number: u64 = rec.block_number.parse().context("block_number")?;
+    let tx_hash_bytes = parse_hash32(rec.transaction_hash()).context("tx hash")?;
+    let block_number: u64 = rec.block_number().parse().context("block_number")?;
 
-    let timestamp = chrono::DateTime::parse_from_rfc3339(&rec.block_timestamp)
+    let timestamp = chrono::DateTime::parse_from_rfc3339(rec.block_timestamp())
         .context("block_timestamp")?
         .with_timezone(&chrono::Utc);
 
     let block_hash = rec
-        .block_hash
-        .as_deref()
+        .block_hash()
         .map(parse_hash32)
         .transpose()
         .context("block_hash")?
@@ -684,18 +775,17 @@ fn map_erc20_record(
     let block_ref = BlockRef::new(ChainId::ETH, block_number, block_hash);
     let tx_ref = TxRef::new(ChainId::ETH, tx_hash_bytes);
 
-    let raw = parse_u256(&rec.value).context("erc20 value")?;
+    let raw = parse_u256(rec.value()).context("erc20 value")?;
     let decimals: u8 = rec
-        .token_decimals
-        .as_deref()
+        .token_decimals()
         .unwrap_or("18")
         .parse()
         .context("erc20 decimals")?;
 
-    let from = parse_address(&rec.from_address).context("erc20.from")?;
-    let to = parse_address(&rec.to_address).context("erc20.to")?;
-    let contract = parse_address(&rec.address).context("erc20.contract")?;
-    let log_index = rec.log_index.unwrap_or(0) as u32;
+    let from = parse_address(rec.from_address()).context("erc20.from")?;
+    let to = parse_address(rec.to_address()).context("erc20.to")?;
+    let contract = parse_address(rec.address()).context("erc20.contract")?;
+    let log_index = rec.log_index().unwrap_or(0) as u32;
 
     Ok(Some(Transfer::new(
         TransferId::new(ChainId::ETH, tx_hash_bytes, log_index),

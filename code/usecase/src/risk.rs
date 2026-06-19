@@ -1,27 +1,49 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use domain::entity::EntityCategory;
+use async_trait::async_trait;
+use domain::entity::{
+    ClusterEvidence, ClusteringHeuristic, Entity, EntityCategory, RiskScore, SanctionList,
+};
 use domain::error::DomainResult;
-use domain::ports::{EntityRepository, TransferRepository};
-use domain::primitives::{Address, Amount, Ratio};
+use domain::ports::{EntityRepository, RiskPort, TransferRepository};
+use domain::primitives::{Address, Amount, Confidence, Ratio};
+use domain::risk::{
+    RiskEvidence, RiskReport, RiskSignal, RiskSignalKind, SanctionsCheckResult,
+};
 use domain::trace::{
-    FlowPath, Sink, SinkKind, TaintStrategy, TraceDirection, TraceOrigin, TraceRequest,
+    FlowPath, Sink, SinkKind, TaintStrategy, TraceDirection, TraceLimits, TraceOrigin, TraceRequest,
     TraceResult, TraceStats,
 };
 use domain::transfer::Transfer;
 
-pub struct TraceFundsUseCase<R, E> {
+pub struct RiskService<R, E> {
     transfers: R,
     entities: E,
 }
 
-impl<R: TransferRepository, E: EntityRepository> TraceFundsUseCase<R, E> {
+impl<R, E> RiskService<R, E> {
     pub fn new(transfers: R, entities: E) -> Self {
-        Self { transfers, entities }
+        Self {
+            transfers,
+            entities,
+        }
     }
+}
 
-    pub async fn execute(&self, req: TraceRequest) -> DomainResult<TraceResult> {
+#[async_trait]
+impl<R, E> RiskPort for RiskService<R, E>
+where
+    R: TransferRepository,
+    E: EntityRepository,
+{
+    #[tracing::instrument(skip(self, req), fields(
+        direction = ?req.direction(),
+        strategy = ?req.strategy(),
+        max_hops = req.limits().max_hops(),
+        max_addresses = req.limits().max_addresses(),
+    ))]
+    async fn trace(&self, req: TraceRequest) -> DomainResult<TraceResult> {
         tracing::info!(
             direction = ?req.direction(),
             strategy = ?req.strategy(),
@@ -39,11 +61,9 @@ impl<R: TransferRepository, E: EntityRepository> TraceFundsUseCase<R, E> {
         let mut transfers_evaluated: usize = 0;
         let mut truncated = false;
 
-        // Per-trace caches: the same address can appear in many paths — fetch once, share via Arc.
         let mut out_cache: HashMap<Address, Arc<Vec<Arc<Transfer>>>> = HashMap::new();
         let mut in_cache: HashMap<Address, Arc<Vec<Arc<Transfer>>>> = HashMap::new();
 
-        // Queue stores Arc<Transfer> hops — path.clone() copies only pointers, not Transfer data.
         let mut queue: Vec<(Vec<Arc<Transfer>>, Address, Amount, HashSet<Address>)> = seeds
             .into_iter()
             .map(|t| {
@@ -85,7 +105,7 @@ impl<R: TransferRepository, E: EntityRepository> TraceFundsUseCase<R, E> {
                 break;
             }
 
-            tracing::trace!(address = %super::addr_hex(&addr), depth = path.len(), "trace visiting");
+            tracing::trace!(address = %crate::addr_hex(&addr), depth = path.len(), "trace visiting");
 
             addresses_visited.insert(addr.clone());
 
@@ -131,7 +151,6 @@ impl<R: TransferRepository, E: EntityRepository> TraceFundsUseCase<R, E> {
                     .await?;
                 sinks.push(sink);
                 let depth = path.len() as u32;
-                // Clone Transfer data only at terminal paths, not during traversal.
                 let hops = path.iter().map(|a| (**a).clone()).collect();
                 paths.push(FlowPath::new(hops, tainted, taint_ratio, depth));
                 continue;
@@ -164,7 +183,7 @@ impl<R: TransferRepository, E: EntityRepository> TraceFundsUseCase<R, E> {
 
                 let mut next_visited = path_visited.clone();
                 next_visited.insert(next_addr.clone());
-                let mut next_path = path.clone(); // Vec<Arc> clone: pointer copies only
+                let mut next_path = path.clone();
                 next_path.push(Arc::clone(t));
                 queue.push((next_path, next_addr, propagated, next_visited));
             }
@@ -200,7 +219,250 @@ impl<R: TransferRepository, E: EntityRepository> TraceFundsUseCase<R, E> {
         ))
     }
 
-    // Fetches transfers for an address, using the per-trace cache to avoid redundant DB queries.
+    #[tracing::instrument(skip(self, addr), fields(address = %crate::addr_hex(addr)))]
+    async fn score(&self, addr: &Address) -> DomainResult<RiskReport> {
+        tracing::info!(address = %crate::addr_hex(addr), "score started");
+        let mut signals: Vec<RiskSignal> = Vec::new();
+
+        if let Some(entity) = self.entities.find_by_address(addr).await? {
+            tracing::debug!(
+                address = %crate::addr_hex(addr),
+                category = ?entity.category(),
+                "direct entity label found"
+            );
+            let (severity, kind) = match entity.category() {
+                EntityCategory::Sanctioned { .. } => {
+                    (RiskScore::CRITICAL, RiskSignalKind::SanctionedCounterparty)
+                }
+                EntityCategory::Mixer => (RiskScore::HIGH, RiskSignalKind::MixerInteraction),
+                EntityCategory::Darknet => (RiskScore::CRITICAL, RiskSignalKind::DarknetMarket),
+                EntityCategory::Scam => (RiskScore::HIGH, RiskSignalKind::DirectExposure),
+                _ => (RiskScore::LOW, RiskSignalKind::DirectExposure),
+            };
+            signals.push(RiskSignal::new(
+                kind,
+                severity,
+                format!(
+                    "Address is labelled: {}",
+                    entity.label().map(|l| l.name()).unwrap_or("unknown")
+                ),
+                RiskEvidence::EntityCategory(entity.category().clone()),
+            ));
+        }
+
+        let backward = self
+            .trace(TraceRequest::new(
+                TraceOrigin::Address(addr.clone()),
+                TraceDirection::Backward,
+                TaintStrategy::Haircut,
+                TraceLimits::new(5, 200, 100, Some(Ratio::from_percent(5))),
+                false,
+            ))
+            .await?;
+
+        for sink in backward.terminal_sinks() {
+            if sink.risk_score() >= RiskScore::HIGH.value() {
+                let hops = backward
+                    .paths()
+                    .iter()
+                    .filter(|p| p.destination() == Some(sink.address()))
+                    .map(|p| p.depth())
+                    .min()
+                    .unwrap_or(0);
+
+                let kind = if hops == 0 {
+                    RiskSignalKind::DirectExposure
+                } else {
+                    RiskSignalKind::IndirectExposure { hops }
+                };
+
+                signals.push(RiskSignal::new(
+                    kind,
+                    RiskScore::new(sink.risk_score()),
+                    format!(
+                        "Funds traceable to high-risk sink ({})",
+                        sink_label(sink.kind())
+                    ),
+                    RiskEvidence::SinkExposure(vec![sink.clone()]),
+                ));
+            }
+        }
+
+        let forward = self
+            .trace(TraceRequest::new(
+                TraceOrigin::Address(addr.clone()),
+                TraceDirection::Forward,
+                TaintStrategy::Haircut,
+                TraceLimits::new(5, 200, 100, Some(Ratio::from_percent(5))),
+                false,
+            ))
+            .await?;
+
+        for sink in forward.terminal_sinks() {
+            if sink.risk_score() >= RiskScore::HIGH.value() {
+                signals.push(RiskSignal::new(
+                    RiskSignalKind::DirectExposure,
+                    RiskScore::new(sink.risk_score()),
+                    format!(
+                        "Funds sent to high-risk destination ({})",
+                        sink_label(sink.kind())
+                    ),
+                    RiskEvidence::SinkExposure(vec![sink.clone()]),
+                ));
+            }
+        }
+
+        let report = RiskReport::new(addr.clone(), signals);
+        tracing::info!(
+            address = %crate::addr_hex(addr),
+            score = report.overall_score().value(),
+            signals = report.signals().len(),
+            is_high_risk = report.is_high_risk(),
+            "score complete"
+        );
+        Ok(report)
+    }
+
+    #[tracing::instrument(skip(self, addr), fields(address = %crate::addr_hex(addr)))]
+    async fn check_sanctions(&self, addr: &Address) -> DomainResult<SanctionsCheckResult> {
+        tracing::debug!(address = %crate::addr_hex(addr), "sanctions check");
+        let entity = self.entities.find_by_address(addr).await?;
+
+        let (is_sanctioned, sanction_list, label) = match entity {
+            Some(e) => {
+                let list: Option<SanctionList> =
+                    if let EntityCategory::Sanctioned { sanction_list } = e.category() {
+                        Some(sanction_list.clone())
+                    } else {
+                        None
+                    };
+                let label = e.label().map(|l| l.name().to_string());
+                (list.is_some(), list, label)
+            }
+            None => (false, None, None),
+        };
+
+        tracing::debug!(
+            address = %crate::addr_hex(addr),
+            is_sanctioned,
+            "sanctions check result"
+        );
+        Ok(SanctionsCheckResult::new(
+            addr.clone(),
+            is_sanctioned,
+            sanction_list,
+            label,
+        ))
+    }
+
+    async fn check_sanctions_batch(
+        &self,
+        addrs: &[Address],
+    ) -> DomainResult<Vec<SanctionsCheckResult>> {
+        let mut results = Vec::with_capacity(addrs.len());
+        for addr in addrs {
+            results.push(self.check_sanctions(addr).await?);
+        }
+        Ok(results)
+    }
+
+    async fn deposit_reuse_cluster(
+        &self,
+        deposit_addr: &Address,
+    ) -> DomainResult<Option<ClusterEvidence>> {
+        let incoming = self.transfers.find_incoming(deposit_addr, None).await?;
+
+        if incoming.len() < 3 {
+            return Ok(None);
+        }
+
+        let senders: Vec<Address> = {
+            let mut v: Vec<Address> = incoming.into_iter().map(|t| t.from().clone()).collect();
+            v.sort_by(|a, b| a.bytes().cmp(b.bytes()));
+            v.dedup();
+            v
+        };
+
+        if senders.len() < 2 {
+            return Ok(None);
+        }
+
+        Ok(Some(ClusterEvidence::new(
+            senders,
+            ClusteringHeuristic::DepositAddressReuse,
+            Confidence::MEDIUM,
+            Some(format!(
+                "All senders route to deposit address {}",
+                deposit_addr
+            )),
+        )))
+    }
+
+    async fn detect_peeling_chain(
+        &self,
+        addr: &Address,
+    ) -> DomainResult<Option<ClusterEvidence>> {
+        let incoming = self.transfers.find_incoming(addr, None).await?;
+        let outgoing = self.transfers.find_outgoing(addr, None).await?;
+
+        if incoming.is_empty() || outgoing.is_empty() {
+            return Ok(None);
+        }
+
+        let in_sum = incoming.iter().fold(None::<Amount>, |acc, t| {
+            Some(acc.map(|a| a + t.amount()).unwrap_or(t.amount()))
+        });
+        let out_sum = outgoing.iter().fold(None::<Amount>, |acc, t| {
+            Some(acc.map(|a| a + t.amount()).unwrap_or(t.amount()))
+        });
+
+        let (Some(in_total), Some(out_total)) = (in_sum, out_sum) else {
+            return Ok(None);
+        };
+
+        let retained = if out_total.raw() <= in_total.raw() {
+            in_total - out_total
+        } else {
+            return Ok(None);
+        };
+
+        let retained_ratio = retained.ratio_of(&in_total);
+
+        if retained_ratio > Ratio::from_percent(5) {
+            return Ok(None);
+        }
+
+        let chain_addrs: Vec<Address> = outgoing.into_iter().map(|t| t.to().clone()).collect();
+
+        Ok(Some(ClusterEvidence::new(
+            chain_addrs,
+            ClusteringHeuristic::PeelingChain,
+            Confidence::HIGH,
+            Some(format!(
+                "Address retains only {:.1}% of inflow",
+                retained_ratio.as_f64() * 100.0
+            )),
+        )))
+    }
+
+    async fn save_cluster(
+        &self,
+        evidence: ClusterEvidence,
+        category: EntityCategory,
+    ) -> DomainResult<()> {
+        let mut entity = Entity::new(category, RiskScore::MEDIUM);
+        for addr in evidence.addresses() {
+            entity.add_address(addr.clone());
+        }
+        self.entities.save(&entity).await
+    }
+}
+
+impl<R, E> RiskService<R, E>
+where
+    R: TransferRepository,
+    E: EntityRepository,
+{
     async fn fetch_cached(
         &self,
         out_cache: &mut HashMap<Address, Arc<Vec<Arc<Transfer>>>>,
@@ -275,10 +537,8 @@ impl<R: TransferRepository, E: EntityRepository> TraceFundsUseCase<R, E> {
                     self.transfers.find_outgoing(addr, None).await
                 }
             },
-            TraceOrigin::Transaction(hash) => {
-                self.transfers
-                    .find_by_tx(domain::chain::ChainId::ETH, hash)
-                    .await
+            TraceOrigin::Transaction { chain, hash } => {
+                self.transfers.find_by_tx(*chain, hash).await
             }
             TraceOrigin::Transfer(id) => {
                 let all = self.transfers.find_by_tx(id.chain(), id.tx_hash()).await?;
@@ -319,5 +579,16 @@ impl<R: TransferRepository, E: EntityRepository> TraceFundsUseCase<R, E> {
         };
 
         Ok(Sink::new(addr.clone(), kind, tainted, ratio))
+    }
+}
+
+fn sink_label(kind: &SinkKind) -> &'static str {
+    match kind {
+        SinkKind::Exchange { .. } => "exchange",
+        SinkKind::Bridge { .. } => "bridge",
+        SinkKind::Mixer => "mixer",
+        SinkKind::Sanctioned => "sanctioned",
+        SinkKind::Darknet => "darknet",
+        SinkKind::Unresolved => "unresolved",
     }
 }

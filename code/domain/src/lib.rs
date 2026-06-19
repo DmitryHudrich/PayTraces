@@ -12,6 +12,8 @@ pub mod trace;
 
 pub mod risk;
 
+pub mod graph;
+
 pub mod error;
 
 pub mod ports;

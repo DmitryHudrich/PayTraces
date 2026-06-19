@@ -1,7 +1,42 @@
-use crate::entity::{EntityCategory, RiskScore};
+use crate::entity::{EntityCategory, RiskScore, SanctionList};
 use crate::primitives::Address;
 use crate::trace::Sink;
 use chrono::{DateTime, Utc};
+
+#[derive(Debug, Clone)]
+pub struct SanctionsCheckResult {
+    address: Address,
+    is_sanctioned: bool,
+    sanction_list: Option<SanctionList>,
+    label: Option<String>,
+}
+
+impl SanctionsCheckResult {
+    pub fn new(
+        address: Address,
+        is_sanctioned: bool,
+        sanction_list: Option<SanctionList>,
+        label: Option<String>,
+    ) -> Self {
+        Self { address, is_sanctioned, sanction_list, label }
+    }
+
+    pub fn address(&self) -> &Address {
+        &self.address
+    }
+
+    pub fn is_sanctioned(&self) -> bool {
+        self.is_sanctioned
+    }
+
+    pub fn sanction_list(&self) -> Option<&SanctionList> {
+        self.sanction_list.as_ref()
+    }
+
+    pub fn label(&self) -> Option<&str> {
+        self.label.as_deref()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct RiskReport {

@@ -36,14 +36,100 @@ pub enum AddressModel {
     Utxo,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainFamily {
+    Evm,
+    Tron,
+    Bitcoin,
+    Solana,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressEncoding {
+    Hex20,
+    TronBase58Check,
+    Bech32,
+    Base58,
+}
+
+impl AddressEncoding {
+    pub fn payload_len(self) -> usize {
+        match self {
+            Self::Hex20 => 20,
+            Self::TronBase58Check => 21,
+            Self::Bech32 => 20,
+            Self::Base58 => 32,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ChainMeta {
-    pub id: ChainId,
-    pub name: &'static str,
-    pub address_model: AddressModel,
-    pub confirmation_depth: u64,
-    pub native_asset_symbol: &'static str,
-    pub native_asset_decimals: u8,
+    id: ChainId,
+    name: &'static str,
+    family: ChainFamily,
+    address_model: AddressModel,
+    address_encoding: AddressEncoding,
+    confirmation_depth: u64,
+    native_asset_symbol: &'static str,
+    native_asset_decimals: u8,
+}
+
+impl ChainMeta {
+    pub fn new(
+        id: ChainId,
+        name: &'static str,
+        family: ChainFamily,
+        address_model: AddressModel,
+        address_encoding: AddressEncoding,
+        confirmation_depth: u64,
+        native_asset_symbol: &'static str,
+        native_asset_decimals: u8,
+    ) -> Self {
+        Self {
+            id,
+            name,
+            family,
+            address_model,
+            address_encoding,
+            confirmation_depth,
+            native_asset_symbol,
+            native_asset_decimals,
+        }
+    }
+
+    pub fn id(&self) -> ChainId {
+        self.id
+    }
+
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+
+    pub fn family(&self) -> ChainFamily {
+        self.family
+    }
+
+    pub fn address_model(&self) -> AddressModel {
+        self.address_model
+    }
+
+    pub fn address_encoding(&self) -> AddressEncoding {
+        self.address_encoding
+    }
+
+    pub fn confirmation_depth(&self) -> u64 {
+        self.confirmation_depth
+    }
+
+    pub fn native_asset_symbol(&self) -> &'static str {
+        self.native_asset_symbol
+    }
+
+    pub fn native_asset_decimals(&self) -> u8 {
+        self.native_asset_decimals
+    }
 }
 
 pub struct ChainRegistry {
@@ -54,40 +140,72 @@ impl ChainRegistry {
     pub fn default_registry() -> Self {
         Self {
             entries: vec![
-                ChainMeta {
-                    id: ChainId::ETH,
-                    name: "Ethereum",
-                    address_model: AddressModel::Account,
-                    confirmation_depth: 12,
-                    native_asset_symbol: "ETH",
-                    native_asset_decimals: 18,
-                },
-                ChainMeta {
-                    id: ChainId::TRON,
-                    name: "Tron",
-                    address_model: AddressModel::Account,
-                    confirmation_depth: 20,
-                    native_asset_symbol: "TRX",
-                    native_asset_decimals: 6,
-                },
-                ChainMeta {
-                    id: ChainId::BTC,
-                    name: "Bitcoin",
-                    address_model: AddressModel::Utxo,
-                    confirmation_depth: 6,
-                    native_asset_symbol: "BTC",
-                    native_asset_decimals: 8,
-                },
+                ChainMeta::new(
+                    ChainId::ETH,
+                    "Ethereum",
+                    ChainFamily::Evm,
+                    AddressModel::Account,
+                    AddressEncoding::Hex20,
+                    12,
+                    "ETH",
+                    18,
+                ),
+                ChainMeta::new(
+                    ChainId::TRON,
+                    "Tron",
+                    ChainFamily::Tron,
+                    AddressModel::Account,
+                    AddressEncoding::TronBase58Check,
+                    20,
+                    "TRX",
+                    6,
+                ),
+                ChainMeta::new(
+                    ChainId::BTC,
+                    "Bitcoin",
+                    ChainFamily::Bitcoin,
+                    AddressModel::Utxo,
+                    AddressEncoding::Bech32,
+                    6,
+                    "BTC",
+                    8,
+                ),
+                ChainMeta::new(
+                    ChainId::SOLANA,
+                    "Solana",
+                    ChainFamily::Solana,
+                    AddressModel::Account,
+                    AddressEncoding::Base58,
+                    32,
+                    "SOL",
+                    9,
+                ),
             ],
         }
     }
 
     pub fn get(&self, id: ChainId) -> Option<&ChainMeta> {
-        self.entries.iter().find(|m| m.id == id)
+        self.entries.iter().find(|m| m.id() == id)
+    }
+
+    pub fn all(&self) -> &[ChainMeta] {
+        &self.entries
     }
 
     pub fn register(&mut self, meta: ChainMeta) {
-        self.entries.retain(|m| m.id != meta.id);
+        self.entries.retain(|m| m.id() != meta.id());
         self.entries.push(meta);
+    }
+
+    pub fn encoding_for(&self, id: ChainId) -> AddressEncoding {
+        self.get(id)
+            .map(|m| m.address_encoding())
+            .unwrap_or(AddressEncoding::Hex20)
+    }
+}
+
+impl Default for ChainRegistry {
+    fn default() -> Self {
+        Self::default_registry()
     }
 }

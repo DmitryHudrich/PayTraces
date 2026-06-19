@@ -1,16 +1,21 @@
 use crate::asset::{AssetId, AssetMeta};
 use crate::chain::ChainId;
-use crate::entity::{Entity, EntityId};
+use crate::entity::{ClusterEvidence, Entity, EntityCategory, EntityId};
 use crate::error::DomainResult;
+use crate::graph::{GraphRequest, TransferGraph};
 use crate::primitives::{Address, BlockRef};
+use crate::risk::{RiskReport, SanctionsCheckResult};
+use crate::trace::{TraceRequest, TraceResult};
 use crate::transfer::{NormalizedBlock, Transfer};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy)]
 pub struct BlockRange {
     from_height: u64,
     to_height: u64,
+    time_window: Option<(DateTime<Utc>, DateTime<Utc>)>,
 }
 
 impl BlockRange {
@@ -19,14 +24,22 @@ impl BlockRange {
         Self {
             from_height,
             to_height,
+            time_window: None,
         }
     }
 
     pub fn single(height: u64) -> Self {
-        Self {
-            from_height: height,
-            to_height: height,
-        }
+        Self::new(height, height)
+    }
+
+    pub fn full() -> Self {
+        Self::new(0, u64::MAX)
+    }
+
+    pub fn with_time_window(mut self, from: DateTime<Utc>, to: DateTime<Utc>) -> Self {
+        assert!(from <= to);
+        self.time_window = Some((from, to));
+        self
     }
 
     pub fn from_height(&self) -> u64 {
@@ -35,6 +48,20 @@ impl BlockRange {
 
     pub fn to_height(&self) -> u64 {
         self.to_height
+    }
+
+    pub fn time_window(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        self.time_window
+    }
+
+    pub fn is_unbounded(&self) -> bool {
+        self.from_height == 0 && self.to_height == u64::MAX && self.time_window.is_none()
+    }
+}
+
+impl Default for BlockRange {
+    fn default() -> Self {
+        Self::full()
     }
 }
 
@@ -47,7 +74,14 @@ pub trait ChainSource: Send + Sync {
         &self,
         addr: &Address,
         range: BlockRange,
+        max_transfers: usize,
     ) -> DomainResult<Vec<Transfer>>;
+}
+
+#[async_trait]
+pub trait ChainSourceRegistry: Send + Sync {
+    fn source(&self, chain: ChainId) -> Option<Arc<dyn ChainSource>>;
+    fn supported_chains(&self) -> Vec<ChainId>;
 }
 
 #[async_trait]
@@ -88,4 +122,45 @@ pub trait AssetRepository: Send + Sync {
 #[async_trait]
 pub trait LabelProvider: Send + Sync {
     async fn resolve(&self, addr: &Address) -> DomainResult<Option<crate::entity::EntityLabel>>;
+}
+
+/// Application port covering data ingestion and transfer-graph construction.
+#[async_trait]
+pub trait IngestionPort: Send + Sync {
+    async fn build_graph(
+        &self,
+        origin: &Address,
+        req: GraphRequest,
+    ) -> DomainResult<TransferGraph>;
+}
+
+/// Application port covering risk analysis: tracing, scoring, sanctions and clustering.
+#[async_trait]
+pub trait RiskPort: Send + Sync {
+    async fn trace(&self, req: TraceRequest) -> DomainResult<TraceResult>;
+
+    async fn score(&self, addr: &Address) -> DomainResult<RiskReport>;
+
+    async fn check_sanctions(&self, addr: &Address) -> DomainResult<SanctionsCheckResult>;
+
+    async fn check_sanctions_batch(
+        &self,
+        addrs: &[Address],
+    ) -> DomainResult<Vec<SanctionsCheckResult>>;
+
+    async fn deposit_reuse_cluster(
+        &self,
+        deposit_addr: &Address,
+    ) -> DomainResult<Option<ClusterEvidence>>;
+
+    async fn detect_peeling_chain(
+        &self,
+        addr: &Address,
+    ) -> DomainResult<Option<ClusterEvidence>>;
+
+    async fn save_cluster(
+        &self,
+        evidence: ClusterEvidence,
+        category: EntityCategory,
+    ) -> DomainResult<()>;
 }

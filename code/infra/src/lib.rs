@@ -10,10 +10,15 @@ use domain::error::{DomainError, DomainResult};
 use domain::ports::EntityRepository;
 use domain::primitives::Address;
 
+pub mod chain_sources;
 pub mod fetch_wallet_api;
 pub mod pg;
+pub mod tron_source;
 mod transfer_repo;
+
+pub use chain_sources::{ChainSources, ChainSourcesBuilder};
 pub use transfer_repo::PostgresTransferRepository;
+pub use tron_source::{TronGridConfig, TronGridSource};
 
 pub struct PostgresEntityRepository {
     pool: Pool,

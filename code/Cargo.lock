@@ -740,6 +740,7 @@ dependencies = [
  "usecase",
  "utoipa",
  "utoipa-swagger-ui",
+ "uuid",
 ]
 
 [[package]]
@@ -3552,6 +3553,8 @@ dependencies = [
  "chrono",
  "fallible-iterator",
  "postgres-protocol",
+ "serde_core",
+ "serde_json",
  "uuid",
 ]
 
@@ -5514,7 +5517,9 @@ dependencies = [
  "anyhow",
  "async-trait",
  "domain",
+ "futures",
  "hex",
+ "moka",
  "thiserror 2.0.18",
  "tracing",
 ]

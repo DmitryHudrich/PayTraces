@@ -128,7 +128,19 @@ impl TransferRepository for PostgresTransferRepository {
                       decimals, block_height, block_hash, ts, kind, token_standard,
                       vin_idx, vout_idx, finality)
                  ON CONFLICT (chain_id, tx_hash, idx) DO UPDATE
-                    SET finality = EXCLUDED.finality",
+                    SET from_addr      = EXCLUDED.from_addr,
+                        to_addr        = EXCLUDED.to_addr,
+                        asset_contract = EXCLUDED.asset_contract,
+                        amount         = EXCLUDED.amount,
+                        decimals       = EXCLUDED.decimals,
+                        block_height   = EXCLUDED.block_height,
+                        block_hash     = EXCLUDED.block_hash,
+                        ts             = EXCLUDED.ts,
+                        kind           = EXCLUDED.kind,
+                        token_standard = EXCLUDED.token_standard,
+                        vin_idx        = EXCLUDED.vin_idx,
+                        vout_idx       = EXCLUDED.vout_idx,
+                        finality       = EXCLUDED.finality",
                 &[
                     &chain_ids,
                     &tx_hashes,
@@ -230,6 +242,47 @@ impl TransferRepository for PostgresTransferRepository {
         after: Option<DateTime<Utc>>,
     ) -> DomainResult<Vec<Transfer>> {
         self.find_directed(addr, after, false).await
+    }
+
+    async fn max_block_height(&self, addr: &Address) -> DomainResult<Option<u64>> {
+        let client = self.pool.get().await.map_err(pool_err)?;
+        let row = client
+            .query_one(
+                "SELECT MAX(block_height) AS h FROM transfers
+                 WHERE chain_id = $1 AND (from_addr = $2 OR to_addr = $2)",
+                &[&(addr.chain().value() as i32), &addr.bytes()],
+            )
+            .await
+            .map_err(pg_err)?;
+        let h: Option<i64> = row.get("h");
+        Ok(h.map(|v| v.max(0) as u64))
+    }
+
+    async fn delete_in_range(
+        &self,
+        addr: &Address,
+        from_block: u64,
+        to_block: u64,
+    ) -> DomainResult<u64> {
+        let client = self.pool.get().await.map_err(pool_err)?;
+        let from_h = from_block.min(i64::MAX as u64) as i64;
+        let to_h = to_block.min(i64::MAX as u64) as i64;
+        let affected = client
+            .execute(
+                "DELETE FROM transfers
+                 WHERE chain_id = $1
+                   AND (from_addr = $2 OR to_addr = $2)
+                   AND block_height BETWEEN $3 AND $4",
+                &[
+                    &(addr.chain().value() as i32),
+                    &addr.bytes(),
+                    &from_h,
+                    &to_h,
+                ],
+            )
+            .await
+            .map_err(pg_err)?;
+        Ok(affected)
     }
 }
 

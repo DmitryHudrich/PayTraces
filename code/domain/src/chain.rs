@@ -132,6 +132,7 @@ impl ChainMeta {
     }
 }
 
+#[derive(Clone)]
 pub struct ChainRegistry {
     entries: Vec<ChainMeta>,
 }

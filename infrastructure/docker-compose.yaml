@@ -1,0 +1,62 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: wallet
+      POSTGRES_PASSWORD: wallet
+      POSTGRES_DB: wallet_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  tempo:
+    image: grafana/tempo:2.7.2
+    ports:
+      - "4317:4317"   # OTLP gRPC (traces in)
+      - "4318:4318"   # OTLP HTTP (traces in)
+      - "3200:3200"   # Tempo HTTP API (Grafana datasource)
+    volumes:
+      - ./observability/tempo.yaml:/etc/tempo/config.yaml
+      - tempo_data:/var/tempo
+    command: -config.file=/etc/tempo/config.yaml
+
+  loki:
+    image: grafana/loki:3.3.0
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./observability/loki.yaml:/etc/loki/local-config.yaml
+      - loki_data:/loki
+    command: -config.file=/etc/loki/local-config.yaml
+
+  promtail:
+    image: grafana/promtail:3.3.0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - ./observability/promtail.yaml:/etc/promtail/config.yaml
+    command: -config.file=/etc/promtail/config.yaml
+    depends_on:
+      - loki
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_FEATURE_TOGGLES_ENABLE=traceToMetrics
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning
+    depends_on:
+      - loki
+      - tempo
+
+volumes:
+  postgres_data:
+  loki_data:
+  grafana_data:
+  tempo_data:

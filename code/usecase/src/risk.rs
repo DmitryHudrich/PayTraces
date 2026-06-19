@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use domain::entity::{
@@ -16,18 +17,70 @@ use domain::trace::{
     TraceResult, TraceStats,
 };
 use domain::transfer::Transfer;
+use moka::future::Cache;
+
+#[derive(Debug, Clone)]
+pub struct RiskCacheConfig {
+    pub score_ttl: Duration,
+    pub score_max_entries: u64,
+    pub sanctions_ttl: Duration,
+    pub sanctions_max_entries: u64,
+}
+
+impl Default for RiskCacheConfig {
+    fn default() -> Self {
+        Self {
+            score_ttl: Duration::from_secs(300),
+            score_max_entries: 10_000,
+            sanctions_ttl: Duration::from_secs(900),
+            sanctions_max_entries: 10_000,
+        }
+    }
+}
 
 pub struct RiskService<R, E> {
     transfers: R,
     entities: E,
+    score_cache: Cache<Address, RiskReport>,
+    sanctions_cache: Cache<Address, SanctionsCheckResult>,
 }
 
 impl<R, E> RiskService<R, E> {
-    pub fn new(transfers: R, entities: E) -> Self {
+    pub fn new(transfers: R, entities: E, cache: RiskCacheConfig) -> Self {
+        let score_cache = Cache::builder()
+            .max_capacity(cache.score_max_entries)
+            .time_to_live(cache.score_ttl)
+            .build();
+        let sanctions_cache = Cache::builder()
+            .max_capacity(cache.sanctions_max_entries)
+            .time_to_live(cache.sanctions_ttl)
+            .build();
         Self {
             transfers,
             entities,
+            score_cache,
+            sanctions_cache,
         }
+    }
+}
+
+impl<R, E> RiskService<R, E>
+where
+    R: TransferRepository,
+    E: EntityRepository,
+{
+    pub async fn score_batch(
+        &self,
+        addresses: &[Address],
+    ) -> DomainResult<Vec<RiskReport>> {
+        use futures::stream::{FuturesUnordered, StreamExt};
+        let mut futs: FuturesUnordered<_> =
+            addresses.iter().map(|addr| self.score(addr)).collect();
+        let mut results = Vec::with_capacity(addresses.len());
+        while let Some(res) = futs.next().await {
+            results.push(res?);
+        }
+        Ok(results)
     }
 }
 
@@ -221,6 +274,10 @@ where
 
     #[tracing::instrument(skip(self, addr), fields(address = %crate::addr_hex(addr)))]
     async fn score(&self, addr: &Address) -> DomainResult<RiskReport> {
+        if let Some(cached) = self.score_cache.get(addr).await {
+            tracing::debug!(address = %crate::addr_hex(addr), "score cache hit");
+            return Ok(cached);
+        }
         tracing::info!(address = %crate::addr_hex(addr), "score started");
         let mut signals: Vec<RiskSignal> = Vec::new();
 
@@ -320,11 +377,16 @@ where
             is_high_risk = report.is_high_risk(),
             "score complete"
         );
+        self.score_cache.insert(addr.clone(), report.clone()).await;
         Ok(report)
     }
 
     #[tracing::instrument(skip(self, addr), fields(address = %crate::addr_hex(addr)))]
     async fn check_sanctions(&self, addr: &Address) -> DomainResult<SanctionsCheckResult> {
+        if let Some(cached) = self.sanctions_cache.get(addr).await {
+            tracing::debug!(address = %crate::addr_hex(addr), "sanctions cache hit");
+            return Ok(cached);
+        }
         tracing::debug!(address = %crate::addr_hex(addr), "sanctions check");
         let entity = self.entities.find_by_address(addr).await?;
 
@@ -347,12 +409,14 @@ where
             is_sanctioned,
             "sanctions check result"
         );
-        Ok(SanctionsCheckResult::new(
+        let result = SanctionsCheckResult::new(
             addr.clone(),
             is_sanctioned,
             sanction_list,
             label,
-        ))
+        );
+        self.sanctions_cache.insert(addr.clone(), result.clone()).await;
+        Ok(result)
     }
 
     async fn check_sanctions_batch(

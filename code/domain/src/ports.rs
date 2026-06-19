@@ -65,6 +65,12 @@ impl Default for BlockRange {
     }
 }
 
+/// Caching contract for implementors:
+/// blocks with height `> latest − ChainMeta::confirmation_depth` may still be
+/// reorganized. Implementations that cache pages SHOULD either skip caching
+/// such pages, use a short TTL, or read only finalized data (e.g. TRON's
+/// `only_confirmed=true`). Mixing finalized and unfinalized data in a long-TTL
+/// cache will leak stale state across reorgs.
 #[async_trait]
 pub trait ChainSource: Send + Sync {
     fn chain_id(&self) -> ChainId;
@@ -103,6 +109,20 @@ pub trait TransferRepository: Send + Sync {
         addr: &Address,
         after: Option<DateTime<Utc>>,
     ) -> DomainResult<Vec<Transfer>>;
+
+    /// Highest block height already persisted for transfers touching `addr`.
+    /// Used by incremental ingest to size the refresh window.
+    async fn max_block_height(&self, addr: &Address) -> DomainResult<Option<u64>>;
+
+    /// Remove all transfers touching `addr` whose `block_height` is inside
+    /// `[from_block, to_block]`. Used to drop reorged tail before re-saving.
+    /// Returns the number of rows deleted.
+    async fn delete_in_range(
+        &self,
+        addr: &Address,
+        from_block: u64,
+        to_block: u64,
+    ) -> DomainResult<u64>;
 }
 
 #[async_trait]

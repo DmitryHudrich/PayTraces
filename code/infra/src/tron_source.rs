@@ -86,6 +86,10 @@ struct PageKey {
 
 type PageValue = Arc<(Vec<Transfer>, Option<String>)>;
 
+/// Reads only solidified (`only_confirmed=true`) data — see
+/// `side_api/tron/endpoints.rs`. TRON DPoS finality means solidified blocks
+/// never reorg, so the hot-tail problem (relevant for ETH/Moralis) doesn't
+/// apply here and pages can be cached aggressively with a single TTL.
 #[derive(Clone)]
 pub struct TronGridSource {
     base_url: String,

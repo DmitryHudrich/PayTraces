@@ -42,6 +42,8 @@ impl LogConfig {
 pub struct ServerConfig {
     host: String,
     port: u16,
+    #[serde(default, rename = "api_key")]
+    api_key: Option<String>,
 }
 
 impl ServerConfig {
@@ -51,6 +53,10 @@ impl ServerConfig {
 
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    pub fn api_key(&self) -> Option<&str> {
+        self.api_key.as_deref().filter(|s| !s.is_empty())
     }
 }
 
@@ -178,8 +184,17 @@ impl FileCacheConfig {
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct CacheConfigFile {
-    #[serde(default = "CacheConfigFile::default_page_ttl_secs")]
-    page_ttl_secs: u64,
+    #[serde(
+        default = "CacheConfigFile::default_cold_ttl_secs",
+        alias = "page_ttl_secs"
+    )]
+    cold_ttl_secs: u64,
+    #[serde(default = "CacheConfigFile::default_hot_ttl_secs")]
+    hot_ttl_secs: u64,
+    #[serde(default = "CacheConfigFile::default_cache_hot_tail")]
+    cache_hot_tail: bool,
+    #[serde(default = "CacheConfigFile::default_confirmation_depth")]
+    confirmation_depth: u64,
     #[serde(default = "CacheConfigFile::default_page_max_capacity")]
     page_max_capacity: u64,
     #[serde(default = "CacheConfigFile::default_latest_block_ttl_secs")]
@@ -191,7 +206,10 @@ pub struct CacheConfigFile {
 impl Default for CacheConfigFile {
     fn default() -> Self {
         Self {
-            page_ttl_secs: Self::default_page_ttl_secs(),
+            cold_ttl_secs: Self::default_cold_ttl_secs(),
+            hot_ttl_secs: Self::default_hot_ttl_secs(),
+            cache_hot_tail: Self::default_cache_hot_tail(),
+            confirmation_depth: Self::default_confirmation_depth(),
             page_max_capacity: Self::default_page_max_capacity(),
             latest_block_ttl_secs: Self::default_latest_block_ttl_secs(),
             file_cache: FileCacheConfig::default(),
@@ -200,8 +218,17 @@ impl Default for CacheConfigFile {
 }
 
 impl CacheConfigFile {
-    fn default_page_ttl_secs() -> u64 {
+    fn default_cold_ttl_secs() -> u64 {
         86_400
+    }
+    fn default_hot_ttl_secs() -> u64 {
+        15
+    }
+    fn default_cache_hot_tail() -> bool {
+        true
+    }
+    fn default_confirmation_depth() -> u64 {
+        12
     }
     fn default_page_max_capacity() -> u64 {
         100_000
@@ -213,7 +240,10 @@ impl CacheConfigFile {
     pub fn into_domain(self) -> infra::fetch_wallet_api::CacheConfig {
         infra::fetch_wallet_api::CacheConfig::new(
             self.page_max_capacity,
-            Duration::from_secs(self.page_ttl_secs),
+            Duration::from_secs(self.cold_ttl_secs),
+            Duration::from_secs(self.hot_ttl_secs),
+            self.cache_hot_tail,
+            self.confirmation_depth,
             Duration::from_secs(self.latest_block_ttl_secs),
             if self.file_cache.enabled {
                 Some(std::path::PathBuf::from(self.file_cache.dir))
@@ -221,6 +251,50 @@ impl CacheConfigFile {
                 None
             },
         )
+    }
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct RiskCacheConfigFile {
+    #[serde(default = "RiskCacheConfigFile::default_score_ttl_secs")]
+    score_ttl_secs: u64,
+    #[serde(default = "RiskCacheConfigFile::default_max_entries")]
+    score_max_entries: u64,
+    #[serde(default = "RiskCacheConfigFile::default_sanctions_ttl_secs")]
+    sanctions_ttl_secs: u64,
+    #[serde(default = "RiskCacheConfigFile::default_max_entries")]
+    sanctions_max_entries: u64,
+}
+
+impl Default for RiskCacheConfigFile {
+    fn default() -> Self {
+        Self {
+            score_ttl_secs: Self::default_score_ttl_secs(),
+            score_max_entries: Self::default_max_entries(),
+            sanctions_ttl_secs: Self::default_sanctions_ttl_secs(),
+            sanctions_max_entries: Self::default_max_entries(),
+        }
+    }
+}
+
+impl RiskCacheConfigFile {
+    fn default_score_ttl_secs() -> u64 {
+        300
+    }
+    fn default_sanctions_ttl_secs() -> u64 {
+        900
+    }
+    fn default_max_entries() -> u64 {
+        10_000
+    }
+
+    pub fn into_domain(self) -> usecase::risk::RiskCacheConfig {
+        usecase::risk::RiskCacheConfig {
+            score_ttl: Duration::from_secs(self.score_ttl_secs),
+            score_max_entries: self.score_max_entries,
+            sanctions_ttl: Duration::from_secs(self.sanctions_ttl_secs),
+            sanctions_max_entries: self.sanctions_max_entries,
+        }
     }
 }
 
@@ -298,6 +372,8 @@ pub struct AppConfig {
     log: LogConfig,
     #[serde(default)]
     telemetry: TelemetryConfig,
+    #[serde(default)]
+    risk_cache: RiskCacheConfigFile,
 }
 
 impl AppConfig {
@@ -327,6 +403,10 @@ impl AppConfig {
 
     pub fn telemetry(&self) -> &TelemetryConfig {
         &self.telemetry
+    }
+
+    pub fn risk_cache(&self) -> &RiskCacheConfigFile {
+        &self.risk_cache
     }
 
     pub fn load(cli: &Cli) -> anyhow::Result<Self> {

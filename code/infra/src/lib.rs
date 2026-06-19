@@ -12,11 +12,13 @@ use domain::primitives::Address;
 
 pub mod chain_sources;
 pub mod fetch_wallet_api;
+mod job_repo;
 pub mod pg;
 pub mod tron_source;
 mod transfer_repo;
 
 pub use chain_sources::{ChainSources, ChainSourcesBuilder};
+pub use job_repo::{JobRepository, JobRow};
 pub use transfer_repo::PostgresTransferRepository;
 pub use tron_source::{TronGridConfig, TronGridSource};
 
@@ -299,7 +301,7 @@ fn str_to_label_source(s: Option<&str>) -> LabelSource {
     }
 }
 
-fn pg_err(e: tokio_postgres::Error) -> DomainError {
+pub(crate) fn pg_err(e: tokio_postgres::Error) -> DomainError {
     let detail = e
         .as_db_error()
         .map(|db| {
@@ -316,6 +318,6 @@ fn pg_err(e: tokio_postgres::Error) -> DomainError {
     DomainError::InsufficientData(detail)
 }
 
-fn pool_err(e: deadpool_postgres::PoolError) -> DomainError {
+pub(crate) fn pool_err(e: deadpool_postgres::PoolError) -> DomainError {
     DomainError::InsufficientData(e.to_string())
 }

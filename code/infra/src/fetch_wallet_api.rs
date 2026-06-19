@@ -52,21 +52,31 @@ type PageValue = Arc<(Vec<Transfer>, Option<String>)>;
 #[derive(Debug, Clone)]
 pub struct CacheConfig {
     page_cache_max_capacity: u64,
-    page_cache_ttl: Duration,
+    cold_ttl: Duration,
+    hot_ttl: Duration,
+    cache_hot_tail: bool,
+    confirmation_depth: u64,
     latest_block_cache_ttl: Duration,
     file_cache_dir: Option<PathBuf>,
 }
 
 impl CacheConfig {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         page_cache_max_capacity: u64,
-        page_cache_ttl: Duration,
+        cold_ttl: Duration,
+        hot_ttl: Duration,
+        cache_hot_tail: bool,
+        confirmation_depth: u64,
         latest_block_cache_ttl: Duration,
         file_cache_dir: Option<PathBuf>,
     ) -> Self {
         Self {
             page_cache_max_capacity,
-            page_cache_ttl,
+            cold_ttl,
+            hot_ttl,
+            cache_hot_tail,
+            confirmation_depth,
             latest_block_cache_ttl,
             file_cache_dir,
         }
@@ -77,7 +87,10 @@ impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             page_cache_max_capacity: 10_000,
-            page_cache_ttl: Duration::from_secs(60 * 60 * 24),
+            cold_ttl: Duration::from_secs(60 * 60 * 24),
+            hot_ttl: Duration::from_secs(15),
+            cache_hot_tail: true,
+            confirmation_depth: 12,
             latest_block_cache_ttl: Duration::from_secs(15),
             file_cache_dir: None,
         }
@@ -89,7 +102,10 @@ pub struct MoralisEthSource {
     api_key: String,
     base_url: String,
     client: reqwest::Client,
-    page_cache: Cache<PageKey, PageValue>,
+    cold_page_cache: Cache<PageKey, PageValue>,
+    hot_page_cache: Cache<PageKey, PageValue>,
+    cache_hot_tail: bool,
+    confirmation_depth: u64,
     latest_block_cache: Cache<(), u64>,
     file_cache_dir: Option<PathBuf>,
     hot_cache: Arc<HashMap<PathBuf, PageValue>>,
@@ -102,10 +118,16 @@ impl MoralisEthSource {
         client: reqwest::Client,
         cache: CacheConfig,
     ) -> Self {
-        let page_cache = Cache::builder()
+        let cold_page_cache = Cache::builder()
             .max_capacity(cache.page_cache_max_capacity)
             .weigher(|_k: &PageKey, v: &PageValue| v.0.len().max(1) as u32)
-            .time_to_live(cache.page_cache_ttl)
+            .time_to_live(cache.cold_ttl)
+            .build();
+
+        let hot_page_cache = Cache::builder()
+            .max_capacity(cache.page_cache_max_capacity)
+            .weigher(|_k: &PageKey, v: &PageValue| v.0.len().max(1) as u32)
+            .time_to_live(cache.hot_ttl)
             .build();
 
         let latest_block_cache = Cache::builder()
@@ -122,11 +144,80 @@ impl MoralisEthSource {
             api_key: api_key.into(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             client,
-            page_cache,
+            cold_page_cache,
+            hot_page_cache,
+            cache_hot_tail: cache.cache_hot_tail,
+            confirmation_depth: cache.confirmation_depth,
             latest_block_cache,
             file_cache_dir: cache.file_cache_dir,
             hot_cache,
         }
+    }
+
+    async fn latest_block_height(&self) -> Option<u64> {
+        if let Some(h) = self.latest_block_cache.get(&()).await {
+            return Some(h);
+        }
+        let url = format!(
+            "{}/dateToBlock?chain=eth&date={}",
+            self.base_url,
+            chrono::Utc::now().timestamp()
+        );
+        let body = match self.http_get_text(&url).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(url, error = %e, "moralis dateToBlock HTTP failed");
+                return None;
+            }
+        };
+        let resp = match serde_json::from_str::<side_api::moralis::dto::DateToBlockResponse>(&body)
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    url,
+                    error = %e,
+                    body_preview = %body.chars().take(200).collect::<String>(),
+                    "moralis dateToBlock body parse failed"
+                );
+                return None;
+            }
+        };
+        let h = resp.block();
+        self.latest_block_cache.insert((), h).await;
+        Some(h)
+    }
+
+    async fn classify_page(&self, transfers: &[Transfer], requested_to: Option<u64>) -> bool {
+        let Some(latest) = self.latest_block_height().await else {
+            return true;
+        };
+        let cutoff = latest.saturating_sub(self.confirmation_depth);
+        if transfers.is_empty() {
+            match requested_to {
+                None => true,
+                Some(to) => to > cutoff,
+            }
+        } else {
+            transfers.iter().any(|t| t.block().height() > cutoff)
+        }
+    }
+
+    async fn insert_page(&self, key: PageKey, value: PageValue, is_hot: bool) {
+        if is_hot {
+            if self.cache_hot_tail {
+                self.hot_page_cache.insert(key, value).await;
+            }
+        } else {
+            self.cold_page_cache.insert(key, value).await;
+        }
+    }
+
+    async fn lookup_page(&self, key: &PageKey) -> Option<PageValue> {
+        if let Some(v) = self.cold_page_cache.get(key).await {
+            return Some(v);
+        }
+        self.hot_page_cache.get(key).await
     }
 
     async fn load_hot_cache(dir: &PathBuf) -> HashMap<PathBuf, PageValue> {
@@ -309,7 +400,7 @@ impl MoralisEthSource {
             to_block,
         };
 
-        if let Some(v) = self.page_cache.get(&key).await {
+        if let Some(v) = self.lookup_page(&key).await {
             tracing::debug!(address = address_hex, endpoint = "native", "moka cache hit");
             return Ok(v);
         }
@@ -322,54 +413,59 @@ impl MoralisEthSource {
             to_block,
         );
 
-        if let Some(ref path) = file_path {
-            if let Some(v) = self.hot_cache.get(path) {
-                tracing::debug!(address = address_hex, "hot cache hit (native)");
-                self.page_cache.insert(key, Arc::clone(v)).await;
+        if let Some(ref path) = file_path
+            && let Some(v) = self.hot_cache.get(path)
+        {
+            let is_hot = self.classify_page(&v.0, to_block).await;
+            if !is_hot {
+                tracing::debug!(address = address_hex, "hot cache hit (native, cold)");
+                self.insert_page(key, Arc::clone(v), false).await;
                 return Ok(Arc::clone(v));
             }
+            tracing::warn!(
+                address = address_hex,
+                path = %path.display(),
+                "preloaded page classifies as hot; dropping stale disk cache"
+            );
+            let _ = tokio::fs::remove_file(path).await;
         }
 
-        let body = match file_path.as_deref() {
-            Some(path) => match Self::file_read(path).await {
-                Some(cached) => {
-                    tracing::debug!(address = address_hex, path = %path.display(), "file cache hit (disk)");
-                    cached
-                }
-                None => {
-                    tracing::debug!(address = address_hex, path = %path.display(), "file cache miss");
-                    let body = self
-                        .http_get_text(&self.build_native_url(
-                            address_hex,
-                            cursor,
-                            from_block,
-                            to_block,
-                        ))
-                        .await?;
-                    Self::file_write(path, &body).await;
-                    body
-                }
-            },
-            None => {
-                self.http_get_text(&self.build_native_url(
-                    address_hex,
-                    cursor,
-                    from_block,
-                    to_block,
-                ))
-                .await?
-            }
-        };
+        let url = self.build_native_url(address_hex, cursor, from_block, to_block);
+        let (mut body, mut from_disk) =
+            self.read_or_fetch(file_path.as_deref(), &url, address_hex).await?;
+        let mut value = Arc::new(parse_native_response(&body)?);
+        let mut is_hot = self.classify_page(&value.0, to_block).await;
 
-        let value = Arc::new(parse_native_response(&body)?);
+        if from_disk && is_hot {
+            tracing::warn!(
+                address = address_hex,
+                "disk cache hit on a hot-classified page; dropping and refetching"
+            );
+            if let Some(path) = file_path.as_deref() {
+                let _ = tokio::fs::remove_file(path).await;
+            }
+            body = self.http_get_text(&url).await?;
+            value = Arc::new(parse_native_response(&body)?);
+            is_hot = self.classify_page(&value.0, to_block).await;
+            from_disk = false;
+        }
+
         tracing::debug!(
             address = address_hex,
             endpoint = "native",
             transfers = value.0.len(),
             has_next = value.1.is_some(),
+            is_hot,
             "page parsed"
         );
-        self.page_cache.insert(key, Arc::clone(&value)).await;
+
+        if !is_hot && !from_disk
+            && let Some(path) = file_path.as_deref()
+        {
+            Self::file_write(path, &body).await;
+        }
+
+        self.insert_page(key, Arc::clone(&value), is_hot).await;
         Ok(value)
     }
 
@@ -388,7 +484,7 @@ impl MoralisEthSource {
             to_block,
         };
 
-        if let Some(v) = self.page_cache.get(&key).await {
+        if let Some(v) = self.lookup_page(&key).await {
             tracing::debug!(address = address_hex, endpoint = "erc20", "moka cache hit");
             return Ok(v);
         }
@@ -401,41 +497,76 @@ impl MoralisEthSource {
             to_block,
         );
 
-        if let Some(ref path) = file_path {
-            if let Some(v) = self.hot_cache.get(path) {
-                tracing::debug!(address = address_hex, "hot cache hit (erc20)");
-                self.page_cache.insert(key, Arc::clone(v)).await;
+        if let Some(ref path) = file_path
+            && let Some(v) = self.hot_cache.get(path)
+        {
+            let is_hot = self.classify_page(&v.0, to_block).await;
+            if !is_hot {
+                tracing::debug!(address = address_hex, "hot cache hit (erc20, cold)");
+                self.insert_page(key, Arc::clone(v), false).await;
                 return Ok(Arc::clone(v));
             }
+            tracing::warn!(
+                address = address_hex,
+                path = %path.display(),
+                "preloaded erc20 page classifies as hot; dropping stale disk cache"
+            );
+            let _ = tokio::fs::remove_file(path).await;
         }
 
-        let body = if let Some(ref path) = file_path {
-            if let Some(cached) = Self::file_read(path).await {
-                tracing::debug!(address = address_hex, path = %path.display(), "file cache hit (disk)");
-                cached
-            } else {
-                tracing::debug!(address = address_hex, path = %path.display(), "file cache miss");
-                let body = self
-                    .http_get_text(&self.build_erc20_url(address_hex, cursor, from_block, to_block))
-                    .await?;
-                Self::file_write(path, &body).await;
-                body
-            }
-        } else {
-            self.http_get_text(&self.build_erc20_url(address_hex, cursor, from_block, to_block))
-                .await?
-        };
+        let url = self.build_erc20_url(address_hex, cursor, from_block, to_block);
+        let (mut body, mut from_disk) =
+            self.read_or_fetch(file_path.as_deref(), &url, address_hex).await?;
+        let mut value = Arc::new(parse_erc20_response(&body)?);
+        let mut is_hot = self.classify_page(&value.0, to_block).await;
 
-        let value = Arc::new(parse_erc20_response(&body)?);
+        if from_disk && is_hot {
+            tracing::warn!(
+                address = address_hex,
+                "disk cache hit on a hot-classified erc20 page; dropping and refetching"
+            );
+            if let Some(path) = file_path.as_deref() {
+                let _ = tokio::fs::remove_file(path).await;
+            }
+            body = self.http_get_text(&url).await?;
+            value = Arc::new(parse_erc20_response(&body)?);
+            is_hot = self.classify_page(&value.0, to_block).await;
+            from_disk = false;
+        }
+
         tracing::debug!(
             address = address_hex,
             endpoint = "erc20",
             transfers = value.0.len(),
             has_next = value.1.is_some(),
+            is_hot,
             "page parsed"
         );
-        self.page_cache.insert(key, Arc::clone(&value)).await;
+
+        if !is_hot && !from_disk
+            && let Some(path) = file_path.as_deref()
+        {
+            Self::file_write(path, &body).await;
+        }
+
+        self.insert_page(key, Arc::clone(&value), is_hot).await;
         Ok(value)
+    }
+
+    async fn read_or_fetch(
+        &self,
+        file_path: Option<&std::path::Path>,
+        url: &str,
+        address_hex: &str,
+    ) -> DomainResult<(String, bool)> {
+        if let Some(path) = file_path
+            && let Some(cached) = Self::file_read(path).await
+        {
+            tracing::debug!(address = address_hex, path = %path.display(), "file cache hit (disk)");
+            return Ok((cached, true));
+        }
+        let body = self.http_get_text(url).await?;
+        Ok((body, false))
     }
 
     fn build_native_url(
@@ -570,22 +701,11 @@ impl ChainSource for MoralisEthSource {
     }
 
     async fn latest_block(&self) -> DomainResult<BlockRef> {
-        if let Some(cached_height) = self.latest_block_cache.get(&()).await {
-            return self.fetch_block(cached_height).await.map(|b| b.block_ref());
-        }
-
-        let url = format!(
-            "{}/dateToBlock?chain=eth&date={}",
-            self.base_url,
-            chrono::Utc::now().to_rfc3339()
-        );
-        let body = self.http_get_text(&url).await?;
-
-        let resp = serde_json::from_str::<side_api::moralis::dto::DateToBlockResponse>(&body)
-            .map_err(|e| DomainError::InsufficientData(format!("parse dateToBlock: {e}")))?;
-
-        self.latest_block_cache.insert((), resp.block()).await;
-        self.fetch_block(resp.block()).await.map(|b| b.block_ref())
+        let h = self
+            .latest_block_height()
+            .await
+            .ok_or_else(|| DomainError::InsufficientData("moralis latest_block fetch failed".into()))?;
+        Ok(BlockRef::new(ChainId::ETH, h, [0u8; 32]))
     }
 
     async fn fetch_block(&self, height: u64) -> DomainResult<NormalizedBlock> {

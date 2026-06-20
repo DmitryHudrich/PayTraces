@@ -186,7 +186,10 @@ async fn main() -> anyhow::Result<()> {
     if let Some(url) = cfg.proxy().socks_url()
         && !url.is_empty()
     {
+        tracing::info!(proxy = %url, "SOCKS proxy enabled");
         client_builder = client_builder.proxy(reqwest::Proxy::all(url)?);
+    } else {
+        tracing::info!("SOCKS proxy disabled");
     }
     let http_client = client_builder.build()?;
 

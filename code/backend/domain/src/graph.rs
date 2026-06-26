@@ -49,14 +49,21 @@ pub struct GraphRequest {
     range: Option<BlockRange>,
     max_depth: u32,
     max_nodes: usize,
+    max_transfers_per_address: usize,
 }
 
 impl GraphRequest {
-    pub fn new(range: Option<BlockRange>, max_depth: u32, max_nodes: usize) -> Self {
+    pub fn new(
+        range: Option<BlockRange>,
+        max_depth: u32,
+        max_nodes: usize,
+        max_transfers_per_address: usize,
+    ) -> Self {
         Self {
             range,
             max_depth,
             max_nodes,
+            max_transfers_per_address,
         }
     }
 
@@ -71,6 +78,10 @@ impl GraphRequest {
     pub fn max_nodes(&self) -> usize {
         self.max_nodes
     }
+
+    pub fn max_transfers_per_address(&self) -> usize {
+        self.max_transfers_per_address
+    }
 }
 
 impl Default for GraphRequest {
@@ -79,6 +90,7 @@ impl Default for GraphRequest {
             range: None,
             max_depth: 3,
             max_nodes: 500,
+            max_transfers_per_address: 10_000,
         }
     }
 }

@@ -51,6 +51,11 @@ pub enum TransferKind {
     Token {
         contract: Address,
         standard: crate::asset::TokenStandard,
+        /// On-chain token symbol when known (e.g. "USDT"). Sources that do not
+        /// return per-row symbol metadata (BigQuery `token_transfers`) leave
+        /// this as `None` and the read path falls back to displaying the
+        /// contract address.
+        symbol: Option<String>,
     },
     Internal,
     Fee,

@@ -906,6 +906,10 @@ fn map_erc20_record(
     let to = parse_address(rec.to_address()).context("erc20.to")?;
     let contract = parse_address(rec.address()).context("erc20.contract")?;
     let log_index = rec.log_index().unwrap_or(0) as u32;
+    let symbol = rec
+        .token_symbol()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
 
     Ok(Some(Transfer::new(
         TransferId::new(ChainId::ETH, tx_hash_bytes, log_index),
@@ -920,6 +924,7 @@ fn map_erc20_record(
         TransferKind::Token {
             contract,
             standard: TokenStandard::Erc20,
+            symbol,
         },
         Finality::Confirmed,
     )))

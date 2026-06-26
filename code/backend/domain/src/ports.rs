@@ -90,13 +90,28 @@ pub trait ChainSourceRegistry: Send + Sync {
     fn supported_chains(&self) -> Vec<ChainId>;
 }
 
+/// Keyset cursor for paginating transfers ordered by `(block_height, idx)`.
+/// Repository implementations return rows strictly greater than this tuple.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransferCursor {
+    pub block_height: u64,
+    pub idx: u32,
+}
+
 #[async_trait]
 pub trait TransferRepository: Send + Sync {
     async fn save(&self, transfers: &[Transfer]) -> DomainResult<()>;
+
+    /// Paginated read of transfers touching `addr` (either side) within `range`.
+    /// Rows are returned ordered by `(block_height, idx)` strictly greater than
+    /// `after`. At most `limit` rows are returned; a returned page smaller than
+    /// `limit` signals end-of-stream.
     async fn find_by_address(
         &self,
         addr: &Address,
         range: Option<BlockRange>,
+        after: Option<TransferCursor>,
+        limit: usize,
     ) -> DomainResult<Vec<Transfer>>;
     async fn find_by_tx(&self, chain: ChainId, tx_hash: &[u8; 32]) -> DomainResult<Vec<Transfer>>;
     async fn find_outgoing(
@@ -109,6 +124,11 @@ pub trait TransferRepository: Send + Sync {
         addr: &Address,
         after: Option<DateTime<Utc>>,
     ) -> DomainResult<Vec<Transfer>>;
+
+    /// Lowest block height already persisted for transfers touching `addr`.
+    /// Used by incremental ingest to detect prefix gaps (user widens
+    /// `from_block` below what was previously fetched).
+    async fn min_block_height(&self, addr: &Address) -> DomainResult<Option<u64>>;
 
     /// Highest block height already persisted for transfers touching `addr`.
     /// Used by incremental ingest to size the refresh window.
@@ -174,6 +194,21 @@ pub trait RiskPort: Send + Sync {
     ) -> DomainResult<Option<ClusterEvidence>>;
 
     async fn detect_peeling_chain(
+        &self,
+        addr: &Address,
+    ) -> DomainResult<Option<ClusterEvidence>>;
+
+    async fn detect_fan_out(
+        &self,
+        addr: &Address,
+    ) -> DomainResult<Option<ClusterEvidence>>;
+
+    async fn detect_fan_in(
+        &self,
+        addr: &Address,
+    ) -> DomainResult<Option<ClusterEvidence>>;
+
+    async fn detect_smurfing_cycle(
         &self,
         addr: &Address,
     ) -> DomainResult<Option<ClusterEvidence>>;

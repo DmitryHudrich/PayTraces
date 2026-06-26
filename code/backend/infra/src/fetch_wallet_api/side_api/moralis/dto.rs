@@ -146,6 +146,10 @@ impl Erc20Transfer {
         self.token_decimals.as_deref()
     }
 
+    pub fn token_symbol(&self) -> Option<&str> {
+        self.token_symbol.as_deref()
+    }
+
     pub fn log_index(&self) -> Option<u64> {
         self.log_index
     }
@@ -276,6 +280,7 @@ pub struct Erc20TransferRecord {
     pub to_address: String,
     pub value: String,
     pub token_decimals: Option<String>,
+    pub token_symbol: Option<String>,
     pub log_index: Option<u64>,
     pub block_timestamp: String,
     pub block_number: String,
@@ -305,6 +310,10 @@ impl Erc20TransferRecord {
 
     pub fn token_decimals(&self) -> Option<&str> {
         self.token_decimals.as_deref()
+    }
+
+    pub fn token_symbol(&self) -> Option<&str> {
+        self.token_symbol.as_deref()
     }
 
     pub fn log_index(&self) -> Option<u64> {

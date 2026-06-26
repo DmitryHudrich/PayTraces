@@ -18,7 +18,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
-use crate::config::{AppConfig, Cli, TelemetryConfig};
+use crate::config::{AppConfig, Cli, EthSourceKind, TelemetryConfig};
 use domain::chain::{ChainId, ChainRegistry};
 use domain::entity::SanctionList;
 use domain::error::DomainError;
@@ -32,8 +32,8 @@ use domain::trace::{
 use domain::transfer::TransferKind;
 use infra::fetch_wallet_api::MoralisEthSource;
 use infra::{
-    ChainSources, JobRepository, PostgresEntityRepository, PostgresTransferRepository,
-    TronGridSource,
+    BigQueryEthSource, ChainSources, EtherscanEthSource, JobRepository, PostgresEntityRepository,
+    PostgresTransferRepository, TronGridSource,
 };
 use usecase::{IngestionService, RiskService};
 
@@ -86,6 +86,7 @@ impl AppState {
 }
 
 struct ApiSecurity;
+
 impl utoipa::Modify for ApiSecurity {
     fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
         use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityScheme};
@@ -117,14 +118,31 @@ impl utoipa::Modify for ApiSecurity {
         version = "1.0.0",
         description = "On-chain transfer graph construction, fund tracing and risk scoring \
                        for EVM-compatible blockchains.\n\n\
+                       **Typical workflow.**\n\
+                       1. `POST /jobs/ingest` — kick off async ingestion for an address.\n\
+                       2. `GET /jobs/{id}` — poll until `succeeded`.\n\
+                       3. `GET /graph` — paginated transfer graph from the DB.\n\
+                       4. `GET /score`, `GET /sanctions`, `GET /trace` — risk-side reads.\n\
+                       5. `GET /heuristics` — fan-out / fan-in / smurfing-cycle detection \
+                          for the address.\n\n\
                        **Versioning.** All API requests MUST include the header \
                        `X-API-Version: 1`. Use the Swagger \"Authorize\" button to set it \
                        once per session. Requests without it return HTTP 400; requests \
                        with an unsupported value return HTTP 400 as well. The Swagger UI \
                        and `/api-docs/openapi.json` are exempt.\n\n\
-                       **Data source:** Moralis Deep Index API (Ethereum mainnet).\n\
-                       Graph endpoints read from PostgreSQL only — call \
-                       POST /jobs/ingest to populate counterparty data asynchronously."
+                       **Data source.** Configurable per chain: Etherscan / Moralis / \
+                       BigQuery for Ethereum, TronGrid for Tron. Graph endpoints read \
+                       from PostgreSQL only — `POST /jobs/ingest` populates counterparty \
+                       data asynchronously.\n\n\
+                       **Heuristic thresholds.** `min_fanout`, `min_fanin`, sliding \
+                       window lengths and `smurf_max_depth` are configured in the \
+                       server `heuristics:` block (config.yaml)."
+    ),
+    tags(
+        (name = "Graph",      description = "Transfer graph construction and read-back."),
+        (name = "Risk",       description = "Risk scoring, sanctions screening, fund tracing, behavioural heuristics."),
+        (name = "Jobs",       description = "Asynchronous ingestion jobs."),
+        (name = "Chains",     description = "Supported blockchain registry."),
     ),
     modifiers(&ApiSecurity),
     security(
@@ -134,7 +152,8 @@ impl utoipa::Modify for ApiSecurity {
     paths(
         get_graph, score_address, check_sanctions, trace_funds, list_chains,
         create_ingest_job, get_job_status,
-        sanctions_batch, score_batch
+        sanctions_batch, score_batch,
+        detect_heuristics
     ),
     components(schemas(
         GraphPage, EdgeDto,
@@ -145,6 +164,7 @@ impl utoipa::Modify for ApiSecurity {
         ErrorResponse,
         IngestJobRequest, JobAcceptedResponse, JobStatusResponse,
         SanctionsBatchRequest, ScoreBatchRequest, BatchItem,
+        HeuristicsResponse, HeuristicEvidenceDto,
     ))
 )]
 struct ApiDoc;
@@ -198,18 +218,55 @@ async fn main() -> anyhow::Result<()> {
 
     let mut sources = ChainSources::builder();
 
-    if let Some(key) = cfg.moralis().api_key().filter(|k| !k.is_empty()) {
-        let eth_source = MoralisEthSource::new(
-            key.to_owned(),
-            cfg.moralis().base_url().to_owned(),
-            http_client.clone(),
-            cfg.moralis().cache().clone().into_domain(),
-        )
-        .await;
-        sources = sources.register(eth_source);
-        tracing::info!(chain = "eth", "registered Moralis ETH source");
-    } else {
-        tracing::warn!("moralis.api_key not set — Ethereum chain disabled");
+    match cfg.ethereum().source() {
+        EthSourceKind::Moralis => {
+            if let Some(key) = cfg.moralis().api_key().filter(|k| !k.is_empty()) {
+                let eth_source = MoralisEthSource::new(
+                    key.to_owned(),
+                    cfg.moralis().base_url().to_owned(),
+                    http_client.clone(),
+                    cfg.moralis().cache().clone().into_domain(),
+                )
+                .await;
+                sources = sources.register(eth_source);
+                tracing::info!(chain = "eth", source = "moralis", "registered ETH source");
+            } else {
+                tracing::warn!("moralis.api_key not set — Ethereum chain disabled");
+            }
+        }
+        EthSourceKind::Bigquery => {
+            let bq_cfg = cfg.bigquery().cloned().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "ethereum.source=bigquery but `bigquery` section is missing in config"
+                )
+            })?;
+            tracing::info!(
+                project = %bq_cfg.project_id(),
+                credentials_path = %bq_cfg.credentials_path(),
+                "configuring BigQuery ETH source"
+            );
+            let eth_source =
+                BigQueryEthSource::new(http_client.clone(), bq_cfg.into_domain()).await?;
+            sources = sources.register(eth_source);
+            tracing::info!(chain = "eth", source = "bigquery", "registered ETH source");
+        }
+        EthSourceKind::Etherscan => {
+            let es_cfg = cfg.etherscan().cloned().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "ethereum.source=etherscan but `etherscan` section is missing in config"
+                )
+            })?;
+            if es_cfg.api_key().is_none() {
+                anyhow::bail!(
+                    "ethereum.source=etherscan but etherscan.api_key is empty — \
+                     set it in config.yaml or pass --etherscan-api-key"
+                );
+            }
+            let eth_source =
+                EtherscanEthSource::new(http_client.clone(), es_cfg.into_domain()).await;
+            sources = sources.register(eth_source);
+            tracing::info!(chain = "eth", source = "etherscan", "registered ETH source");
+        }
     }
 
     if cfg.trongrid().enabled() {
@@ -238,6 +295,7 @@ async fn main() -> anyhow::Result<()> {
             PostgresTransferRepository::new(pool.clone()),
             PostgresEntityRepository::new(pool.clone()),
             cfg.risk_cache().clone().into_domain(),
+            cfg.heuristics().clone().into_domain(),
         ),
         chain_registry,
         JobRepository::new(pool.clone()),
@@ -254,6 +312,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/sanctions", get(check_sanctions))
         .route("/sanctions/batch", post(sanctions_batch))
         .route("/trace", get(trace_funds))
+        .route("/heuristics", get(detect_heuristics))
         .route("/jobs/ingest", post(create_ingest_job))
         .route("/jobs/{id}", get(get_job_status))
         .layer(middleware::from_fn_with_state(
@@ -396,6 +455,14 @@ fn transfer_kind_str(k: &TransferKind) -> (&'static str, Option<String>) {
         TransferKind::Internal => ("internal", None),
         TransferKind::Fee => ("fee", None),
         TransferKind::UtxoEdge { .. } => ("utxo_edge", None),
+    }
+}
+
+fn edge_symbol(k: &TransferKind, native: &str) -> String {
+    match k {
+        TransferKind::Native | TransferKind::Internal | TransferKind::Fee => native.to_string(),
+        TransferKind::Token { symbol, .. } => symbol.clone().unwrap_or_default(),
+        TransferKind::UtxoEdge { .. } => native.to_string(),
     }
 }
 
@@ -793,6 +860,10 @@ pub struct GraphQuery {
     #[param(example = 500)]
     max_nodes: Option<usize>,
 
+    /// Per-address cap on transfers fetched from the chain/repo. Defaults to 10000.
+    #[param(example = 10000)]
+    max_transfers_per_address: Option<usize>,
+
     /// Restrict transfers to blocks ≥ this height (inclusive).
     #[param(example = 19000000)]
     from_block: Option<u64>,
@@ -838,7 +909,12 @@ pub async fn get_graph(
         .ingestion()
         .build_graph_from_db(
             &addr,
-            GraphRequest::new(range, q.max_depth.unwrap_or(3), q.max_nodes.unwrap_or(500)),
+            GraphRequest::new(
+                range,
+                q.max_depth.unwrap_or(3),
+                q.max_nodes.unwrap_or(500),
+                q.max_transfers_per_address.unwrap_or(10_000),
+            ),
         )
         .await
         .map_err(ApiError::Internal)?;
@@ -860,7 +936,7 @@ pub async fn get_graph(
         Vec::new()
     };
 
-    let symbol = native_symbol(state.chains(), chain);
+    let native = native_symbol(state.chains(), chain);
 
     let edges: Vec<EdgeDto> = edge_page
         .iter()
@@ -873,7 +949,7 @@ pub async fn get_graph(
                 to: t.to().canonical(),
                 raw: t.amount().raw().to_string(),
                 formatted: format_amount(t.amount().raw(), t.amount().decimals()),
-                symbol: symbol.clone(),
+                symbol: edge_symbol(t.kind(), &native),
                 decimals: t.amount().decimals(),
                 block: t.block().height(),
                 ts: t.timestamp().timestamp(),
@@ -999,6 +1075,113 @@ pub async fn check_sanctions(
 
 #[derive(Deserialize, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
+pub struct HeuristicsQuery {
+    /// Origin wallet address to evaluate. Detection runs against the address
+    /// itself and its direct counterparties already persisted in the repo.
+    /// Trigger ingestion first via `POST /jobs/ingest` if the address has not
+    /// been seen yet.
+    #[param(example = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045")]
+    address: String,
+
+    /// Chain ID. Defaults to 1 (Ethereum mainnet).
+    #[param(example = 1)]
+    chain_id: Option<u32>,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct HeuristicEvidenceDto {
+    /// Heuristic that fired. One of: `FanOut`, `FanIn`, `SmurfingCycle`.
+    #[schema(example = "FanOut")]
+    heuristic: String,
+
+    /// Detector confidence. One of: `LOW`, `MEDIUM`, `HIGH`.
+    #[schema(example = "MEDIUM")]
+    confidence: String,
+
+    /// Addresses involved in the pattern.
+    /// * `FanOut`: distinct receivers seen in the burst window.
+    /// * `FanIn`: distinct senders seen in the burst window.
+    /// * `SmurfingCycle`: `[distributor, ...intermediaries..., cash_out]`.
+    addresses: Vec<String>,
+
+    /// Human-readable explanation including the matched counts and windows.
+    #[schema(example = "5 unique receivers within a 86400s window from 0x…")]
+    notes: Option<String>,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct HeuristicsResponse {
+    /// Echoes the canonical form of the queried address.
+    address: String,
+
+    /// Fan-out evidence — one source distributing funds to many distinct
+    /// receivers inside a sliding time window. `null` if not detected.
+    fan_out: Option<HeuristicEvidenceDto>,
+
+    /// Fan-in evidence — many distinct senders converging into one
+    /// address inside a sliding time window. `null` if not detected.
+    fan_in: Option<HeuristicEvidenceDto>,
+
+    /// Smurfing cycle — fan-out followed by intermediaries that route funds
+    /// back into a single cash-out address within `smurf_window` and
+    /// `smurf_max_depth` hops. `null` if not detected.
+    smurfing_cycle: Option<HeuristicEvidenceDto>,
+}
+
+fn evidence_to_dto(
+    e: &domain::entity::ClusterEvidence,
+) -> HeuristicEvidenceDto {
+    HeuristicEvidenceDto {
+        heuristic: format!("{:?}", e.heuristic()),
+        confidence: format!("{:?}", e.confidence()),
+        addresses: e.addresses().iter().map(|a| a.canonical()).collect(),
+        notes: e.notes().map(|s| s.to_owned()),
+    }
+}
+
+#[utoipa::path(
+    get, path = "/heuristics",
+    params(HeuristicsQuery),
+    responses(
+        (
+            status = 200,
+            description = "Detection results. Each heuristic is independently \
+                           reported as either an evidence object or `null`. \
+                           Thresholds (`min_fanout`, `min_fanin`, window \
+                           lengths, BFS depth) come from the server config \
+                           block `heuristics:` — see config.yaml.",
+            body = HeuristicsResponse
+        ),
+        (status = 400, description = "Invalid address", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse),
+    ),
+    tag = "Risk"
+)]
+pub async fn detect_heuristics(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<HeuristicsQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let chain = ChainId::new(q.chain_id.unwrap_or(ChainId::ETH.value()));
+    let addr = parse_address(&q.address, chain)?;
+
+    let risk = state.risk();
+    let fan_out = risk.detect_fan_out(&addr).await.map_err(ApiError::Internal)?;
+    let fan_in = risk.detect_fan_in(&addr).await.map_err(ApiError::Internal)?;
+    let smurf = risk
+        .detect_smurfing_cycle(&addr)
+        .await
+        .map_err(ApiError::Internal)?;
+
+    Ok(Json(HeuristicsResponse {
+        address: addr.canonical(),
+        fan_out: fan_out.as_ref().map(evidence_to_dto),
+        fan_in: fan_in.as_ref().map(evidence_to_dto),
+        smurfing_cycle: smurf.as_ref().map(evidence_to_dto),
+    }))
+}
+
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct TraceQuery {
     #[param(example = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045")]
     address: String,
@@ -1118,6 +1301,8 @@ pub struct IngestJobRequest {
     max_depth: Option<u32>,
     #[schema(example = 500)]
     max_nodes: Option<usize>,
+    #[schema(example = 10000)]
+    max_transfers_per_address: Option<usize>,
     from_block: Option<u64>,
     to_block: Option<u64>,
 }
@@ -1155,6 +1340,7 @@ pub async fn create_ingest_job(
 
     let max_depth = body.max_depth.unwrap_or(3);
     let max_nodes = body.max_nodes.unwrap_or(500);
+    let max_transfers_per_address = body.max_transfers_per_address.unwrap_or(10_000);
     let range = match (body.from_block, body.to_block) {
         (None, None) => None,
         (from, to) => Some(BlockRange::new(from.unwrap_or(0), to.unwrap_or(u64::MAX))),
@@ -1175,7 +1361,7 @@ pub async fn create_ingest_job(
             tracing::error!(error = %e, job_id = %job_id, "failed to mark job running");
             return;
         }
-        let req = GraphRequest::new(range, max_depth, max_nodes);
+        let req = GraphRequest::new(range, max_depth, max_nodes, max_transfers_per_address);
         match state_for_job
             .ingestion()
             .build_graph(&addr_for_job, req)

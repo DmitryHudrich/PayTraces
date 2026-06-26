@@ -5,7 +5,7 @@ use deadpool_postgres::Pool;
 use domain::asset::{AssetId, AssetKind, TokenStandard};
 use domain::chain::ChainId;
 use domain::error::{DomainError, DomainResult};
-use domain::ports::{BlockRange, TransferRepository};
+use domain::ports::{BlockRange, TransferCursor, TransferRepository};
 use domain::primitives::{Address, Amount, BlockRef, TxRef, U256};
 use domain::transfer::{Finality, Transfer, TransferId, TransferKind};
 
@@ -17,7 +17,7 @@ fn addr_str(addr: &Address) -> String {
 
 const COLS: &str = "chain_id, tx_hash, idx, from_addr, to_addr, asset_contract, \
                     amount::text AS amount, decimals, block_height, block_hash, \
-                    ts, kind, token_standard, vin_idx, vout_idx, finality";
+                    ts, kind, token_standard, asset_symbol, vin_idx, vout_idx, finality";
 
 pub struct PostgresTransferRepository {
     pool: Pool,
@@ -44,7 +44,21 @@ impl TransferRepository for PostgresTransferRepository {
             tracing::debug!("save called with 0 transfers, skipping");
             return Ok(());
         }
-        tracing::debug!(count = transfers.len(), "saving transfers to postgres");
+        let (native_n, token_n, other_n) = transfers.iter().fold(
+            (0usize, 0usize, 0usize),
+            |(n, t, o), tr| match tr.kind() {
+                TransferKind::Native => (n + 1, t, o),
+                TransferKind::Token { .. } => (n, t + 1, o),
+                _ => (n, t, o + 1),
+            },
+        );
+        tracing::debug!(
+            total = transfers.len(),
+            native = native_n,
+            token = token_n,
+            other = other_n,
+            "saving transfers to postgres"
+        );
         let client = self.pool.get().await.map_err(pool_err)?;
 
         let n = transfers.len();
@@ -61,6 +75,7 @@ impl TransferRepository for PostgresTransferRepository {
         let mut timestamps: Vec<DateTime<Utc>> = Vec::with_capacity(n);
         let mut kinds: Vec<&'static str> = Vec::with_capacity(n);
         let mut standards: Vec<Option<String>> = Vec::with_capacity(n);
+        let mut symbols: Vec<Option<String>> = Vec::with_capacity(n);
         let mut vin_idxs: Vec<Option<i32>> = Vec::with_capacity(n);
         let mut vout_idxs: Vec<Option<i32>> = Vec::with_capacity(n);
         let mut finalities: Vec<&'static str> = Vec::with_capacity(n);
@@ -93,6 +108,10 @@ impl TransferRepository for PostgresTransferRepository {
                 }
                 _ => None,
             });
+            symbols.push(match t.kind() {
+                TransferKind::Token { symbol, .. } => symbol.clone(),
+                _ => None,
+            });
             let (vin_i, vout_i) = match t.kind() {
                 TransferKind::UtxoEdge {
                     vin_index,
@@ -114,19 +133,19 @@ impl TransferRepository for PostgresTransferRepository {
             .execute(
                 "INSERT INTO transfers (chain_id, tx_hash, idx, from_addr, to_addr,
                                         asset_contract, amount, decimals, block_height,
-                                        block_hash, ts, kind, token_standard,
+                                        block_hash, ts, kind, token_standard, asset_symbol,
                                         vin_idx, vout_idx, finality)
                  SELECT u.chain_id, u.tx_hash, u.idx, u.from_addr, u.to_addr,
                         u.asset_contract, u.amount::numeric, u.decimals, u.block_height,
-                        u.block_hash, u.ts, u.kind, u.token_standard,
+                        u.block_hash, u.ts, u.kind, u.token_standard, u.asset_symbol,
                         u.vin_idx, u.vout_idx, u.finality
                  FROM UNNEST($1::int4[], $2::bytea[], $3::int4[], $4::bytea[], $5::bytea[],
                              $6::bytea[], $7::text[], $8::int2[], $9::int8[],
                              $10::bytea[], $11::timestamptz[], $12::text[], $13::text[],
-                             $14::int4[], $15::int4[], $16::text[])
+                             $14::text[], $15::int4[], $16::int4[], $17::text[])
                  AS u(chain_id, tx_hash, idx, from_addr, to_addr, asset_contract, amount,
                       decimals, block_height, block_hash, ts, kind, token_standard,
-                      vin_idx, vout_idx, finality)
+                      asset_symbol, vin_idx, vout_idx, finality)
                  ON CONFLICT (chain_id, tx_hash, idx) DO UPDATE
                     SET from_addr      = EXCLUDED.from_addr,
                         to_addr        = EXCLUDED.to_addr,
@@ -138,6 +157,7 @@ impl TransferRepository for PostgresTransferRepository {
                         ts             = EXCLUDED.ts,
                         kind           = EXCLUDED.kind,
                         token_standard = EXCLUDED.token_standard,
+                        asset_symbol   = COALESCE(EXCLUDED.asset_symbol, transfers.asset_symbol),
                         vin_idx        = EXCLUDED.vin_idx,
                         vout_idx       = EXCLUDED.vout_idx,
                         finality       = EXCLUDED.finality",
@@ -155,6 +175,7 @@ impl TransferRepository for PostgresTransferRepository {
                     &timestamps,
                     &kinds,
                     &standards,
+                    &symbols,
                     &vin_idxs,
                     &vout_idxs,
                     &finalities,
@@ -171,6 +192,8 @@ impl TransferRepository for PostgresTransferRepository {
         &self,
         addr: &Address,
         range: Option<BlockRange>,
+        after: Option<TransferCursor>,
+        limit: usize,
     ) -> DomainResult<Vec<Transfer>> {
         let client = self.pool.get().await.map_err(pool_err)?;
 
@@ -182,7 +205,19 @@ impl TransferRepository for PostgresTransferRepository {
             None => (0_i64, i64::MAX),
         };
 
-        tracing::debug!(address = %addr_str(addr), from_block = from_h, to_block = to_h, "find_by_address");
+        let (after_h, after_idx) = match after {
+            Some(c) => (c.block_height.min(i64::MAX as u64) as i64, c.idx as i64),
+            None => (-1_i64, -1_i64),
+        };
+
+        let limit_i64 = limit.min(i64::MAX as usize) as i64;
+
+        tracing::debug!(
+            address = %addr_str(addr),
+            from_block = from_h, to_block = to_h,
+            after_h, after_idx, limit = limit_i64,
+            "find_by_address"
+        );
 
         let rows = client
             .query(
@@ -191,13 +226,18 @@ impl TransferRepository for PostgresTransferRepository {
                      WHERE chain_id = $1
                        AND (from_addr = $2 OR to_addr = $2)
                        AND block_height BETWEEN $3 AND $4
-                     ORDER BY block_height, idx"
+                       AND (block_height, idx) > ($5, $6)
+                     ORDER BY block_height, idx
+                     LIMIT $7"
                 ),
                 &[
                     &(addr.chain().value() as i32),
                     &addr.bytes(),
                     &from_h,
                     &to_h,
+                    &after_h,
+                    &after_idx,
+                    &limit_i64,
                 ],
             )
             .await
@@ -242,6 +282,20 @@ impl TransferRepository for PostgresTransferRepository {
         after: Option<DateTime<Utc>>,
     ) -> DomainResult<Vec<Transfer>> {
         self.find_directed(addr, after, false).await
+    }
+
+    async fn min_block_height(&self, addr: &Address) -> DomainResult<Option<u64>> {
+        let client = self.pool.get().await.map_err(pool_err)?;
+        let row = client
+            .query_one(
+                "SELECT MIN(block_height) AS h FROM transfers
+                 WHERE chain_id = $1 AND (from_addr = $2 OR to_addr = $2)",
+                &[&(addr.chain().value() as i32), &addr.bytes()],
+            )
+            .await
+            .map_err(pg_err)?;
+        let h: Option<i64> = row.get("h");
+        Ok(h.map(|v| v.max(0) as u64))
     }
 
     async fn max_block_height(&self, addr: &Address) -> DomainResult<Option<u64>> {
@@ -384,9 +438,14 @@ fn row_to_transfer(row: &tokio_postgres::Row) -> DomainResult<Transfer> {
                         ));
                     }
                 };
+                let symbol = row
+                    .get::<_, Option<&str>>("asset_symbol")
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
                 TransferKind::Token {
                     contract: Address::new(chain, contract_bytes),
                     standard,
+                    symbol,
                 }
             }
             other => {

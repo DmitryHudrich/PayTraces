@@ -10,14 +10,18 @@ use domain::error::{DomainError, DomainResult};
 use domain::ports::EntityRepository;
 use domain::primitives::Address;
 
+pub mod bigquery_eth_source;
 pub mod chain_sources;
+pub mod etherscan_eth_source;
 pub mod fetch_wallet_api;
 mod job_repo;
 pub mod pg;
 pub mod tron_source;
 mod transfer_repo;
 
+pub use bigquery_eth_source::{BigQueryEthConfig, BigQueryEthSource};
 pub use chain_sources::{ChainSources, ChainSourcesBuilder};
+pub use etherscan_eth_source::{EtherscanEthConfig, EtherscanEthSource};
 pub use job_repo::{JobRepository, JobRow};
 pub use transfer_repo::PostgresTransferRepository;
 pub use tron_source::{TronGridConfig, TronGridSource};

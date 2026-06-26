@@ -213,6 +213,9 @@ pub enum ClusteringHeuristic {
     CoSpend,
     DepositAddressReuse,
     PeelingChain,
+    FanOut,
+    FanIn,
+    SmurfingCycle,
     BehavioralPattern(String),
     Manual,
 }

@@ -428,6 +428,10 @@ fn map_trc20(rec: dto::Trc20Transfer) -> anyhow::Result<Transfer> {
         .map_err(|e| anyhow!("trc20 contract: {e}"))?;
     let raw = U256::from_dec_str(rec.value()).context("trc20 value")?;
     let decimals = rec.token_info().decimals();
+    let symbol = {
+        let s = rec.token_info().symbol();
+        if s.is_empty() { None } else { Some(s.to_string()) }
+    };
 
     let block_ref = BlockRef::new(ChainId::TRON, 0, tx_hash);
     Ok(Transfer::new(
@@ -443,6 +447,7 @@ fn map_trc20(rec: dto::Trc20Transfer) -> anyhow::Result<Transfer> {
         TransferKind::Token {
             contract,
             standard: TokenStandard::Trc20,
+            symbol,
         },
         Finality::Confirmed,
     ))

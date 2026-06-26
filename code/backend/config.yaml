@@ -11,6 +11,34 @@ log:
     - "domain=debug"
     - "usecase=debug"
 
+ethereum:
+  # Источник истины для ETH-транзакций: moralis | bigquery | etherscan
+  source: etherscan
+
+bigquery:
+  project_id: "secret"
+  credentials_path: "secret"
+  transactions_table: "bigquery-public-data.goog_blockchain_ethereum_mainnet_us.transactions"
+  token_transfers_table: "bigquery-public-data.goog_blockchain_ethereum_mainnet_us.token_transfers"
+  max_rows_per_query: 10000
+  query_timeout_secs: 60
+
+etherscan:
+  api_key: ~
+  base_url: "https://api.etherscan.io/v2/api"
+  page_size: 1000           # rows per HTTP page (max 10000)
+  max_pages: 20             # hard cap on pages per (endpoint, address, range)
+  cold_ttl_secs: 86400      # in-memory TTL for finalized pages
+  hot_ttl_secs: 15          # in-memory TTL for hot-tail pages
+  cache_hot_tail: true      # false = bypass in-memory cache for unfinalized pages
+  confirmation_depth: 12    # ETH finality depth
+  latest_block_ttl_secs: 15    # eth_blockNumber cache TTL
+  page_max_capacity: 10000     # weighed by rows-per-page; controls moka size
+  max_concurrent_requests: 4   # semaphore bound; etherscan free tier is 5 req/sec
+  file_cache:
+    enabled: true              # disk cache stores only cold (finalized) pages
+    dir: "./etherscan_cache"
+
 moralis:
   base_url: "https://deep-index.moralis.io/api/v2.2"
   api_key: ~
@@ -52,3 +80,10 @@ risk_cache:
   score_max_entries: 10000
   sanctions_ttl_secs: 900    # /sanctions result cache TTL
   sanctions_max_entries: 10000
+
+heuristics:
+  min_fanout: 5              # unique receivers in window to trigger fan-out
+  min_fanin: 5               # unique senders in window to trigger fan-in
+  fan_window_secs: 86400     # sliding-window length for fan-in/out (24h)
+  smurf_window_secs: 86400   # max delay between distributor->intermediary->cash-out hops
+  smurf_max_depth: 2         # BFS hops downstream from each intermediary (1 = direct cash-out)

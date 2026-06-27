@@ -14,7 +14,7 @@ reqwest = "0"
 
 
 utoipa = { version = "5", features = ["axum_extras"] }
-utoipa-swagger-ui = { version = "9", features = ["axum"] }
+utoipa-scalar = { version = "0.3", features = ["axum"] }
 
 axum = "0"
 tower = { version = "0" }

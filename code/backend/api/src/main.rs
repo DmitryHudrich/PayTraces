@@ -8,7 +8,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     middleware::{self, Next},
-    response::IntoResponse,
+    response::{IntoResponse, Redirect},
     routing::{get, post},
 };
 use clap::Parser;
@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use utoipa::OpenApi;
-use utoipa_swagger_ui::SwaggerUi;
+use utoipa_scalar::{Scalar, Servable};
 
 use crate::config::{AppConfig, Cli, EthSourceKind, TelemetryConfig};
 use domain::chain::{ChainId, ChainRegistry};
@@ -167,35 +167,175 @@ impl utoipa::Modify for ApiSecurity {
     info(
         title = "PayTraces — Crypto Forensics API",
         version = "1.0.0",
-        description = "On-chain transfer graph construction, fund tracing and risk scoring \
-                       for EVM-compatible blockchains.\n\n\
-                       **Typical workflow.**\n\
-                       1. `POST /jobs/ingest` — kick off async ingestion for an address.\n\
-                       2. `GET /jobs/{id}` — poll until `succeeded`.\n\
-                       3. `GET /graph` — paginated transfer graph from the DB.\n\
-                       4. `GET /score`, `GET /sanctions`, `GET /trace` — risk-side reads.\n\
-                       5. `GET /heuristics` — fan-out / fan-in / smurfing-cycle detection \
-                          for the address.\n\n\
-                       **Versioning.** All API requests MUST include the header \
-                       `X-API-Version: 1`. Use the Swagger \"Authorize\" button to set it \
-                       once per session. Requests without it return HTTP 400; requests \
-                       with an unsupported value return HTTP 400 as well. The Swagger UI \
-                       and `/api-docs/openapi.json` are exempt.\n\n\
-                       **Data source.** Configurable per chain: Etherscan / Moralis / \
-                       BigQuery for Ethereum, TronGrid for Tron. Graph endpoints read \
-                       from PostgreSQL only — `POST /jobs/ingest` populates counterparty \
-                       data asynchronously.\n\n\
-                       **Heuristic thresholds.** `min_fanout`, `min_fanin`, sliding \
-                       window lengths and `smurf_max_depth` are configured in the \
-                       server `heuristics:` block (config.yaml)."
+        description = "PayTraces is a crypto-forensics API for EVM-compatible blockchains \
+                       (Ethereum mainnet today; Tron and others coming). It builds a \
+                       searchable graph of on-chain value transfers around an address, \
+                       traces tainted funds to their final sinks, and produces a per-\
+                       address risk score with explainable evidence.\n\n\
+                       ---\n\n\
+                       ## What you can do with this API\n\n\
+                       - **Reconstruct the transfer graph** around any wallet — incoming \
+                         and outgoing native + ERC-20 edges, paginated, with BFS depth \
+                         and node-count caps you control.\n\
+                       - **Trace tainted funds forward or backward** through multiple \
+                         hops using FIFO, LIFO, Haircut, or Poison strategies — useful \
+                         for AML investigations after a theft, hack, or sanctioned \
+                         counterparty interaction.\n\
+                       - **Score an address for risk** by aggregating signals from \
+                         entity labels, sink exposure (mixer / sanctioned / darknet), \
+                         and behavioural heuristics. Returns 0 (clean) to 100 (critical) \
+                         with a list of contributing signals.\n\
+                       - **Screen against sanctions lists** (OFAC / EU / UN) with a \
+                         single GET. Bulk variant for batch checks.\n\
+                       - **Detect cluster-formation patterns** — fan-in / fan-out / \
+                         peeling chain / smurfing cycle / temporal burst / fixed-amount \
+                         clustering / dwell time. Each detector produces evidence with \
+                         the matching counterparties and a confidence band.\n\
+                       - **Manage entity labels** (admin) — attach exchange / mixer / \
+                         sanctioned / scam / bridge / darknet labels to addresses so \
+                         downstream scoring and tracing benefit from your private \
+                         attribution data.\n\n\
+                       ---\n\n\
+                       ## Authentication\n\n\
+                       Two independent headers protect different parts of the API:\n\n\
+                       | Header | When required | Endpoints |\n\
+                       |--------|---------------|-----------|\n\
+                       | `X-Api-Key` | Set on the server (optional) | All `/graph`, `/score`, `/sanctions`, `/trace`, `/heuristics`, ... |\n\
+                       | `X-Admin-Api-Key` | Set on the server (optional) | Mutation endpoints: `POST /labels`, `POST /entities`, `POST /watchlist`, `POST /address/.../kind` |\n\
+                       | `Authorization: Bearer <key>` | Alternative to `X-Api-Key` | Same as above |\n\n\
+                       If the server has no API key configured, the corresponding headers \
+                       are NOT required. The Scalar \"Authentication\" panel (top-right \
+                       of this UI) lets you set both headers once per session.\n\n\
+                       ---\n\n\
+                       ## API versioning\n\n\
+                       Every request MUST carry an `X-API-Version: 1` header. Without \
+                       it the server returns `HTTP 400 missing required header`. With an \
+                       unsupported value it returns the same status with the supported \
+                       version listed. Only `/scalar` (this UI) and \
+                       `/api-docs/openapi.json` (the raw spec) are exempt.\n\n\
+                       This is a deliberately strict policy: it makes breaking schema \
+                       changes safe to introduce on a new version while old clients \
+                       keep working on `v1`.\n\n\
+                       ---\n\n\
+                       ## End-to-end workflow\n\n\
+                       Most use cases follow the same shape: ingest first, then read.\n\n\
+                       **Step 1.** Schedule ingestion for an address. This is async — \
+                       it returns immediately with a job id while the worker walks the \
+                       on-chain history and writes counterparty transfers to PostgreSQL.\n\
+                       ```bash\n\
+                       curl -X POST http://localhost:8080/jobs/ingest \\\n\
+                         -H 'X-API-Version: 1' \\\n\
+                         -H 'Content-Type: application/json' \\\n\
+                         -d '{\n\
+                           \"address\": \"0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045\",\n\
+                           \"chain_id\": 1,\n\
+                           \"max_depth\": 3,\n\
+                           \"max_nodes\": 500\n\
+                         }'\n\
+                       # → { \"job_id\": \"01HX...\", \"status\": \"queued\" }\n\
+                       ```\n\n\
+                       **Step 2.** Poll job status until it succeeds.\n\
+                       ```bash\n\
+                       curl 'http://localhost:8080/jobs/01HX...' \\\n\
+                         -H 'X-API-Version: 1'\n\
+                       # → { \"status\": \"succeeded\", \"finished_at\": ... }\n\
+                       ```\n\n\
+                       **Step 3.** Read the transfer graph from the DB (this never \
+                       touches a chain source — pure read).\n\
+                       ```bash\n\
+                       curl 'http://localhost:8080/graph?address=0xd8dA...&chain_id=1&max_depth=2&page=0&page_size=100' \\\n\
+                         -H 'X-API-Version: 1'\n\
+                       ```\n\n\
+                       **Step 4.** Score and screen.\n\
+                       ```bash\n\
+                       curl 'http://localhost:8080/score?address=0xd8dA...&chain_id=1' \\\n\
+                         -H 'X-API-Version: 1'\n\
+                       # → { \"score\": 42, \"signals\": [...] }\n\
+                       curl 'http://localhost:8080/sanctions?address=0xd8dA...&chain_id=1' \\\n\
+                         -H 'X-API-Version: 1'\n\
+                       ```\n\n\
+                       **Step 5.** Inspect behavioural heuristics — fan-in, fan-out, \
+                       smurfing, peeling, etc.\n\
+                       ```bash\n\
+                       curl 'http://localhost:8080/heuristics?address=0xd8dA...&chain_id=1' \\\n\
+                         -H 'X-API-Version: 1'\n\
+                       ```\n\n\
+                       Or follow the money:\n\
+                       ```bash\n\
+                       curl 'http://localhost:8080/trace?address=0xd8dA...&chain_id=1&direction=forward&strategy=haircut&max_hops=5' \\\n\
+                         -H 'X-API-Version: 1'\n\
+                       ```\n\n\
+                       ---\n\n\
+                       ## Architecture\n\n\
+                       - **Chain sources.** Per-chain, configurable. For Ethereum: \
+                         Etherscan, Alchemy, Moralis, BigQuery, or a `routed` orchestrator \
+                         that fails over between them on rate-limits. For Tron: TronGrid. \
+                         Set via the `ethereum.source:` / `tron.source:` block in \
+                         `config.yaml`.\n\
+                       - **Storage.** PostgreSQL holds transfers, entity labels, address \
+                         kinds (EOA / Contract / KnownService), watchlists, alerts. \
+                         Read endpoints (`/graph`, `/score`, ...) hit only the DB, so \
+                         they never block on a chain RPC.\n\
+                       - **Ingestion.** `POST /jobs/ingest` enqueues a worker that walks \
+                         the address graph BFS, fetches transfers from the configured \
+                         chain source, persists them, and classifies counterparties as \
+                         EOA vs. contract. Rate limits and retries are handled inside \
+                         the source layer.\n\
+                       - **Risk model.** `GET /score` aggregates RiskSignals (entity \
+                         labels + sink exposure from forward/backward Haircut traces) \
+                         using a configurable strategy (`max` or `weighted_count` with \
+                         dedup). Tunables live under the `score:` block in `config.yaml`.\n\
+                       - **Heuristics.** Cluster-formation detectors (fan-in/out, \
+                         peeling, smurfing, burst, fixed-amount, dwell) feed into \
+                         `GET /heuristics` and `POST /cluster`. Thresholds and windows \
+                         live under the `heuristics:` block in `config.yaml`.\n\n\
+                       ---\n\n\
+                       ## Pagination\n\n\
+                       `GET /graph` is paginated by edges. `nodes` is returned only on \
+                       `page == 0` because the node set is global per request — paginate \
+                       through edges using `page` + `page_size` (default 100, max 1000).\n\n\
+                       Other list endpoints (`/labels`, `/watchlist`, `/alerts`) return \
+                       the full collection in one response — these are admin endpoints \
+                       expected to stay small.\n\n\
+                       ---\n\n\
+                       ## Common errors\n\n\
+                       | Status | Meaning |\n\
+                       |--------|---------|\n\
+                       | `400 Bad Request` | Missing/invalid `X-API-Version`, malformed body, unknown chain id, address that doesn't parse for the chain family. |\n\
+                       | `401 Unauthorized` | `X-Api-Key` or `X-Admin-Api-Key` missing or wrong. |\n\
+                       | `404 Not Found` | Job id / entity id / label / watchlist entry not found. |\n\
+                       | `409 Conflict` | Duplicate label or duplicate watchlist entry. |\n\
+                       | `500 Internal Server Error` | Database, chain source, or internal bug. Response body carries the message. |\n\n\
+                       All errors share the `ErrorResponse` schema documented below."
     ),
     tags(
-        (name = "Graph",      description = "Transfer graph construction and read-back."),
-        (name = "Risk",       description = "Risk scoring, sanctions screening, fund tracing, behavioural heuristics."),
-        (name = "Labels",     description = "Entity/label CRUD (admin). Adds OFAC/exchange/mixer/etc. attribution to addresses; powers /score and /sanctions."),
-        (name = "Jobs",       description = "Asynchronous ingestion jobs."),
-        (name = "Chains",     description = "Supported blockchain registry."),
-        (name = "Discovery",  description = "Service discovery (registered chains, capabilities)."),
+        (name = "Graph",      description = "Build and read the transfer graph. \
+                                            `POST /jobs/ingest` populates the DB \
+                                            asynchronously; `GET /graph` reads it back \
+                                            paginated."),
+        (name = "Risk",       description = "Risk scoring, sanctions screening, fund \
+                                            tracing, and behavioural heuristics. Read \
+                                            from the DB only — run /jobs/ingest first \
+                                            if data isn't there yet."),
+        (name = "Labels",     description = "Admin-only entity / label CRUD. Use this to \
+                                            attach OFAC, exchange, mixer, darknet, or \
+                                            other attribution data to addresses; the \
+                                            risk model and the trace sink classifier \
+                                            consume those labels."),
+        (name = "Watchlist",  description = "Admin-only watchlist of addresses. When a \
+                                            saved ingestion touches a watched address, \
+                                            an Alert is recorded automatically."),
+        (name = "Alerts",     description = "Read-only stream of triggered watchlist \
+                                            alerts (audit log)."),
+        (name = "Jobs",       description = "Asynchronous ingestion jobs. Submit with \
+                                            POST, poll with GET — the worker runs the \
+                                            BFS and chain-source fetch off the request \
+                                            path."),
+        (name = "Chains",     description = "Supported blockchain registry (chain id, \
+                                            family, address encoding, native asset)."),
+        (name = "Discovery",  description = "Service discovery: which chains have a live \
+                                            chain source registered, what each one can \
+                                            do."),
     ),
     modifiers(&ApiSecurity),
     security(
@@ -595,8 +735,24 @@ async fn main() -> anyhow::Result<()> {
         .merge(admin_routes)
         .layer(middleware::from_fn(version_middleware));
 
+    // Scalar serves the interactive API docs at /scalar; the raw spec
+    // stays at /api-docs/openapi.json so existing tooling (codegen, lint,
+    // import-into-Postman) keeps working without a path change.
+    //
+    // /swagger-ui is kept as a permanent redirect so any old links or
+    // bookmarks from the previous swagger-ui-based UI land on Scalar
+    // instead of 404. Mount on the outer router so the version_middleware
+    // (which only wraps the `api` sub-router) does not gate the redirect.
     let app = Router::new()
-        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
+        .merge(Scalar::with_url("/scalar", ApiDoc::openapi()))
+        .route(
+            "/swagger-ui",
+            get(|| async { Redirect::permanent("/scalar") }),
+        )
+        .route(
+            "/swagger-ui/",
+            get(|| async { Redirect::permanent("/scalar") }),
+        )
         .merge(api)
         .with_state(state)
         .layer(TraceLayer::new_for_http().on_failure(()).on_response(
@@ -776,169 +932,293 @@ fn sanction_list_str(s: &SanctionList) -> String {
 
 // ── Response DTOs ────────────────────────────────────────────────────────────
 
-/// A single transfer edge in the graph.
+/// A single transfer edge in the on-chain graph returned by `GET /graph`.
+///
+/// One `EdgeDto` corresponds to exactly one value transfer (a native ETH/TRX
+/// move, an ERC-20/TRC-20 token transfer, an internal contract call, a gas fee,
+/// or a UTXO edge for Bitcoin-family chains). `from` always lost the value and
+/// `to` always received it.
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct EdgeDto {
-    /// Transaction hash (64 hex chars, no 0x prefix)
+    /// Transaction hash, hex-encoded without the `0x` prefix (64 chars on EVM).
     #[schema(example = "a1b2c3...")]
     tx_hash: String,
-    /// Log index within the transaction (0 for native transfers)
+    /// Log / event index within the transaction. `0` for a native top-level
+    /// transfer; higher values disambiguate multiple token transfers inside the
+    /// same tx.
     index: u32,
-    /// Sender address
+    /// Canonical sender address (the one that lost the value).
     from: String,
-    /// Recipient address
+    /// Canonical recipient address (the one that gained the value).
     to: String,
-    /// Raw amount (integer big-int, no decimals applied)
+    /// Raw on-chain amount as a base-10 big integer string, with no decimal
+    /// shift applied. For ETH this is wei; for an ERC-20 it is in the token's
+    /// own base units.
     #[schema(example = "1000000000000000000")]
     raw: String,
-    /// Decimal-shifted human amount (raw / 10^decimals, up to 8 fractional digits)
+    /// Human-friendly amount: `raw / 10^decimals`, truncated to at most 8
+    /// fractional digits with trailing zeros stripped.
     #[schema(example = "1.0")]
     formatted: String,
-    /// Native asset symbol for the chain
+    /// Asset symbol for the edge — token symbol for ERC-20 / TRC-20 transfers,
+    /// otherwise the chain's native asset symbol (`ETH`, `TRX`, ...). May be
+    /// empty for tokens whose contract did not expose a symbol.
     #[schema(example = "ETH")]
     symbol: String,
-    /// Token decimals (18 for ETH and most ERC-20 tokens)
+    /// Token decimals used by `formatted` (18 for ETH and most ERC-20 tokens,
+    /// 6 for USDC/USDT).
     decimals: u8,
-    /// Block height
+    /// Block height at which the transfer was mined.
     block: u64,
-    /// Unix timestamp (seconds)
+    /// Unix timestamp of the block in seconds (UTC).
     ts: i64,
-    /// Stable transfer kind: `native`, `token`, `internal`, `fee`, `utxo_edge`
+    /// Transfer kind. One of: `native` (chain's native asset), `token`
+    /// (ERC-20 / TRC-20), `internal` (internal contract-call value move),
+    /// `fee` (gas / transaction fee), `utxo_edge` (Bitcoin-family edge).
     kind: String,
-    /// Token contract address when `kind == "token"`, else null
+    /// Token contract address when `kind == "token"`. `null` for every other
+    /// kind.
     contract: Option<String>,
+    /// Numeric chain id this edge belongs to (echoed from the request).
     chain_id: u32,
 }
 
-/// Paginated transfer graph response.
+/// One page of a paginated transfer graph, returned by `GET /graph`.
+///
+/// Pagination is over `edges` only — the `nodes` array is global to the request
+/// and only ships on page 0 to avoid duplicating it across pages. Pages are
+/// returned in stable repository order; missing data means ingestion has not
+/// run yet (see `POST /jobs/ingest`).
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct GraphPage {
-    /// Total number of unique addresses (nodes) in the full graph
+    /// Total number of unique addresses (nodes) in the full graph, across all
+    /// pages.
     total_nodes: usize,
-    /// Total number of transfers (edges) in the full graph
+    /// Total number of transfers (edges) in the full graph, across all pages.
     total_edges: usize,
-    /// Current page index (0-based)
+    /// Current page index, zero-based. Always equals the requested `page`
+    /// parameter (or 0 when omitted).
     page: u32,
-    /// Edges returned per page
+    /// Number of edges per page, after clamping to the server's bounds
+    /// (default 100, max 1000).
     page_size: usize,
-    /// Total number of pages
+    /// Total number of pages available for this request.
     total_pages: u32,
-    /// Whether a next page exists
+    /// Convenience flag: `true` when a strictly higher `page` value still
+    /// returns edges.
     has_next: bool,
-    /// All unique addresses in the graph. Returned only on the first page (`page == 0`);
-    /// subsequent pages return an empty array.
+    /// All unique addresses in the graph, in deterministic order. Populated
+    /// only on `page == 0`; on subsequent pages this array is empty to keep
+    /// each page payload bounded.
     nodes: Vec<String>,
-    /// Transfers on the current page
+    /// Transfers on the current page.
     edges: Vec<EdgeDto>,
 }
 
-/// A risk signal attached to an address score.
+/// One contributing risk signal inside a [`ScoreResponse`].
+///
+/// Each signal is a single, explainable reason why the address received the
+/// score it did — for example direct exposure to a sanctioned counterparty,
+/// or a mixer interaction. Severities combine into the aggregate `score`.
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct SignalDto {
-    /// Stable snake_case signal category (e.g. `sanctioned_counterparty`, `mixer_interaction`)
+    /// Stable snake_case category. One of: `direct_exposure`,
+    /// `indirect_exposure`, `sanctioned_counterparty`, `mixer_interaction`,
+    /// `darknet_market`, `rapid_layering`, `high_velocity`, `new_address`,
+    /// `no_kyc`.
     kind: String,
-    /// Severity 0–100 (≥70 = HIGH, ≥90 = CRITICAL)
+    /// Severity in the range 0–100. `>= 70` is considered HIGH, `>= 90` is
+    /// CRITICAL. The overall `score` is derived from these severities using
+    /// the configured aggregation strategy.
     severity: u8,
-    /// Human-readable explanation
+    /// Human-readable explanation of what triggered this signal — useful to
+    /// surface verbatim in an investigator UI.
     description: String,
 }
 
-/// Risk score report for an address.
+/// Risk-score report for a single address, returned by `GET /score` and as
+/// each item of `POST /score/batch`.
+///
+/// The overall `score` is the aggregation of every signal in `signals` using
+/// the `score.aggregation_strategy` configured server-side (`max` or
+/// `weighted_count`). Signals come from entity labels (`/labels`) and from
+/// taint-trace sink classification — run `POST /jobs/ingest` first if the
+/// address has no persisted history.
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct ScoreResponse {
+    /// Canonical form of the scored address (echoes the request).
     address: String,
+    /// Numeric chain id this score applies to.
     chain_id: u32,
-    /// Aggregate risk score 0–100
+    /// Aggregate risk score in the range 0–100. Higher means riskier.
     score: u8,
-    /// `true` when score ≥ 70
+    /// Convenience flag: `true` when `score >= 70`.
     is_high_risk: bool,
-    /// Individual risk signals that contributed to the score
+    /// Every individual signal that contributed to the score. May be empty when
+    /// the address is clean (in which case `score` is 0 and `is_high_risk` is
+    /// `false`).
     signals: Vec<SignalDto>,
-    /// ISO-8601 timestamp when the report was generated
+    /// ISO-8601 timestamp (UTC) when the report was computed. Useful for cache
+    /// invalidation in a client.
     generated_at: String,
 }
 
-/// OFAC / sanctions screening result.
+/// Sanctions-screening result returned by `GET /sanctions` and each item of
+/// `POST /sanctions/batch`.
+///
+/// Combines OFAC / EU / UN list checks with the server's internal entity
+/// labels. A `true` here covers both direct sanctions hits and sanctioned-by-
+/// inheritance cases (e.g. an address attached to a sanctioned entity).
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct SanctionsResponse {
+    /// Canonical form of the screened address.
     address: String,
+    /// Numeric chain id.
     chain_id: u32,
-    /// Whether the address appears on a sanctions list
+    /// `true` if the address appears on any configured sanctions list.
     is_sanctioned: bool,
-    /// Sanctions list name, snake_case if applicable
+    /// Which list flagged the address. One of `ofac`, `eu`, `un`, or a custom
+    /// snake_case identifier for non-standard lists. `null` when
+    /// `is_sanctioned` is `false`.
     sanction_list: Option<String>,
-    /// Known entity label, if applicable
+    /// Best-known entity label for the address (e.g. `"Tornado Cash"`,
+    /// `"Lazarus Group"`). `null` when no label is attached.
     label: Option<String>,
 }
 
-/// Aggregate statistics for a trace run.
+/// Aggregate statistics describing how much work a trace did.
+///
+/// Returned inside [`TraceResponse`]. Useful for diagnosing under-/over-budget
+/// traces: when `truncated` is `true`, the trace stopped because it hit a
+/// limit, not because it ran out of paths.
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct TraceStatsDto {
+    /// Number of unique addresses the trace visited during traversal.
     addresses_visited: usize,
+    /// Total number of transfer edges the trace evaluated. Higher than
+    /// `addresses_visited` because each address has multiple in/out edges.
     transfers_evaluated: usize,
+    /// Number of complete origin-to-sink paths discovered.
     paths_found: usize,
-    /// Deepest hop reached
+    /// Deepest hop reached by the BFS. Always `<= max_hops` from the request.
     depth_reached: u32,
-    /// `true` when the run hit a limit (max_hops, max_addresses, or max_paths)
+    /// `true` when the trace hit `max_hops`, `max_addresses`, or the internal
+    /// `max_paths` cap. When `true`, the result is a lower bound on what's
+    /// actually reachable.
     truncated: bool,
 }
 
-/// A terminal sink discovered during tracing.
+/// A terminal "sink" where tainted funds came to rest during a trace.
+///
+/// Returned inside [`TraceResponse::sinks`]. A sink is the last address on a
+/// traced path where the taint stops moving (because the funds were cashed
+/// out, mixed, bridged, or simply held). The `kind` and `risk_score` come from
+/// entity labels and built-in classifiers.
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct SinkDto {
+    /// Canonical address of the sink.
     address: String,
-    /// Stable sink category: `exchange`, `bridge`, `mixer`, `sanctioned`, `darknet`, `unresolved`
+    /// Sink category. One of: `exchange`, `bridge`, `mixer`, `sanctioned`,
+    /// `darknet`, `unresolved`. `unresolved` means the sink could not be
+    /// classified from labels.
     kind: String,
-    /// Exchange name when `kind == "exchange"`, else null
+    /// Human name for the sink when `kind == "exchange"` (e.g. `"Binance"`).
+    /// `null` for every other kind.
     name: Option<String>,
-    /// Risk score of this sink 0–100
+    /// Risk score 0–100 attached to the sink itself. Higher means
+    /// investigating this sink should be prioritised.
     risk_score: u8,
-    /// Raw tainted amount that reached this sink (big-int)
+    /// Raw tainted amount that reached this sink, as a base-10 big integer
+    /// string in the asset's base units (wei for ETH).
     tainted_amount: String,
-    /// Decimal-shifted tainted amount (up to 8 fractional digits)
+    /// Decimal-shifted tainted amount, truncated to at most 8 fractional
+    /// digits with trailing zeros stripped.
     formatted: String,
-    /// Fraction of the sink's incoming funds that are tainted (0.0–1.0)
+    /// Fraction of the sink's incoming funds that came from the tainted
+    /// origin (0.0–1.0). `1.0` means the sink received only tainted funds on
+    /// the observed paths.
     taint_ratio: f64,
 }
 
-/// One traced fund flow path from origin to a sink.
+/// One end-to-end traced path from an origin address to a sink.
+///
+/// Returned inside [`TraceResponse::paths`]. Each path is a chain of hops; this
+/// DTO captures the path's shape (depth, hop count) and its taint summary
+/// rather than every individual edge.
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct PathDto {
-    /// Number of hops in this path
+    /// Path depth (== `hops`). Number of edges along the path.
     depth: u32,
-    /// Raw tainted amount along this path
+    /// Raw tainted amount carried along this specific path, as a base-10 big
+    /// integer string.
     tainted_amount: String,
-    /// Taint ratio at the end of the path (0.0–1.0)
+    /// Taint ratio at the destination of the path (0.0–1.0).
     taint_ratio: f64,
-    /// Number of transfers in this path
+    /// Number of transfers (hops) in the path.
     hops: usize,
+    /// Canonical address where the path starts (the traced subject for forward
+    /// traces, or the source for backward traces). `null` for synthetic paths
+    /// that have no concrete starting address.
     origin: Option<String>,
+    /// Canonical address where the path ends (a sink). `null` for paths that
+    /// were truncated before reaching a sink.
     destination: Option<String>,
 }
 
-/// Fund trace result.
+/// Result of a fund-flow trace, returned by `GET /trace`.
+///
+/// Combines aggregate statistics, the set of terminal sinks reached by the
+/// taint, and a list of the actual paths discovered. The same sink may be the
+/// endpoint of several paths.
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct TraceResponse {
+    /// How much work the trace did and whether it was truncated.
     stats: TraceStatsDto,
+    /// Terminal sinks reached by tainted funds, deduplicated by address.
     sinks: Vec<SinkDto>,
+    /// Origin-to-sink paths in the order they were discovered.
     paths: Vec<PathDto>,
 }
 
+/// Metadata for a single chain known to the server's chain registry.
+///
+/// Returned as part of [`ChainsResponse`] by `GET /chains`. `source_registered`
+/// tells you whether the server has a live data source configured for this chain
+/// (without one, ingestion and live reads will fail for that chain even though
+/// the chain itself is recognised by the registry).
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct ChainDto {
+    /// Numeric chain id (e.g. `1` for Ethereum mainnet, `728126428` for Tron mainnet).
     id: u32,
+    /// Human-readable chain name (e.g. `"Ethereum"`, `"Tron"`).
     name: String,
+    /// Chain family. One of: `evm`, `tron`, `bitcoin`, `solana`, `other`.
     family: String,
+    /// Address ledger model. One of: `account` (account-balance model, EVM/Tron/Solana)
+    /// or `utxo` (Bitcoin-style unspent outputs).
     address_model: String,
+    /// On-the-wire address encoding. One of: `hex20` (EVM 20-byte hex),
+    /// `tron_base58_check`, `bech32`, `base58`.
     address_encoding: String,
+    /// Symbol of the chain's native asset (e.g. `"ETH"`, `"TRX"`).
     native_symbol: String,
+    /// Number of decimal places for the native asset (18 for ETH, 6 for TRX).
     native_decimals: u8,
+    /// Number of blocks the chain considers "final" for confirmation purposes.
+    /// Used by ingestion to wait out reorgs.
     confirmation_depth: u64,
+    /// `true` when the server has a live chain source registered for this chain
+    /// and ingestion/reads are operational. `false` means the chain is in the
+    /// registry but no source is configured — ingestion will fail.
     source_registered: bool,
 }
 
+/// Envelope returned by `GET /chains`. Lists every chain the server knows about.
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct ChainsResponse {
+    /// All chains in the registry, in registry order. Includes both chains
+    /// with a live source (`source_registered == true`) and chains that are
+    /// recognised but not currently operational.
     chains: Vec<ChainDto>,
 }
 
@@ -1086,8 +1366,36 @@ async fn admin_auth_middleware(
 
 #[utoipa::path(
     get, path = "/chains",
+    description = "List every blockchain the server knows about and whether it is operational.\n\n\
+                   ## What this does\n\n\
+                   Returns the full chain registry — one entry per supported chain — together \
+                   with a flag (`source_registered`) indicating whether a live data source is \
+                   configured for that chain on this server. Use this endpoint to discover \
+                   which `chain_id` values are valid in other endpoints and which of those \
+                   chains can actually serve traffic right now.\n\n\
+                   This is a pure in-memory read (no DB, no chain RPC), so it is cheap to \
+                   call from a client at startup or for health-style checks.\n\n\
+                   ## When to use it\n\n\
+                   Call this once at client startup to populate a chain picker, or whenever \
+                   you receive a `400` complaining about an unknown chain id. A chain with \
+                   `source_registered = false` is in the registry but cannot ingest or read \
+                   data — calls passing its `chain_id` will fail.\n\n\
+                   ## Example\n\n\
+                   ```bash\n\
+                   curl 'http://localhost:8080/chains' \\\n\
+                     -H 'X-API-Version: 1'\n\
+                   ```\n\n\
+                   ## Notes\n\n\
+                   The set of registered chains is fixed for the lifetime of the server \
+                   process and is driven by `config.yaml` (the presence of `ethereum:` / \
+                   `tron:` blocks and configured source credentials).",
     responses(
-        (status = 200, description = "All chains known to the registry", body = ChainsResponse),
+        (status = 200,
+         description = "Full list of registered chains. Each entry carries the numeric \
+                        chain id, family, native asset metadata, confirmation depth, and a \
+                        `source_registered` flag distinguishing live chains from \
+                        registry-only entries.",
+         body = ChainsResponse),
     ),
     tag = "Discovery"
 )]
@@ -1180,13 +1488,47 @@ pub struct GraphQuery {
 
 #[utoipa::path(
     get, path = "/graph",
+    description = "Read the persisted transfer graph around an address, paginated by edge.\n\n\
+                   ## What this does\n\n\
+                   Walks the persisted graph in PostgreSQL outward from `address`, BFS-bounded \
+                   by `max_depth` hops and `max_nodes` distinct counterparties, then returns the \
+                   discovered transfers paginated by edge. This endpoint never contacts a chain \
+                   RPC; it is a pure read against whatever ingestion has already persisted, so \
+                   the response is fast and deterministic but bounded by what has already been \
+                   ingested.\n\n\
+                   ## When to use it\n\n\
+                   Run `POST /jobs/ingest` for the same address first and wait for the job to \
+                   reach `succeeded`. Then call this endpoint to render the graph, drive a \
+                   visualisation, or feed it into downstream tooling. If you call it before \
+                   ingestion, you will get an empty graph rather than an error.\n\n\
+                   ## Example\n\n\
+                   ```bash\n\
+                   curl 'http://localhost:8080/graph?address=0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045&chain_id=1&max_depth=2&page=0&page_size=100' \\\n\
+                     -H 'X-API-Version: 1'\n\
+                   ```\n\n\
+                   ## Notes\n\n\
+                   The `nodes` array is only returned on `page == 0` because the node set is \
+                   global per request; subsequent pages send an empty `nodes` array to save \
+                   bandwidth. `page_size` is clamped to `[1, 1000]`. The `from_block` / \
+                   `to_block` filters apply to the persisted edges only.",
     params(GraphQuery),
     responses(
-        (status = 200, description = "Paginated transfer graph (read-only from DB; \
-                                       trigger ingestion with POST /jobs/ingest). \
-                                       `nodes` is populated only when `page == 0`.", body = GraphPage),
-        (status = 400, description = "Invalid address or parameters", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse),
+        (status = 200,
+         description = "One page of the persisted graph. `total_nodes` / `total_edges` describe \
+                        the full result set; `edges` carries the current page only; `nodes` is \
+                        non-empty only on page 0. An empty graph (no nodes, no edges) means \
+                        ingestion has not produced data for this address yet — run \
+                        `POST /jobs/ingest`.",
+         body = GraphPage),
+        (status = 400,
+         description = "Address could not be parsed for the chain family, an unknown `chain_id` \
+                        was supplied, or numeric parameters (page, page_size, max_depth, etc.) \
+                        were out of range.",
+         body = ErrorResponse),
+        (status = 500,
+         description = "Database read failure. The original error message is included in the \
+                        body for debugging.",
+         body = ErrorResponse),
     ),
     tag = "Graph"
 )]
@@ -1280,11 +1622,46 @@ pub struct ScoreQuery {
 
 #[utoipa::path(
     get, path = "/score",
+    description = "Compute a 0–100 risk score for an address with explainable signals.\n\n\
+                   ## What this does\n\n\
+                   Aggregates risk signals attached to the address into a single 0–100 score. \
+                   Inputs are entity labels (from `/labels`), built-in sanctions lists, and the \
+                   sinks discovered by an internal forward + backward Haircut trace over the \
+                   persisted graph. Signals are combined using the strategy configured under \
+                   the `score:` block in `config.yaml` (`max` by default, or `weighted_count` \
+                   with deduplication).\n\n\
+                   This is a DB-only read — the chain RPC is never touched. If you score an \
+                   address that has not been ingested, you will get a low score even when the \
+                   real on-chain reality says otherwise: ingest first.\n\n\
+                   ## When to use it\n\n\
+                   After running `POST /jobs/ingest` for the address, call this whenever you \
+                   need a single risk number plus explainable evidence. Surface the `signals` \
+                   array verbatim in your UI so investigators can audit each contributor.\n\n\
+                   ## Example\n\n\
+                   ```bash\n\
+                   curl 'http://localhost:8080/score?address=0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045&chain_id=1' \\\n\
+                     -H 'X-API-Version: 1'\n\
+                   ```\n\n\
+                   ## Notes\n\n\
+                   The score is cached for a short, configurable TTL (`risk_cache:` block in \
+                   `config.yaml`), so back-to-back calls return the same result without redoing \
+                   the trace.",
     params(ScoreQuery),
     responses(
-        (status = 200, description = "Risk score report for the address", body = ScoreResponse),
-        (status = 400, description = "Invalid address", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse),
+        (status = 200,
+         description = "Risk report containing the aggregate score and every signal that \
+                        contributed to it. An empty `signals` array with `score: 0` means the \
+                        address looks clean to the model — verify ingestion actually covered \
+                        it before drawing conclusions.",
+         body = ScoreResponse),
+        (status = 400,
+         description = "Address could not be parsed for the chain family, or `chain_id` is \
+                        unknown.",
+         body = ErrorResponse),
+        (status = 500,
+         description = "Database or internal scoring failure. The error message is included \
+                        in the body.",
+         body = ErrorResponse),
     ),
     tag = "Risk"
 )]
@@ -1346,11 +1723,41 @@ pub struct SanctionsQuery {
 
 #[utoipa::path(
     get, path = "/sanctions",
+    description = "Check whether an address is on any configured sanctions list.\n\n\
+                   ## What this does\n\n\
+                   Looks the address up against every sanctions list known to the server (OFAC, \
+                   EU, UN, plus any custom lists you have imported via `/labels` with \
+                   `category: sanctioned`). Returns a boolean plus, when matched, which list and \
+                   the entity label.\n\n\
+                   This is a fast in-memory + DB read; no chain RPC is touched. Sanctions lists \
+                   are loaded from the entity store on startup and refreshed whenever you POST \
+                   to `/labels`, so the result is always consistent with the latest admin \
+                   imports.\n\n\
+                   ## When to use it\n\n\
+                   Suitable as a compliance gate before accepting an inbound deposit or before \
+                   sending funds to a counterparty. For high-volume use cases, prefer \
+                   `POST /sanctions/batch` to amortise round-trips.\n\n\
+                   ## Example\n\n\
+                   ```bash\n\
+                   curl 'http://localhost:8080/sanctions?address=0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045&chain_id=1' \\\n\
+                     -H 'X-API-Version: 1'\n\
+                   ```\n\n\
+                   ## Notes\n\n\
+                   A `false` here only means the exact address is not directly listed. It does \
+                   NOT prove the address has no exposure to sanctioned funds — use `/score` or \
+                   `/trace` for indirect exposure.",
     params(SanctionsQuery),
     responses(
-        (status = 200, description = "OFAC / sanctions screening result", body = SanctionsResponse),
-        (status = 400, description = "Invalid address", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse),
+        (status = 200,
+         description = "Sanctions verdict. `is_sanctioned` is `true` when the address is on a \
+                        list; `sanction_list` and `label` are populated only on a hit.",
+         body = SanctionsResponse),
+        (status = 400,
+         description = "Address failed to parse for the chain family, or `chain_id` is unknown.",
+         body = ErrorResponse),
+        (status = 500,
+         description = "Database read failure while consulting the entity store.",
+         body = ErrorResponse),
     ),
     tag = "Risk"
 )]
@@ -1385,9 +1792,17 @@ pub struct HeuristicsQuery {
     chain_id: Option<u32>,
 }
 
+/// Evidence captured when a single behavioural-pattern heuristic fires for an
+/// address. Returned as the value of any non-null field on
+/// [`HeuristicsResponse`].
+///
+/// The shape of `addresses` and the contents of `notes` depend on which
+/// heuristic fired — see the field docs.
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct HeuristicEvidenceDto {
-    /// Heuristic that fired. One of: `FanOut`, `FanIn`, `SmurfingCycle`.
+    /// Heuristic that fired. One of: `FanOut`, `FanIn`, `SmurfingCycle`,
+    /// `TemporalBurst`, `FixedAmountClustering`, `DwellTimePassThrough`,
+    /// `PeelingChain`, `DepositAddressReuse`.
     #[schema(example = "FanOut")]
     heuristic: String,
 
@@ -1406,6 +1821,13 @@ pub struct HeuristicEvidenceDto {
     notes: Option<String>,
 }
 
+/// Aggregated heuristic-detection report for one address, returned by
+/// `GET /heuristics`.
+///
+/// Each behavioural detector runs independently against the persisted
+/// transfers around the subject and reports a non-null evidence object when it
+/// fires. `null` means the pattern did not match (the default and most common
+/// outcome).
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct HeuristicsResponse {
     /// Echoes the canonical form of the queried address.
@@ -1458,19 +1880,48 @@ fn evidence_to_dto(
 
 #[utoipa::path(
     get, path = "/heuristics",
+    description = "Run every behavioural-pattern detector against an address and report what fired.\n\n\
+                   ## What this does\n\n\
+                   Evaluates eight independent cluster-formation heuristics against the \
+                   persisted transfers around `address`: fan-out, fan-in, smurfing cycle, \
+                   temporal burst, fixed-amount clustering, dwell-time pass-through, peeling \
+                   chain, and deposit-address reuse. Each detector independently returns an \
+                   evidence object (with the participating counterparties and a confidence \
+                   band) or `null` when its pattern did not match.\n\n\
+                   All thresholds — minimum fan-out/fan-in counts, burst multipliers, window \
+                   lengths, BFS depth caps — come from the `heuristics:` block in \
+                   `config.yaml`. This endpoint is DB-only; no chain RPC is touched.\n\n\
+                   ## When to use it\n\n\
+                   Use this to explain *why* an address looks suspicious in human terms — the \
+                   evidence objects list the actual counterparty addresses and the matched \
+                   counts. Run `POST /jobs/ingest` for the address first; without persisted \
+                   counterparties, every detector returns `null`.\n\n\
+                   ## Example\n\n\
+                   ```bash\n\
+                   curl 'http://localhost:8080/heuristics?address=0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045&chain_id=1' \\\n\
+                     -H 'X-API-Version: 1'\n\
+                   ```\n\n\
+                   ## Notes\n\n\
+                   Heuristics are independent — getting one match does not affect another. \
+                   `null` for every field is the most common outcome for ordinary addresses \
+                   and is not an error.",
     params(HeuristicsQuery),
     responses(
         (
             status = 200,
-            description = "Detection results. Each heuristic is independently \
-                           reported as either an evidence object or `null`. \
-                           Thresholds (`min_fanout`, `min_fanin`, window \
-                           lengths, BFS depth) come from the server config \
-                           block `heuristics:` — see config.yaml.",
+            description = "Per-heuristic detection results. Every field is either a \
+                           [`HeuristicEvidenceDto`] with the matched counterparties and \
+                           confidence band, or `null` when the pattern did not fire. An \
+                           all-null response is normal for an unremarkable address.",
             body = HeuristicsResponse
         ),
-        (status = 400, description = "Invalid address", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse),
+        (status = 400,
+         description = "Address failed to parse, or `chain_id` is unknown.",
+         body = ErrorResponse),
+        (status = 500,
+         description = "Database read failure while running detectors. The error message is \
+                        in the body.",
+         body = ErrorResponse),
     ),
     tag = "Risk"
 )]
@@ -1544,23 +1995,46 @@ pub struct PathQuery {
     max_nodes: Option<usize>,
 }
 
+/// A single transfer edge used to describe a hop in a shortest-path result.
+///
+/// Returned inside [`PathResponse`] by `GET /path`. The edges appear in
+/// traversal order from `from` to `to`.
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct PathEdgeDto {
+    /// Transaction hash, hex-encoded without `0x` (64 chars on EVM).
     tx_hash: String,
+    /// Sender address for this hop.
     from: String,
+    /// Recipient address for this hop.
     to: String,
+    /// Raw on-chain amount as a base-10 big integer string, in the asset's
+    /// base units (wei for ETH).
     amount: String,
+    /// Asset identifier — chain native symbol (e.g. `"ETH"`) or token symbol
+    /// for ERC-20 transfers.
     asset: String,
+    /// Best-effort USD value at the time of the transfer. `null` when no
+    /// price was available for this asset/block.
     usd_value: Option<f64>,
+    /// ISO-8601 timestamp of the block, in UTC.
     timestamp: String,
 }
 
+/// Shortest-path result returned by `GET /path`.
+///
+/// Describes a single chain of edges from `from` to `to` discovered inside a
+/// bounded BFS subgraph anchored at `from`. When `not_found` is `true` the
+/// other fields fall back to neutral defaults.
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct PathResponse {
-    /// Number of hops (== length of `edges`). 0 means from == to.
+    /// Number of hops (== length of `edges`). 0 means `from == to`.
     length: usize,
-    /// Set to `true` when no path was found inside the bounded subgraph.
+    /// `true` when no path was found inside the bounded subgraph. When `true`,
+    /// `edges` is empty and `length` is 0. A `true` here does not mean no path
+    /// exists on-chain — only that none was reachable within the configured
+    /// `max_depth` / `max_nodes` budget.
     not_found: bool,
+    /// Hops in order from source to target. Empty when `not_found` is `true`.
     edges: Vec<PathEdgeDto>,
 }
 
@@ -1578,11 +2052,44 @@ fn edge_dto(t: &domain::transfer::Transfer) -> PathEdgeDto {
 
 #[utoipa::path(
     get, path = "/path",
+    description = "Find the shortest transfer chain between two addresses inside the persisted graph.\n\n\
+                   ## What this does\n\n\
+                   Builds a bounded BFS subgraph anchored at `from` (up to `max_depth` hops and \
+                   `max_nodes` distinct addresses), then runs a shortest-path search ending at \
+                   `to`. Returns the sequence of transfer edges that connects the two addresses, \
+                   or an empty `not_found` response when no such chain exists inside the budget.\n\n\
+                   The subgraph is read only from PostgreSQL; this endpoint never contacts a chain \
+                   RPC. The path is shortest by hop count — it is not weighted by amount, time, or \
+                   risk.\n\n\
+                   ## When to use it\n\n\
+                   Useful for AML investigations of the form \"is there a chain of transfers from \
+                   wallet A to wallet B within N hops?\". Run `POST /jobs/ingest` for `from` first; \
+                   if the chain you are looking for fans out wide, also pre-ingest `to` and bump \
+                   `max_depth` / `max_nodes`.\n\n\
+                   ## Example\n\n\
+                   ```bash\n\
+                   curl 'http://localhost:8080/path?from=0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045&to=0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1&chain_id=1&max_depth=4' \\\n\
+                     -H 'X-API-Version: 1'\n\
+                   ```\n\n\
+                   ## Notes\n\n\
+                   A `not_found: true` response does NOT prove the addresses are disconnected on \
+                   chain — it only means no path was reachable inside the `max_depth` / `max_nodes` \
+                   budget you set. Increasing the budget can change the answer.",
     params(PathQuery),
     responses(
-        (status = 200, description = "Shortest-path between two addresses in the bounded graph", body = PathResponse),
-        (status = 400, description = "Invalid address or parameter", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse),
+        (status = 200,
+         description = "Shortest path inside the bounded subgraph. When `not_found` is `true`, \
+                        `edges` is empty and `length` is `0`. When a path is found, `edges` lists \
+                        the transfers in traversal order from `from` to `to`.",
+         body = PathResponse),
+        (status = 400,
+         description = "Either address failed to parse for the chain family, or `chain_id` is \
+                        unknown.",
+         body = ErrorResponse),
+        (status = 500,
+         description = "Database read failure while building the subgraph. The error message is \
+                        included in the body.",
+         body = ErrorResponse),
     ),
     tag = "Graph"
 )]
@@ -1629,21 +2136,62 @@ pub struct ClusterQuery {
     chain_id: Option<u32>,
 }
 
+/// Union-Find clustering result for an address, returned by `GET /cluster`.
+///
+/// A "component" is a set of addresses the detectors believe belong to the
+/// same real-world owner. The queried address is always in the first component
+/// (`components[0]`); additional components describe satellite clusters
+/// discovered during traversal.
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct ClusterResponse {
+    /// Canonical form of the queried address.
     address: String,
-    /// Components produced by Union-Find over outputs of every detector. The
-    /// queried address is guaranteed to be in component 0.
+    /// Connected components produced by Union-Find over the outputs of every
+    /// cluster-formation detector (fan-in/out, peeling, smurfing, etc.). The
+    /// queried address is guaranteed to be in `components[0]`. Each inner
+    /// `Vec` is the list of canonical addresses inside that component.
     components: Vec<Vec<String>>,
 }
 
 #[utoipa::path(
     get, path = "/cluster",
+    description = "Group an address with its likely co-owned siblings using Union-Find over every heuristic.\n\n\
+                   ## What this does\n\n\
+                   Runs every cluster-formation detector (fan-in, fan-out, smurfing cycle, \
+                   peeling chain, deposit-address reuse, ...) over the persisted graph around \
+                   the address and unions each detector's outputs into connected components \
+                   using Union-Find. The result is a partition of the discovered addresses \
+                   into clusters that probably share a real-world owner.\n\n\
+                   This endpoint reads only from the DB. The queried address is always returned \
+                   in `components[0]`; other components describe satellite clusters discovered \
+                   during traversal.\n\n\
+                   ## When to use it\n\n\
+                   Use this after ingesting an address (`POST /jobs/ingest`) to expand a single \
+                   suspect into the wider set of addresses that probably belong to the same \
+                   actor. Complementary to `/heuristics` (which says *why*) — this endpoint says \
+                   *with whom*.\n\n\
+                   ## Example\n\n\
+                   ```bash\n\
+                   curl 'http://localhost:8080/cluster?address=0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045&chain_id=1' \\\n\
+                     -H 'X-API-Version: 1'\n\
+                   ```\n\n\
+                   ## Notes\n\n\
+                   Component contents are heuristic — they are an *upper bound* on co-ownership, \
+                   not a proof. Larger components on whales/exchanges are expected; treat the \
+                   first component as the primary answer.",
     params(ClusterQuery),
     responses(
-        (status = 200, description = "Union-Find clustering anchored at the address", body = ClusterResponse),
-        (status = 400, description = "Invalid address", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse),
+        (status = 200,
+         description = "Connected-component partition. `components[0]` always contains the \
+                        queried address. An empty `components` array means no co-ownership \
+                        signals were detected (rare unless ingestion produced no graph).",
+         body = ClusterResponse),
+        (status = 400,
+         description = "Address failed to parse or `chain_id` is unknown.",
+         body = ErrorResponse),
+        (status = 500,
+         description = "Database read or detector failure. The error is in the body.",
+         body = ErrorResponse),
     ),
     tag = "Risk"
 )]
@@ -1684,31 +2232,85 @@ pub struct EdgeSignificanceQuery {
     limit: Option<usize>,
 }
 
+/// One edge with its forensic-significance score, returned inside
+/// [`EdgeSignificanceResponse`].
+///
+/// The `score` field is the heuristic significance of this specific transfer
+/// relative to its neighbours — higher values indicate transfers that stand
+/// out and probably deserve human attention.
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct EdgeScoreDto {
+    /// Transaction hash, hex-encoded without `0x`.
     tx_hash: String,
+    /// Canonical sender address.
     from: String,
+    /// Canonical recipient address.
     to: String,
+    /// Raw on-chain amount in the asset's base units, as a base-10 big integer
+    /// string (wei for ETH).
     amount: String,
+    /// Asset identifier — chain native symbol or ERC-20 token symbol.
     asset: String,
+    /// Best-effort USD value at the time of the transfer. `null` when no
+    /// price was available.
     usd_value: Option<f64>,
+    /// ISO-8601 timestamp of the block, UTC.
     timestamp: String,
+    /// Forensic-significance score in roughly `[0.0, 1.0]`. The higher, the
+    /// more this edge stands out from its neighbours. Use as a sort key when
+    /// triaging large graphs.
     score: f64,
 }
 
+/// Top forensic edges around an address, returned by `GET /edges/significance`.
+///
+/// The edges are sorted from highest-significance to lowest. Sort order is
+/// stable for ties in score.
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct EdgeSignificanceResponse {
+    /// Canonical form of the queried address (echoes the request).
     address: String,
+    /// Top edges in/out of the address, sorted by descending `score`. Length
+    /// is capped at the request's `limit` (default 50).
     edges: Vec<EdgeScoreDto>,
 }
 
 #[utoipa::path(
     get, path = "/edges/significance",
+    description = "Rank the transfers around an address by forensic significance.\n\n\
+                   ## What this does\n\n\
+                   Loads every incoming and outgoing transfer for `address` from the persisted \
+                   graph, scores each one with the edge-significance heuristic (which considers \
+                   amount, timing, counterparty rarity, and contextual outliers among the \
+                   subject's other edges), and returns the top `limit` highest-scoring edges.\n\n\
+                   This is a DB-only read. It is a complement to `/heuristics` and `/cluster`: \
+                   where those summarise patterns, this surfaces the specific transactions an \
+                   investigator should look at first.\n\n\
+                   ## When to use it\n\n\
+                   Use this as the second step in manual triage of an address: get the score \
+                   with `/score`, then pull the most significant edges here to ground the \
+                   investigation in concrete transactions. Run `POST /jobs/ingest` first.\n\n\
+                   ## Example\n\n\
+                   ```bash\n\
+                   curl 'http://localhost:8080/edges/significance?address=0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045&chain_id=1&limit=20' \\\n\
+                     -H 'X-API-Version: 1'\n\
+                   ```\n\n\
+                   ## Notes\n\n\
+                   The score is heuristic and not directly comparable across different subject \
+                   addresses — it is calibrated to the subject's own neighbourhood. `limit` \
+                   defaults to 50.",
     params(EdgeSignificanceQuery),
     responses(
-        (status = 200, description = "Top edges around address scored by edge-significance heuristic", body = EdgeSignificanceResponse),
-        (status = 400, description = "Invalid address", body = ErrorResponse),
-        (status = 500, description = "Internal server error", body = ErrorResponse),
+        (status = 200,
+         description = "Top-N edges sorted by descending significance score. An empty `edges` \
+                        array means no transfers have been ingested for this address yet.",
+         body = EdgeSignificanceResponse),
+        (status = 400,
+         description = "Address failed to parse or `chain_id` is unknown.",
+         body = ErrorResponse),
+        (status = 500,
+         description = "Database read failure. The error message is in the body.",
+         body = ErrorResponse),
     ),
     tag = "Risk"
 )]
@@ -1762,30 +2364,73 @@ pub async fn edge_significance_endpoint(
 
 // ── /watchlist + /alerts ─────────────────────────────────────────────────────
 
+/// Request body for `POST /watchlist`. Adds a single address to the watchlist
+/// so future ingestions automatically raise an alert when they touch it.
 #[derive(Deserialize, Serialize, utoipa::ToSchema)]
 pub struct WatchlistAddRequest {
+    /// Address to watch. Must parse against the chosen `chain_id`.
     #[schema(example = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045")]
     address: String,
+    /// Chain id the address belongs to. Defaults to `1` (Ethereum mainnet).
     #[schema(example = 1)]
     chain_id: Option<u32>,
+    /// Free-form note explaining why this address is on the watchlist. Surfaces
+    /// on every alert that this address triggers. Optional.
     #[schema(example = "Suspect address from incident #42")]
     reason: Option<String>,
 }
 
+/// One entry in the watchlist. Returned by `POST /watchlist` (single) and
+/// `GET /watchlist` (array).
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct WatchlistEntryDto {
+    /// Canonical form of the watched address.
     address: String,
+    /// The note attached when the address was added (echo of
+    /// `WatchlistAddRequest.reason`). `null` when no reason was supplied.
     reason: Option<String>,
 }
 
 #[utoipa::path(
     post, path = "/watchlist",
+    description = "Add an address to the watchlist (admin only).\n\n\
+                   ## What this does\n\n\
+                   Persists the address in the watchlist table. From this point on, any \
+                   ingestion that touches the address — whether it was the explicit ingest \
+                   target or just a counterparty discovered during BFS — automatically writes \
+                   an entry to `/alerts` recording the triggering transfer.\n\n\
+                   This is a DB-only write. The address itself does not need to have been \
+                   ingested previously; you can pre-watch an address and the alerts will start \
+                   appearing on the next ingestion run.\n\n\
+                   ## When to use it\n\n\
+                   Use this for proactive monitoring — for example, watch a sanctioned wallet \
+                   so any future contact with it shows up in `/alerts` without you having to \
+                   re-score every address you ingest.\n\n\
+                   ## Example\n\n\
+                   ```bash\n\
+                   curl -X POST 'http://localhost:8080/watchlist' \\\n\
+                     -H 'X-API-Version: 1' \\\n\
+                     -H 'X-Admin-Api-Key: <admin-key>' \\\n\
+                     -H 'Content-Type: application/json' \\\n\
+                     -d '{\"address\": \"0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045\", \"chain_id\": 1, \"reason\": \"incident #42\"}'\n\
+                   ```\n\n\
+                   ## Notes\n\n\
+                   Requires the `X-Admin-Api-Key` header (or the regular `X-Api-Key` when no \
+                   admin key is configured). Adding an address that already exists is a no-op.",
     request_body = WatchlistAddRequest,
     responses(
-        (status = 200, description = "Address added to watchlist", body = WatchlistEntryDto),
-        (status = 400, description = "Invalid address", body = ErrorResponse),
+        (status = 200,
+         description = "Address persisted in the watchlist. The response echoes the canonical \
+                        address and reason for easy confirmation.",
+         body = WatchlistEntryDto),
+        (status = 400,
+         description = "Address failed to parse for the chain family or `chain_id` is unknown.",
+         body = ErrorResponse),
+        (status = 401,
+         description = "Missing or invalid `X-Admin-Api-Key`.",
+         body = ErrorResponse),
     ),
-    tag = "Risk"
+    tag = "Watchlist"
 )]
 pub async fn watchlist_add(
     State(state): State<Arc<AppState>>,
@@ -1810,10 +2455,32 @@ pub async fn watchlist_add(
 
 #[utoipa::path(
     get, path = "/watchlist",
+    description = "Return the full watchlist (admin only).\n\n\
+                   ## What this does\n\n\
+                   Reads every entry currently in the watchlist table and returns them as a \
+                   flat array. There is no pagination — the watchlist is an admin tool expected \
+                   to stay small (typically tens to low hundreds of entries).\n\n\
+                   ## When to use it\n\n\
+                   Use this to audit which addresses are currently being monitored. Pair with \
+                   `GET /alerts` to see which of these have actually triggered.\n\n\
+                   ## Example\n\n\
+                   ```bash\n\
+                   curl 'http://localhost:8080/watchlist' \\\n\
+                     -H 'X-API-Version: 1' \\\n\
+                     -H 'X-Admin-Api-Key: <admin-key>'\n\
+                   ```\n\n\
+                   ## Notes\n\n\
+                   Requires the `X-Admin-Api-Key` header (or the regular `X-Api-Key` when no \
+                   admin key is configured).",
     responses(
-        (status = 200, description = "Current watchlist", body = [WatchlistEntryDto]),
+        (status = 200,
+         description = "Every address currently on the watchlist. May be an empty array.",
+         body = [WatchlistEntryDto]),
+        (status = 401,
+         description = "Missing or invalid `X-Admin-Api-Key`.",
+         body = ErrorResponse),
     ),
-    tag = "Risk"
+    tag = "Watchlist"
 )]
 pub async fn watchlist_list(
     State(state): State<Arc<AppState>>,
@@ -1841,12 +2508,38 @@ pub struct WatchlistRemoveQuery {
 
 #[utoipa::path(
     delete, path = "/watchlist",
+    description = "Remove an address from the watchlist (admin only).\n\n\
+                   ## What this does\n\n\
+                   Deletes the watchlist row for the supplied address, if any. Existing alerts \
+                   already in the `/alerts` log are not touched — only future ingestions stop \
+                   raising new alerts for this address.\n\n\
+                   ## When to use it\n\n\
+                   Use this when an incident is closed or a counterparty has been cleared. The \
+                   audit trail (existing alerts) is preserved.\n\n\
+                   ## Example\n\n\
+                   ```bash\n\
+                   curl -X DELETE 'http://localhost:8080/watchlist?address=0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045&chain_id=1' \\\n\
+                     -H 'X-API-Version: 1' \\\n\
+                     -H 'X-Admin-Api-Key: <admin-key>'\n\
+                   ```\n\n\
+                   ## Notes\n\n\
+                   Requires the `X-Admin-Api-Key` header. Removing an address that is not on \
+                   the watchlist is not an error — the response indicates whether anything was \
+                   actually removed.",
     params(WatchlistRemoveQuery),
     responses(
-        (status = 200, description = "Removed (returns whether the address was present)"),
-        (status = 400, description = "Invalid address", body = ErrorResponse),
+        (status = 200,
+         description = "Body: `{\"removed\": true|false}`. `true` means a row was deleted; \
+                        `false` means the address was not on the watchlist (and the call was a \
+                        no-op)."),
+        (status = 400,
+         description = "Address failed to parse for the chain family.",
+         body = ErrorResponse),
+        (status = 401,
+         description = "Missing or invalid `X-Admin-Api-Key`.",
+         body = ErrorResponse),
     ),
-    tag = "Risk"
+    tag = "Watchlist"
 )]
 pub async fn watchlist_remove(
     State(state): State<Arc<AppState>>,
@@ -1859,21 +2552,60 @@ pub async fn watchlist_remove(
     Ok(Json(serde_json::json!({ "removed": removed })))
 }
 
+/// One alert raised when a watched address was touched by an ingestion run.
+///
+/// Returned in the array body of `GET /alerts`. Acts as an audit log entry —
+/// it records the specific transfer that triggered the alert.
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct AlertDto {
+    /// Canonical form of the watched address that was hit.
     address: String,
+    /// Transaction hash that touched the watched address, hex-encoded without
+    /// the `0x` prefix.
     tx_hash: String,
+    /// Log / event index inside the transaction. Disambiguates multiple
+    /// transfers in the same tx (e.g. several ERC-20 transfers in one call).
     tx_idx: u32,
+    /// ISO-8601 timestamp (UTC) when the alert was recorded.
     created_at: String,
+    /// Reason copied from the watchlist entry (`WatchlistAddRequest.reason`)
+    /// at the moment the alert was raised. `null` if no reason was set.
     reason: Option<String>,
 }
 
 #[utoipa::path(
     get, path = "/alerts",
+    description = "Return the alert audit log (admin only).\n\n\
+                   ## What this does\n\n\
+                   Reads every alert previously written by ingestion runs that touched a \
+                   watchlisted address. Each entry records the watched address, the specific \
+                   triggering transfer, the timestamp, and the watchlist reason as of the \
+                   moment the alert was raised.\n\n\
+                   This endpoint is the audit-log counterpart to `/watchlist`: the watchlist \
+                   defines *what to watch for*, and this endpoint shows *what has happened*.\n\n\
+                   ## When to use it\n\n\
+                   Poll periodically from a monitoring dashboard, or read on demand when \
+                   investigating an incident. Removing an address from `/watchlist` does NOT \
+                   remove existing alerts — they remain for audit purposes.\n\n\
+                   ## Example\n\n\
+                   ```bash\n\
+                   curl 'http://localhost:8080/alerts' \\\n\
+                     -H 'X-API-Version: 1' \\\n\
+                     -H 'X-Admin-Api-Key: <admin-key>'\n\
+                   ```\n\n\
+                   ## Notes\n\n\
+                   Requires the `X-Admin-Api-Key` header. No pagination — the response \
+                   includes the full log. If the volume grows large, prune it directly in the \
+                   database.",
     responses(
-        (status = 200, description = "Recent alerts triggered by watchlist matches", body = [AlertDto]),
+        (status = 200,
+         description = "Every alert ever recorded by ingestion, oldest first. May be empty.",
+         body = [AlertDto]),
+        (status = 401,
+         description = "Missing or invalid `X-Admin-Api-Key`.",
+         body = ErrorResponse),
     ),
-    tag = "Risk"
+    tag = "Alerts"
 )]
 pub async fn list_alerts(
     State(state): State<Arc<AppState>>,
@@ -1895,31 +2627,73 @@ pub async fn list_alerts(
 
 // ── /address/{addr}/kind ─────────────────────────────────────────────────────
 
+/// Request body for `POST /address/{addr}/kind`. Overrides the address-kind
+/// classification stored for an address.
 #[derive(Deserialize, Serialize, utoipa::ToSchema)]
 pub struct AddressKindRequest {
-    /// One of: `eoa`, `contract`, `known_service`, `unknown`.
+    /// New kind to assign. One of: `eoa` (externally-owned account),
+    /// `contract` (smart contract / TRX contract), `known_service` (named
+    /// custodial wallet — exchange, payment processor, etc.), or `unknown`
+    /// (forget any prior classification).
     #[schema(example = "contract")]
     kind: String,
-    /// Required when `kind = known_service`.
+    /// Display name for `known_service`. Ignored for other kinds. Required
+    /// (and non-empty) when `kind == "known_service"`.
     #[schema(example = "Binance hot wallet")]
     service_name: Option<String>,
+    /// Chain id the address belongs to. Defaults to `1` (Ethereum mainnet).
     #[schema(example = 1)]
     chain_id: Option<u32>,
 }
 
+/// Address-kind classification, returned by both
+/// `GET /address/{addr}/kind` and `POST /address/{addr}/kind`.
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct AddressKindResponse {
+    /// Canonical form of the address.
     address: String,
+    /// Current classification. One of `eoa`, `contract`, `known_service`,
+    /// `unknown`. `unknown` is returned for addresses the classifier has not
+    /// yet seen.
     kind: String,
+    /// Service name when `kind == "known_service"`. `null` for every other
+    /// kind.
     service_name: Option<String>,
 }
 
 #[utoipa::path(
     get, path = "/address/{addr}/kind",
-    params(("addr" = String, Path, description = "Address (hex or canonical chain form)")),
+    description = "Look up the address-kind classification (EOA / Contract / KnownService).\n\n\
+                   ## What this does\n\n\
+                   Returns whatever classification the server currently holds for the address. \
+                   The kind is set either by the ingestion classifier (which detects EOA vs. \
+                   contract from on-chain code) or by an explicit admin override via \
+                   `POST /address/{addr}/kind`. Addresses the classifier has never seen come \
+                   back as `unknown`.\n\n\
+                   This is a fast DB-only read; no chain RPC is touched.\n\n\
+                   ## When to use it\n\n\
+                   Use this when rendering an address in a UI to pick the right icon (wallet \
+                   vs. contract vs. named service), or to gate features that only make sense \
+                   for EOAs.\n\n\
+                   ## Example\n\n\
+                   ```bash\n\
+                   curl 'http://localhost:8080/address/0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045/kind' \\\n\
+                     -H 'X-API-Version: 1'\n\
+                   ```\n\n\
+                   ## Notes\n\n\
+                   The path parameter is parsed against Ethereum mainnet (`chain_id = 1`) — \
+                   non-EVM addresses use the same route only as long as their canonical form is \
+                   accepted by the parser.",
+    params(("addr" = String, Path, description = "Address in hex (EVM) or canonical chain form (other families).")),
     responses(
-        (status = 200, description = "Current address-kind label", body = AddressKindResponse),
-        (status = 400, description = "Invalid address", body = ErrorResponse),
+        (status = 200,
+         description = "Current classification. `kind == \"unknown\"` is the default for \
+                        unseen addresses; `service_name` is non-null only when \
+                        `kind == \"known_service\"`.",
+         body = AddressKindResponse),
+        (status = 400,
+         description = "Path parameter failed to parse as an address.",
+         body = ErrorResponse),
     ),
     tag = "Risk"
 )]
@@ -1942,11 +2716,41 @@ pub async fn get_address_kind(
 
 #[utoipa::path(
     post, path = "/address/{addr}/kind",
-    params(("addr" = String, Path, description = "Address (hex or canonical chain form)")),
+    description = "Override the address-kind classification for an address (admin only).\n\n\
+                   ## What this does\n\n\
+                   Writes the supplied kind/service_name pair into the address-kinds table, \
+                   replacing any prior classification. Useful when the automatic classifier has \
+                   nothing to go on (e.g. an account that has not yet emitted code) or when you \
+                   want to attach a friendly service name (`known_service`).\n\n\
+                   The new value takes effect immediately for all subsequent reads — the \
+                   classifier honours admin overrides.\n\n\
+                   ## When to use it\n\n\
+                   Use this for curated allow/deny lists of named services (exchanges, payment \
+                   processors). For pure risk labels (mixer / sanctioned / scam), prefer \
+                   `POST /labels` — the categorisation there carries a richer model.\n\n\
+                   ## Example\n\n\
+                   ```bash\n\
+                   curl -X POST 'http://localhost:8080/address/0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045/kind' \\\n\
+                     -H 'X-API-Version: 1' \\\n\
+                     -H 'X-Admin-Api-Key: <admin-key>' \\\n\
+                     -H 'Content-Type: application/json' \\\n\
+                     -d '{\"kind\": \"known_service\", \"service_name\": \"Binance hot wallet\", \"chain_id\": 1}'\n\
+                   ```\n\n\
+                   ## Notes\n\n\
+                   Requires the `X-Admin-Api-Key` header. `kind` must be one of `eoa`, \
+                   `contract`, `known_service`, `unknown` — anything else triggers a 400.",
+    params(("addr" = String, Path, description = "Address in hex (EVM) or canonical chain form.")),
     request_body = AddressKindRequest,
     responses(
-        (status = 200, description = "Updated address-kind label", body = AddressKindResponse),
-        (status = 400, description = "Invalid address or kind value", body = ErrorResponse),
+        (status = 200,
+         description = "Updated classification (echoes the stored row).",
+         body = AddressKindResponse),
+        (status = 400,
+         description = "Address failed to parse, or `kind` is not one of the allowed values.",
+         body = ErrorResponse),
+        (status = 401,
+         description = "Missing or invalid `X-Admin-Api-Key`.",
+         body = ErrorResponse),
     ),
     tag = "Risk"
 )]
@@ -1987,52 +2791,86 @@ pub async fn set_address_kind(
 
 // ── /labels + /entities ──────────────────────────────────────────────────────
 
+/// Request body for `POST /labels` (single) and each element of
+/// `POST /labels/bulk`. Attaches a category + label to an address, creating
+/// or extending the underlying entity.
 #[derive(Deserialize, Serialize, utoipa::ToSchema)]
 pub struct LabelRequest {
-    /// Address to tag (hex or canonical chain form).
+    /// Address to tag. EVM addresses use the `0x...` hex form; other families
+    /// use their canonical chain form.
     #[schema(example = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045")]
     address: String,
-    /// Chain ID. Defaults to 1 (Ethereum mainnet).
+    /// Chain id the address belongs to. Defaults to `1` (Ethereum mainnet).
     #[schema(example = 1)]
     chain_id: Option<u32>,
-    /// One of: `exchange`, `mixer`, `bridge`, `defi`, `scam`, `gambling`,
-    /// `darknet`, `mining`, `sanctioned`, `unknown`.
+    /// Entity category. One of: `exchange`, `mixer`, `bridge`, `defi`, `scam`,
+    /// `gambling`, `darknet`, `mining`, `sanctioned`, `unknown`. Drives the
+    /// default `risk_score` and the trace-sink classifier.
     #[schema(example = "exchange")]
     category: String,
-    /// Human label name (e.g. "Binance hot wallet 14"). If matches another
-    /// entity by (category, label_name), this address is appended there.
+    /// Human-readable display name for the entity (e.g. `"Binance hot wallet 14"`).
+    /// When the same `(category, label_name)` already exists, the address is
+    /// appended to that entity instead of creating a new one — this is how
+    /// you group multiple addresses under the same logical entity.
     #[schema(example = "Binance 14")]
     label_name: Option<String>,
+    /// Optional reference URL (e.g. an Etherscan link, an internal investigation
+    /// ticket). Stored as-is and round-tripped in `LabelResponse.label_url`.
     #[schema(example = "https://etherscan.io/address/0xd8dA…")]
     label_url: Option<String>,
-    /// One of: `manual`, `chainalysis`, `internal`, `community`. Defaults to `manual`.
+    /// Provenance of the label. One of: `manual`, `chainalysis`, `internal`,
+    /// `community`. Defaults to `manual`. Affects nothing automatic — purely
+    /// metadata for audit.
     #[schema(example = "manual")]
     label_source: Option<String>,
-    /// Only used when `category = sanctioned`. One of `ofac`, `eu`, `un`, or a
-    /// custom string.
+    /// Specific sanctions list. Only meaningful when `category == "sanctioned"`.
+    /// One of `ofac`, `eu`, `un`, or a custom snake_case identifier.
     #[schema(example = "ofac")]
     sanction_list: Option<String>,
-    /// 0..100. Defaults: sanctioned=100, darknet=95, mixer=90, scam=75,
-    /// bridge=40, exchange=30, others=25.
+    /// Override for the entity's risk score (0–100). When omitted the default
+    /// for the category is used: `sanctioned = 100`, `darknet = 95`,
+    /// `mixer = 90`, `scam = 75`, `bridge = 40`, `exchange = 30`, others = 25.
     #[schema(example = 30)]
     risk_score: Option<u8>,
 }
 
+/// Entity record returned by every `/labels` and `/entities` endpoint.
+///
+/// One entity may carry many addresses (e.g. an exchange's hot-wallet set),
+/// hence `addresses` is plural. Reading a single address through `GET /labels/{addr}`
+/// returns the entity it belongs to together with all sibling addresses.
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct LabelResponse {
+    /// Internal UUID of the entity. Stable across address additions/removals.
     entity_id: String,
+    /// Every address attached to this entity, in canonical form. Includes
+    /// addresses other than the one queried — that's how you discover related
+    /// addresses by labelling one of them.
     addresses: Vec<String>,
+    /// Entity category. Same vocabulary as `LabelRequest.category`.
     category: String,
+    /// Sanctions list name when `category == "sanctioned"`, otherwise `null`.
     sanction_list: Option<String>,
+    /// Display name (echoes `LabelRequest.label_name`). `null` if never set.
     label_name: Option<String>,
+    /// Reference URL (echoes `LabelRequest.label_url`). `null` if never set.
     label_url: Option<String>,
+    /// Provenance of the label. One of `manual`, `chainalysis`, `internal`,
+    /// `community`. `null` if no label has ever been attached.
     label_source: Option<String>,
+    /// Entity-level risk score 0–100. Used by `/score` and the trace-sink
+    /// classifier.
     risk_score: u8,
 }
 
+/// Result of `POST /labels/bulk`. Summarises how many entries were applied
+/// successfully and which ones failed.
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct LabelsBulkResponse {
+    /// Number of entries that were upserted successfully.
     upserted: usize,
+    /// Per-row error messages for entries that could not be applied. Format
+    /// is `"<address>: <reason>"`. Empty when every entry succeeded.
     errors: Vec<String>,
 }
 
@@ -2179,11 +3017,53 @@ async fn apply_label(
 
 #[utoipa::path(
     post, path = "/labels",
+    description = "Tag an address with a category + label (admin only).\n\n\
+                   ## What this does\n\n\
+                   Resolves the target entity using the following priority:\n\n\
+                   1. If the address is already attached to an entity, reuse that entity.\n\
+                   2. Else, if `label_name` matches an existing `(category, label_name)` pair, \
+                      append the address there.\n\
+                   3. Else, create a brand-new entity with the supplied category + label.\n\n\
+                   The resulting entity is then persisted with the address attached. This is \
+                   how you build up multi-address entities (e.g. all of an exchange's hot \
+                   wallets) by repeatedly labelling individual addresses with the same \
+                   `label_name`.\n\n\
+                   Writes go to PostgreSQL. The label is immediately visible to `/score`, \
+                   `/sanctions`, and the trace-sink classifier.\n\n\
+                   ## When to use it\n\n\
+                   Use this to inject your own attribution data — internal investigations, \
+                   curated allow-lists, or imports from third-party providers. For batch \
+                   imports, prefer `POST /labels/bulk`.\n\n\
+                   ## Example\n\n\
+                   ```bash\n\
+                   curl -X POST 'http://localhost:8080/labels' \\\n\
+                     -H 'X-API-Version: 1' \\\n\
+                     -H 'X-Admin-Api-Key: <admin-key>' \\\n\
+                     -H 'Content-Type: application/json' \\\n\
+                     -d '{\n\
+                       \"address\": \"0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045\",\n\
+                       \"chain_id\": 1,\n\
+                       \"category\": \"exchange\",\n\
+                       \"label_name\": \"Binance hot wallet 14\",\n\
+                       \"label_source\": \"manual\"\n\
+                     }'\n\
+                   ```\n\n\
+                   ## Notes\n\n\
+                   Requires the `X-Admin-Api-Key` header. `risk_score` is auto-defaulted from \
+                   `category` when omitted — explicit overrides only matter for fine-tuning.",
     request_body = LabelRequest,
     responses(
-        (status = 200, description = "Address labelled (entity created or extended)", body = LabelResponse),
-        (status = 400, description = "Invalid address or category", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid admin key", body = ErrorResponse),
+        (status = 200,
+         description = "The resulting entity after upsert. `addresses` includes every address \
+                        attached to this entity (not just the one you just added).",
+         body = LabelResponse),
+        (status = 400,
+         description = "Address failed to parse for the chain family, `chain_id` is unknown, \
+                        or `category` is not one of the allowed values.",
+         body = ErrorResponse),
+        (status = 401,
+         description = "Missing or invalid `X-Admin-Api-Key`.",
+         body = ErrorResponse),
     ),
     tag = "Labels"
 )]
@@ -2197,11 +3077,38 @@ pub async fn labels_set(
 
 #[utoipa::path(
     get, path = "/labels/{addr}",
-    params(("addr" = String, Path, description = "Address (hex or canonical chain form)")),
+    description = "Look up the entity attached to an address (admin only).\n\n\
+                   ## What this does\n\n\
+                   Returns the entity that contains the supplied address, including every sibling \
+                   address attached to that same entity. Useful for discovering related wallets — \
+                   labelling one of an exchange's hot wallets exposes the full set.\n\n\
+                   This is a DB-only read. No chain RPC is touched.\n\n\
+                   ## When to use it\n\n\
+                   Call this to render the label / category / risk score for an address in a UI, \
+                   or to expand a known address into the wider set of co-labelled siblings.\n\n\
+                   ## Example\n\n\
+                   ```bash\n\
+                   curl 'http://localhost:8080/labels/0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045' \\\n\
+                     -H 'X-API-Version: 1' \\\n\
+                     -H 'X-Admin-Api-Key: <admin-key>'\n\
+                   ```\n\n\
+                   ## Notes\n\n\
+                   Requires the `X-Admin-Api-Key` header. The path parameter is parsed against \
+                   Ethereum mainnet — for other chains, attach labels via the same address \
+                   format that the chain registry produces.",
+    params(("addr" = String, Path, description = "Address in hex (EVM) or canonical chain form.")),
     responses(
-        (status = 200, description = "Label info for the address (and the other addresses in the same entity)", body = LabelResponse),
-        (status = 404, description = "Address has no label", body = ErrorResponse),
-        (status = 400, description = "Invalid address", body = ErrorResponse),
+        (status = 200,
+         description = "The entity. `addresses` includes every address inside the same entity, \
+                        not just the one queried.",
+         body = LabelResponse),
+        (status = 400,
+         description = "Path parameter failed to parse as an address, OR the address has no \
+                        label attached (the endpoint returns 400 — not 404 — for that case).",
+         body = ErrorResponse),
+        (status = 401,
+         description = "Missing or invalid `X-Admin-Api-Key`.",
+         body = ErrorResponse),
     ),
     tag = "Labels"
 )]
@@ -2222,10 +3129,37 @@ pub async fn labels_get(
 
 #[utoipa::path(
     delete, path = "/labels/{addr}",
-    params(("addr" = String, Path, description = "Address (hex or canonical chain form)")),
+    description = "Detach an address from its entity (admin only).\n\n\
+                   ## What this does\n\n\
+                   Removes the address from whatever entity currently holds it. The entity \
+                   itself is preserved (with its remaining addresses) so other addresses in the \
+                   same entity keep their label. If the address has no label attached, the call \
+                   is a no-op.\n\n\
+                   ## When to use it\n\n\
+                   Use this when a labelling decision turns out to be wrong, or when an address \
+                   is decommissioned. To delete an entity entirely, remove every address one by \
+                   one — there is no separate \"delete entity\" endpoint.\n\n\
+                   ## Example\n\n\
+                   ```bash\n\
+                   curl -X DELETE 'http://localhost:8080/labels/0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045' \\\n\
+                     -H 'X-API-Version: 1' \\\n\
+                     -H 'X-Admin-Api-Key: <admin-key>'\n\
+                   ```\n\n\
+                   ## Notes\n\n\
+                   Requires the `X-Admin-Api-Key` header.",
+    params(("addr" = String, Path, description = "Address in hex (EVM) or canonical chain form.")),
     responses(
-        (status = 200, description = "Removed (returns the entity it was detached from, or `null` if the address had no label)"),
-        (status = 400, description = "Invalid address", body = ErrorResponse),
+        (status = 200,
+         description = "Body: `{\"removed\": true, \"entity_id\": \"...\", \"remaining\": N}` \
+                        when the address was attached and is now detached (`remaining` is the \
+                        number of addresses still on the entity); or `{\"removed\": false}` \
+                        when the address had no label."),
+        (status = 400,
+         description = "Path parameter failed to parse as an address.",
+         body = ErrorResponse),
+        (status = 401,
+         description = "Missing or invalid `X-Admin-Api-Key`.",
+         body = ErrorResponse),
     ),
     tag = "Labels"
 )]

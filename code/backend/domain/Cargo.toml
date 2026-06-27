@@ -17,3 +17,4 @@ hex = "0"
 reqwest = "0" # only errors
 petgraph = "0"
 bs58 = { version = "0.5", features = ["check"] }
+futures = "0.3"

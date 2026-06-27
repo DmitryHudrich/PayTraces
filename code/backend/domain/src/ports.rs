@@ -82,6 +82,38 @@ pub trait ChainSource: Send + Sync {
         range: BlockRange,
         max_transfers: usize,
     ) -> DomainResult<Vec<Transfer>>;
+
+    /// Whether `addr` is a smart contract (i.e. has non-empty code at the
+    /// latest block). `Ok(None)` means the underlying source does not expose
+    /// this information; callers should fall back to `AddressKind::Unknown`.
+    async fn is_contract(&self, _addr: &Address) -> DomainResult<Option<bool>> {
+        Ok(None)
+    }
+
+    /// Bulk variant of `is_contract`. Returns one entry per input address
+    /// in matching order. Default impl fans out N concurrent `is_contract`
+    /// calls — useful even for sources without a real batch API, since it
+    /// parallelises the work that would otherwise be serial. Sources with
+    /// a true bulk path (Alchemy's JSON-RPC batched requests) should
+    /// override for a single round-trip per N addresses.
+    async fn is_contract_batch(
+        &self,
+        addrs: &[Address],
+    ) -> DomainResult<Vec<Option<bool>>> {
+        use futures::future::join_all;
+        let futs = addrs.iter().map(|a| self.is_contract(a));
+        let results = join_all(futs).await;
+        let mut out = Vec::with_capacity(results.len());
+        for r in results {
+            match r {
+                Ok(v) => out.push(v),
+                // Surface the first hard error so the caller can decide
+                // (router treats RateLimited as failover trigger, etc).
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[async_trait]
@@ -149,6 +181,13 @@ pub trait TransferRepository: Send + Sync {
 pub trait EntityRepository: Send + Sync {
     async fn find_by_id(&self, id: &EntityId) -> DomainResult<Option<Entity>>;
     async fn find_by_address(&self, addr: &Address) -> DomainResult<Option<Entity>>;
+    /// Find an entity by exact `(category, label.name)` match — used by the
+    /// labels API to merge a new address into an existing labelled cluster.
+    async fn find_by_label(
+        &self,
+        category: &EntityCategory,
+        label_name: &str,
+    ) -> DomainResult<Option<Entity>>;
     async fn save(&self, entity: &Entity) -> DomainResult<()>;
     async fn list_sanctioned(&self) -> DomainResult<Vec<Entity>>;
 }
@@ -162,6 +201,87 @@ pub trait AssetRepository: Send + Sync {
 #[async_trait]
 pub trait LabelProvider: Send + Sync {
     async fn resolve(&self, addr: &Address) -> DomainResult<Option<crate::entity::EntityLabel>>;
+}
+
+#[async_trait]
+pub trait AddressKindRepository: Send + Sync {
+    async fn kind(&self, addr: &Address) -> DomainResult<crate::entity::AddressKind>;
+    async fn set_kind(
+        &self,
+        addr: &Address,
+        kind: crate::entity::AddressKind,
+    ) -> DomainResult<()>;
+
+    /// Bulk read of address kinds. Returns one entry per input address in
+    /// the same order; missing rows surface as `AddressKind::Unknown` so
+    /// callers don't need to special-case absences.
+    ///
+    /// Default impl falls back to N single calls so existing implementors
+    /// keep working. Backends with a fast bulk path (Postgres ANY(...))
+    /// should override.
+    async fn kind_batch(
+        &self,
+        addrs: &[Address],
+    ) -> DomainResult<Vec<crate::entity::AddressKind>> {
+        let mut out = Vec::with_capacity(addrs.len());
+        for a in addrs {
+            out.push(self.kind(a).await?);
+        }
+        Ok(out)
+    }
+
+    /// Bulk upsert. Default impl loops over `set_kind`; Postgres impl
+    /// pushes all rows in a single statement with UNNEST.
+    async fn set_kind_batch(
+        &self,
+        entries: &[(Address, crate::entity::AddressKind)],
+    ) -> DomainResult<()> {
+        for (a, k) in entries {
+            self.set_kind(a, k.clone()).await?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WatchlistEntry {
+    pub address: Address,
+    pub reason: Option<String>,
+}
+
+#[async_trait]
+pub trait WatchlistRepository: Send + Sync {
+    async fn add(&self, entry: WatchlistEntry) -> DomainResult<()>;
+    async fn remove(&self, addr: &Address) -> DomainResult<bool>;
+    async fn list(&self) -> DomainResult<Vec<WatchlistEntry>>;
+    async fn contains(&self, addr: &Address) -> DomainResult<bool>;
+}
+
+#[derive(Debug, Clone)]
+pub struct Alert {
+    pub address: Address,
+    pub triggered_by_tx: [u8; 32],
+    pub triggered_by_idx: u32,
+    pub created_at: DateTime<Utc>,
+    pub reason: Option<String>,
+}
+
+#[async_trait]
+pub trait AlertSink: Send + Sync {
+    async fn record(&self, alert: Alert) -> DomainResult<()>;
+    async fn list(&self) -> DomainResult<Vec<Alert>>;
+}
+
+/// Historical USD pricing for `asset` at `timestamp`. Implementations should
+/// cache and may return `None` if pricing is unknown (caller decides whether
+/// to treat that as 0 or skip).
+#[async_trait]
+pub trait PricePort: Send + Sync {
+    async fn price_at(
+        &self,
+        asset: &AssetId,
+        timestamp: DateTime<Utc>,
+    ) -> DomainResult<Option<crate::price::UnitPrice>>;
 }
 
 /// Application port covering data ingestion and transfer-graph construction.
@@ -212,6 +332,29 @@ pub trait RiskPort: Send + Sync {
         &self,
         addr: &Address,
     ) -> DomainResult<Option<ClusterEvidence>>;
+
+    async fn detect_temporal_burst(
+        &self,
+        addr: &Address,
+    ) -> DomainResult<Option<ClusterEvidence>>;
+
+    async fn detect_fixed_amount_clustering(
+        &self,
+        addr: &Address,
+    ) -> DomainResult<Option<ClusterEvidence>>;
+
+    async fn detect_dwell_time(
+        &self,
+        addr: &Address,
+    ) -> DomainResult<Option<ClusterEvidence>>;
+
+    /// Cluster all evidence under union-find: addresses appearing in the same
+    /// detector output get merged into one component. Returns components as
+    /// flat address lists.
+    async fn cluster_address(
+        &self,
+        addr: &Address,
+    ) -> DomainResult<Vec<Vec<Address>>>;
 
     async fn save_cluster(
         &self,

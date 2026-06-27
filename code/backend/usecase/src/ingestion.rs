@@ -1,24 +1,193 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use async_trait::async_trait;
+use chrono::Utc;
 use domain::chain::{ChainId, ChainRegistry};
-use domain::error::DomainResult;
+use domain::error::{DomainError, DomainResult};
 use domain::graph::{GraphRequest, TransferGraph};
+use domain::entity::AddressKind;
 use domain::ports::{
-    BlockRange, ChainSourceRegistry, IngestionPort, TransferCursor, TransferRepository,
+    AddressKindRepository, Alert, AlertSink, BlockRange, ChainSource, ChainSourceRegistry,
+    IngestionPort, PricePort, TransferCursor, TransferRepository, WatchlistRepository,
 };
 use domain::primitives::Address;
 use domain::transfer::Transfer;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+/// Adaptive limiter for concurrent `transfers_for_address` calls.
+///
+/// Concurrent /build_graph requests share a single `IngestionService`; when
+/// they collectively saturate the chain source(s) we observe rate-limit
+/// errors. The gate detects this and dynamically shrinks the in-flight cap
+/// so the next batch of work doesn't keep hammering the upstream.
+///
+/// Mechanism:
+/// * On `RateLimited` → the permit being held is `.forget()`'d, which
+///   *permanently* reduces the semaphore's effective capacity by one. The
+///   logical `permits_current` counter tracks this so logs are accurate.
+/// * On `success_streak >= grow_after_successes` consecutive Ok's →
+///   `add_permits(1)` (up to `permits_max`) and reset the streak.
+/// * Shrinks bottom out at `permits_min` (≥ 1), grows top out at `permits_max`.
+///
+/// Both directions emit a WARN with `from`/`to` permit counts so the
+/// pressure profile is visible in logs.
+#[derive(Debug)]
+pub struct AdaptiveConcurrency {
+    semaphore: Arc<Semaphore>,
+    permits_current: AtomicU32,
+    permits_min: u32,
+    permits_max: u32,
+    success_streak: AtomicU32,
+    grow_after_successes: u32,
+}
+
+impl AdaptiveConcurrency {
+    pub fn new(initial: u32, min: u32, max: u32, grow_after_successes: u32) -> Self {
+        let min = min.max(1);
+        let max = max.max(min);
+        let initial = initial.clamp(min, max);
+        Self {
+            semaphore: Arc::new(Semaphore::new(initial as usize)),
+            permits_current: AtomicU32::new(initial),
+            permits_min: min,
+            permits_max: max,
+            success_streak: AtomicU32::new(0),
+            grow_after_successes: grow_after_successes.max(1),
+        }
+    }
+
+    /// Sensible default for the transfers path: start at 4 concurrent
+    /// fetches, never go below 1, never above 8, restore one slot every 20
+    /// consecutive successful fetches.
+    pub fn transfers_default() -> Self {
+        Self::new(4, 1, 8, 20)
+    }
+
+    pub fn current_permits(&self) -> u32 {
+        self.permits_current.load(Ordering::Relaxed)
+    }
+
+    pub async fn acquire(&self) -> Option<OwnedSemaphorePermit> {
+        self.semaphore.clone().acquire_owned().await.ok()
+    }
+
+    /// The held permit is `forget()`'d (effective capacity −1) when we're
+    /// above the floor, otherwise dropped normally. Resets the success
+    /// streak either way.
+    pub fn shrink_after_rate_limit(&self, permit: OwnedSemaphorePermit) {
+        self.success_streak.store(0, Ordering::Relaxed);
+        let cur = self.permits_current.load(Ordering::Relaxed);
+        if cur > self.permits_min {
+            permit.forget();
+            let new = cur - 1;
+            self.permits_current.store(new, Ordering::Relaxed);
+            tracing::warn!(
+                from = cur,
+                to = new,
+                min = self.permits_min,
+                "adaptive concurrency: transfers rate-limited, reduced concurrency"
+            );
+        } else {
+            drop(permit);
+            tracing::warn!(
+                permits = cur,
+                min = self.permits_min,
+                "adaptive concurrency: transfers rate-limited, concurrency already at floor"
+            );
+        }
+    }
+
+    /// Successful call — bumps the streak, and after `grow_after_successes`
+    /// of them adds a permit back (up to ceiling). Permit always dropped.
+    pub fn release_after_success(&self, permit: OwnedSemaphorePermit) {
+        drop(permit);
+        let streak = self.success_streak.fetch_add(1, Ordering::Relaxed) + 1;
+        if streak < self.grow_after_successes {
+            return;
+        }
+        let cur = self.permits_current.load(Ordering::Relaxed);
+        if cur < self.permits_max {
+            self.semaphore.add_permits(1);
+            let new = cur + 1;
+            self.permits_current.store(new, Ordering::Relaxed);
+            tracing::warn!(
+                from = cur,
+                to = new,
+                max = self.permits_max,
+                successes_in_a_row = streak,
+                "adaptive concurrency: transfers stable, restored concurrency"
+            );
+        }
+        // Reset streak regardless so the next grow waits for a fresh window.
+        self.success_streak.store(0, Ordering::Relaxed);
+    }
+
+    /// Non-rate-limit errors do not change concurrency state (real bugs
+    /// shouldn't shrink our throughput) — just return the permit.
+    pub fn release_after_other_error(&self, permit: OwnedSemaphorePermit) {
+        drop(permit);
+    }
+}
 
 pub struct IngestionService<S, R> {
     sources: S,
     repo: R,
     chains: ChainRegistry,
+    prices: Option<Arc<dyn PricePort>>,
+    watchlist: Option<Arc<dyn WatchlistRepository>>,
+    alerts: Option<Arc<dyn AlertSink>>,
+    address_kinds: Option<Arc<dyn AddressKindRepository>>,
+    transfers_gate: Arc<AdaptiveConcurrency>,
+    classify_chain_batch_size: usize,
 }
 
 impl<S, R> IngestionService<S, R> {
     pub fn new(sources: S, repo: R, chains: ChainRegistry) -> Self {
-        Self { sources, repo, chains }
+        Self {
+            sources,
+            repo,
+            chains,
+            prices: None,
+            watchlist: None,
+            alerts: None,
+            address_kinds: None,
+            transfers_gate: Arc::new(AdaptiveConcurrency::transfers_default()),
+            // 100 fits inside Alchemy's batch limit and typical Postgres
+            // ARRAY parameter sizes comfortably. Tunable via config.
+            classify_chain_batch_size: 100,
+        }
+    }
+
+    pub fn with_transfers_concurrency(mut self, gate: Arc<AdaptiveConcurrency>) -> Self {
+        self.transfers_gate = gate;
+        self
+    }
+
+    pub fn with_classify_chain_batch_size(mut self, n: usize) -> Self {
+        self.classify_chain_batch_size = n.max(1);
+        self
+    }
+
+    pub fn with_address_kinds(mut self, kinds: Arc<dyn AddressKindRepository>) -> Self {
+        self.address_kinds = Some(kinds);
+        self
+    }
+
+    pub fn with_prices(mut self, prices: Arc<dyn PricePort>) -> Self {
+        self.prices = Some(prices);
+        self
+    }
+
+    pub fn with_watchlist(
+        mut self,
+        watchlist: Arc<dyn WatchlistRepository>,
+        alerts: Arc<dyn AlertSink>,
+    ) -> Self {
+        self.watchlist = Some(watchlist);
+        self.alerts = Some(alerts);
+        self
     }
 
     pub fn sources(&self) -> &S {
@@ -31,6 +200,158 @@ impl<S, R> IngestionService<S, R> {
 
     pub fn chains(&self) -> &ChainRegistry {
         &self.chains
+    }
+}
+
+/// Probe the chain for each new address in the freshly-ingested batch and
+/// persist its AddressKind (EOA vs Contract). Skips addresses whose kind is
+/// already a non-Unknown label (preserves manual `KnownService` overrides).
+///
+/// Implementation is fully batched:
+///  1. Collect unique addresses from `fetched`.
+///  2. ONE Postgres roundtrip via `kind_batch` to fetch existing labels.
+///  3. Partition into Unknown (need probe) vs already-labelled (skip).
+///  4. Chunk Unknowns into batches of `chain_batch_size` and call
+///     `source.is_contract_batch` on each. With the routed source +
+///     Alchemy this becomes one JSON-RPC batch HTTP per chunk; with
+///     Etherscan it's a parallel `join_all` over single calls. Either
+///     way the round-trip cost drops by ~`chain_batch_size`×.
+///  5. ONE Postgres roundtrip via `set_kind_batch` to persist results.
+///  6. Log totals + elapsed_ms so the WARN log can answer "why is
+///     classify taking so long".
+async fn classify_address_kinds(
+    source: &dyn ChainSource,
+    kinds: Option<&Arc<dyn AddressKindRepository>>,
+    fetched: &[Transfer],
+    chain_batch_size: usize,
+) {
+    let Some(kinds) = kinds else { return };
+    let start = std::time::Instant::now();
+
+    let mut seen: HashSet<Address> = HashSet::new();
+    for t in fetched {
+        seen.insert(t.from().clone());
+        seen.insert(t.to().clone());
+    }
+    let all: Vec<Address> = seen.into_iter().collect();
+    let total = all.len();
+    if total == 0 {
+        return;
+    }
+
+    // Step 1: bulk fetch known kinds.
+    let known = match kinds.kind_batch(&all).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, total, "address_kind: kind_batch failed");
+            return;
+        }
+    };
+
+    // Step 2: filter to Unknowns — those need a chain probe.
+    let mut to_probe: Vec<Address> = Vec::new();
+    let mut already_labelled = 0usize;
+    for (addr, k) in all.iter().zip(known.iter()) {
+        match k {
+            AddressKind::Unknown => to_probe.push(addr.clone()),
+            _ => already_labelled += 1,
+        }
+    }
+    let probe_count = to_probe.len();
+
+    // Step 3: chunked batched probe.
+    let chunk_size = chain_batch_size.max(1);
+    let mut contracts: Vec<(Address, AddressKind)> = Vec::new();
+    let mut eoas: Vec<(Address, AddressKind)> = Vec::new();
+    let mut unknown_after_probe = 0usize;
+
+    for chunk in to_probe.chunks(chunk_size) {
+        match source.is_contract_batch(chunk).await {
+            Ok(results) => {
+                for (addr, r) in chunk.iter().zip(results.into_iter()) {
+                    match r {
+                        Some(true) => contracts.push((addr.clone(), AddressKind::Contract)),
+                        Some(false) => eoas.push((addr.clone(), AddressKind::Eoa)),
+                        None => unknown_after_probe += 1,
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    batch = chunk.len(),
+                    "is_contract_batch failed for chunk; leaving as Unknown"
+                );
+                unknown_after_probe += chunk.len();
+            }
+        }
+    }
+
+    // Step 4: bulk persist (one INSERT for contracts + eoas combined).
+    let mut to_persist: Vec<(Address, AddressKind)> =
+        Vec::with_capacity(contracts.len() + eoas.len());
+    to_persist.append(&mut contracts);
+    to_persist.append(&mut eoas);
+    if !to_persist.is_empty() {
+        if let Err(e) = kinds.set_kind_batch(&to_persist).await {
+            tracing::warn!(error = %e, rows = to_persist.len(), "set_kind_batch failed");
+        }
+    }
+
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+    tracing::info!(
+        total,
+        already_labelled,
+        probed = probe_count,
+        contracts = to_persist.iter().filter(|(_, k)| matches!(k, AddressKind::Contract)).count(),
+        eoas = to_persist.iter().filter(|(_, k)| matches!(k, AddressKind::Eoa)).count(),
+        unknown_after_probe,
+        chain_batch_size = chunk_size,
+        elapsed_ms,
+        "address kinds classified"
+    );
+}
+
+async fn enrich_and_alert(
+    fetched: &mut Vec<Transfer>,
+    prices: Option<&Arc<dyn PricePort>>,
+    watchlist: Option<&Arc<dyn WatchlistRepository>>,
+    alerts: Option<&Arc<dyn AlertSink>>,
+) {
+    if let Some(p) = prices {
+        let mut day_cache: HashMap<(domain::asset::AssetId, i64), Option<domain::price::UnitPrice>> =
+            HashMap::new();
+        for t in fetched.iter_mut() {
+            let key = (t.asset().clone(), t.timestamp().timestamp() / 86_400);
+            let price = match day_cache.get(&key) {
+                Some(v) => *v,
+                None => {
+                    let v = p.price_at(t.asset(), t.timestamp()).await.unwrap_or(None);
+                    day_cache.insert(key, v);
+                    v
+                }
+            };
+            if let Some(price) = price {
+                t.set_usd_value(price.apply(t.amount()));
+            }
+        }
+    }
+
+    if let (Some(w), Some(a)) = (watchlist, alerts) {
+        for t in fetched.iter() {
+            for addr in [t.from(), t.to()] {
+                if w.contains(addr).await.unwrap_or(false) {
+                    let alert = Alert {
+                        address: addr.clone(),
+                        triggered_by_tx: *t.id().tx_hash(),
+                        triggered_by_idx: t.id().index(),
+                        created_at: Utc::now(),
+                        reason: Some(format!("watchlist address {} touched", addr)),
+                    };
+                    let _ = a.record(alert).await;
+                }
+            }
+        }
     }
 }
 
@@ -252,11 +573,25 @@ where
 
             for (from_h, to_h) in spans {
                 let range = BlockRange::new(from_h, to_h);
-                match source
+                // Adaptive throttle: parallel build_graph requests share
+                // this gate; the gate shrinks on RateLimited (held permit
+                // is forget()'d) and grows back on a success streak. Both
+                // shifts are surfaced at WARN by the gate itself.
+                let permit = self.transfers_gate.acquire().await;
+                let outcome = source
                     .transfers_for_address(&addr, range, req.max_transfers_per_address())
-                    .await
-                {
-                    Ok(fetched) => {
+                    .await;
+                if let Some(p) = permit {
+                    match &outcome {
+                        Ok(_) => self.transfers_gate.release_after_success(p),
+                        Err(DomainError::RateLimited(_)) => {
+                            self.transfers_gate.shrink_after_rate_limit(p)
+                        }
+                        Err(_) => self.transfers_gate.release_after_other_error(p),
+                    }
+                }
+                match outcome {
+                    Ok(mut fetched) => {
                         tracing::debug!(
                             address = %addr,
                             from_h,
@@ -264,6 +599,13 @@ where
                             fetched = fetched.len(),
                             "span fetched from chain"
                         );
+                        enrich_and_alert(
+                            &mut fetched,
+                            self.prices.as_ref(),
+                            self.watchlist.as_ref(),
+                            self.alerts.as_ref(),
+                        )
+                        .await;
                         // delete only the actually-fetched span so prior
                         // cold data outside the span (other ranges, other
                         // ingests) is preserved
@@ -280,6 +622,13 @@ where
                             if let Err(e) = self.repo.save(&fetched).await {
                                 tracing::warn!(address = %addr, error = %e, "save failed");
                             }
+                            classify_address_kinds(
+                                source.as_ref(),
+                                self.address_kinds.as_ref(),
+                                &fetched,
+                                self.classify_chain_batch_size,
+                            )
+                            .await;
                         }
                     }
                     Err(e) => {
@@ -516,5 +865,112 @@ mod tests {
             missing_spans(250, 400, 500, Some(100), Some(200), 12),
             vec![(250, 400)]
         );
+    }
+}
+
+#[cfg(test)]
+mod adaptive_concurrency_tests {
+    use super::AdaptiveConcurrency;
+
+    #[tokio::test]
+    async fn rate_limit_shrinks_one_permit_at_a_time() {
+        let gate = AdaptiveConcurrency::new(4, 1, 8, 20);
+        assert_eq!(gate.current_permits(), 4);
+
+        // Each rate-limit eats one permit (forget) until we hit the floor.
+        for expected_after in [3u32, 2, 1] {
+            let p = gate.acquire().await.unwrap();
+            gate.shrink_after_rate_limit(p);
+            assert_eq!(gate.current_permits(), expected_after);
+        }
+        // At floor: shrink no longer changes the counter.
+        let p = gate.acquire().await.unwrap();
+        gate.shrink_after_rate_limit(p);
+        assert_eq!(gate.current_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn success_streak_grows_permit_then_resets() {
+        let gate = AdaptiveConcurrency::new(2, 1, 4, 3);
+
+        // Shrink first to leave room to grow back.
+        let p = gate.acquire().await.unwrap();
+        gate.shrink_after_rate_limit(p);
+        assert_eq!(gate.current_permits(), 1);
+
+        // First two successes don't reach the grow threshold yet.
+        for _ in 0..2 {
+            let p = gate.acquire().await.unwrap();
+            gate.release_after_success(p);
+        }
+        assert_eq!(gate.current_permits(), 1);
+
+        // Third success crosses the threshold → +1 permit, streak resets.
+        let p = gate.acquire().await.unwrap();
+        gate.release_after_success(p);
+        assert_eq!(gate.current_permits(), 2);
+
+        // Two more successes — not enough to grow again because streak reset.
+        for _ in 0..2 {
+            let p = gate.acquire().await.unwrap();
+            gate.release_after_success(p);
+        }
+        assert_eq!(gate.current_permits(), 2);
+
+        // Third post-grow success grows again.
+        let p = gate.acquire().await.unwrap();
+        gate.release_after_success(p);
+        assert_eq!(gate.current_permits(), 3);
+    }
+
+    #[tokio::test]
+    async fn growth_stops_at_ceiling() {
+        let gate = AdaptiveConcurrency::new(2, 1, 2, 1);
+        let p = gate.acquire().await.unwrap();
+        gate.release_after_success(p);
+        // Cannot grow above max.
+        assert_eq!(gate.current_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_resets_success_streak() {
+        // Build up streak, then a rate-limit must reset it — so the next
+        // success alone should NOT trigger growth.
+        let gate = AdaptiveConcurrency::new(1, 1, 4, 3);
+        for _ in 0..2 {
+            let p = gate.acquire().await.unwrap();
+            gate.release_after_success(p);
+        }
+        // Streak = 2. Rate-limit zeroes it; shrink no-ops because we're at floor.
+        let p = gate.acquire().await.unwrap();
+        gate.shrink_after_rate_limit(p);
+        assert_eq!(gate.current_permits(), 1);
+
+        // Single success after reset must not grow (would need 3 in a row).
+        let p = gate.acquire().await.unwrap();
+        gate.release_after_success(p);
+        assert_eq!(gate.current_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn other_errors_do_not_change_state() {
+        let gate = AdaptiveConcurrency::new(4, 1, 8, 20);
+        let p = gate.acquire().await.unwrap();
+        gate.release_after_other_error(p);
+        assert_eq!(gate.current_permits(), 4);
+        // Streak isn't bumped either — a subsequent rate-limit still
+        // shrinks normally without odd interactions.
+        let p = gate.acquire().await.unwrap();
+        gate.shrink_after_rate_limit(p);
+        assert_eq!(gate.current_permits(), 3);
+    }
+
+    #[tokio::test]
+    async fn invariants_held_when_initial_outside_bounds() {
+        // initial above max → clamped to max; below min → clamped to min.
+        let above = AdaptiveConcurrency::new(99, 2, 5, 10);
+        assert_eq!(above.current_permits(), 5);
+        let below = AdaptiveConcurrency::new(0, 2, 5, 10);
+        assert_eq!(below.current_permits(), 2);
     }
 }

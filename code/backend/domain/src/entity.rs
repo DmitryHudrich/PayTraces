@@ -79,6 +79,27 @@ pub enum LabelSource {
     Community,
 }
 
+/// Semantic role of an address — used by trace and heuristics to skip
+/// infrastructure (contracts, exchanges) as cash-outs and to weight risk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AddressKind {
+    Eoa,
+    Contract,
+    KnownService(String),
+    Unknown,
+}
+
+impl AddressKind {
+    pub fn as_str(&self) -> &str {
+        match self {
+            AddressKind::Eoa => "eoa",
+            AddressKind::Contract => "contract",
+            AddressKind::KnownService(_) => "known_service",
+            AddressKind::Unknown => "unknown",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Entity {
     id: EntityId,
@@ -216,6 +237,9 @@ pub enum ClusteringHeuristic {
     FanOut,
     FanIn,
     SmurfingCycle,
+    TemporalBurst,
+    FixedAmountClustering,
+    DwellTimePassThrough,
     BehavioralPattern(String),
     Manual,
 }

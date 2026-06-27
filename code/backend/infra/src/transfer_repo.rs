@@ -205,9 +205,12 @@ impl TransferRepository for PostgresTransferRepository {
             None => (0_i64, i64::MAX),
         };
 
-        let (after_h, after_idx) = match after {
-            Some(c) => (c.block_height.min(i64::MAX as u64) as i64, c.idx as i64),
-            None => (-1_i64, -1_i64),
+        let (after_h, after_idx): (i64, i32) = match after {
+            Some(c) => (
+                c.block_height.min(i64::MAX as u64) as i64,
+                c.idx.min(i32::MAX as u32) as i32,
+            ),
+            None => (-1_i64, -1_i32),
         };
 
         let limit_i64 = limit.min(i64::MAX as usize) as i64;

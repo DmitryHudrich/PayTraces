@@ -86,6 +86,7 @@ pub struct Transfer {
     timestamp: DateTime<Utc>,
     kind: TransferKind,
     finality: Finality,
+    usd_value: Option<crate::price::UsdAmount>,
 }
 
 impl Transfer {
@@ -114,7 +115,16 @@ impl Transfer {
             timestamp,
             kind,
             finality,
+            usd_value: None,
         }
+    }
+
+    pub fn usd_value(&self) -> Option<crate::price::UsdAmount> {
+        self.usd_value
+    }
+
+    pub fn set_usd_value(&mut self, usd: crate::price::UsdAmount) {
+        self.usd_value = Some(usd);
     }
 
     pub fn id(&self) -> &TransferId {

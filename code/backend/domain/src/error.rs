@@ -16,6 +16,13 @@ pub enum DomainError {
     #[error("insufficient data: {0}")]
     InsufficientData(String),
 
+    /// Upstream source exhausted its retry budget due to rate limiting (e.g.
+    /// all API keys cooled, HTTP 429 persisted across attempts). Routers
+    /// treat this as a failover trigger and try the next source; leaf
+    /// callers should surface it as transient unavailability.
+    #[error("rate limited: {0}")]
+    RateLimited(String),
+
     #[error("decimals mismatch: expected {expected}, got {actual}")]
     DecimalsMismatch { expected: u8, actual: u8 },
 

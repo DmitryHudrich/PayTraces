@@ -10,19 +10,36 @@ use domain::error::{DomainError, DomainResult};
 use domain::ports::EntityRepository;
 use domain::primitives::Address;
 
+pub mod alchemy_eth_source;
 pub mod bigquery_eth_source;
 pub mod chain_sources;
+pub mod eth_routed_source;
 pub mod etherscan_eth_source;
 pub mod fetch_wallet_api;
+pub mod forensics_repo;
+pub mod in_memory;
 mod job_repo;
+pub mod key_pool;
 pub mod pg;
+pub mod price;
+pub mod rate_limiter;
 pub mod tron_source;
 mod transfer_repo;
 
+pub use alchemy_eth_source::{AlchemyEthConfig, AlchemyEthSource};
 pub use bigquery_eth_source::{BigQueryEthConfig, BigQueryEthSource};
 pub use chain_sources::{ChainSources, ChainSourcesBuilder};
+pub use eth_routed_source::{
+    Capability, RoutedChains, RoutedEthSource, RoutedEthSourceBuilder,
+};
 pub use etherscan_eth_source::{EtherscanEthConfig, EtherscanEthSource};
+pub use forensics_repo::{PostgresAddressKinds, PostgresAlerts, PostgresWatchlist};
+pub use in_memory::{
+    InMemoryAddressKinds, InMemoryAlerts, InMemoryWatchlist, StaticLabelProvider,
+    check_watchlist_and_alert,
+};
 pub use job_repo::{JobRepository, JobRow};
+pub use price::{StaticPriceProvider, enrich_with_usd};
 pub use transfer_repo::PostgresTransferRepository;
 pub use tron_source::{TronGridConfig, TronGridSource};
 
@@ -91,6 +108,32 @@ impl EntityRepository for PostgresEntityRepository {
             .await
             .map_err(pg_err)?;
 
+        let Some(row) = row else { return Ok(None) };
+        let entity_id = EntityId::from_uuid(row.get("id"));
+        let addresses = load_addresses(&client, &entity_id).await?;
+        Ok(Some(row_to_entity(&row, entity_id, addresses)?))
+    }
+
+    async fn find_by_label(
+        &self,
+        category: &EntityCategory,
+        label_name: &str,
+    ) -> DomainResult<Option<Entity>> {
+        let client = self.pool.get().await.map_err(pool_err)?;
+        let (category_s, sanction_list_s) = category_to_str(category);
+        let row = client
+            .query_opt(
+                "SELECT e.id, e.category, e.sanction_list, e.label_name, e.label_url,
+                        e.label_source, e.risk_score
+                 FROM entities e
+                 WHERE e.category = $1
+                   AND COALESCE(e.sanction_list, '') = COALESCE($2, '')
+                   AND e.label_name = $3
+                 LIMIT 1",
+                &[&category_s, &sanction_list_s, &label_name],
+            )
+            .await
+            .map_err(pg_err)?;
         let Some(row) = row else { return Ok(None) };
         let entity_id = EntityId::from_uuid(row.get("id"));
         let addresses = load_addresses(&client, &entity_id).await?;

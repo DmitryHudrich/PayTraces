@@ -42,6 +42,65 @@ impl TransferGraph {
     pub fn incoming(&self, addr: &Address) -> Vec<&Transfer> {
         self.edges.iter().filter(|t| t.to() == addr).collect()
     }
+
+    /// BFS shortest path from `from` to `to` over the undirected projection of
+    /// the transfer graph. Returns the sequence of edges that connects them, or
+    /// `None` if unreachable. Picks the first edge per (u,v) pair encountered.
+    pub fn shortest_path(&self, from: &Address, to: &Address) -> Option<Vec<Transfer>> {
+        if from == to {
+            return Some(Vec::new());
+        }
+
+        use std::collections::{HashMap, HashSet, VecDeque};
+
+        let mut adjacency: HashMap<Address, Vec<(Address, &Transfer)>> = HashMap::new();
+        for e in &self.edges {
+            adjacency
+                .entry(e.from().clone())
+                .or_default()
+                .push((e.to().clone(), e));
+            adjacency
+                .entry(e.to().clone())
+                .or_default()
+                .push((e.from().clone(), e));
+        }
+
+        let mut prev: HashMap<Address, (Address, Transfer)> = HashMap::new();
+        let mut visited: HashSet<Address> = HashSet::new();
+        let mut q: VecDeque<Address> = VecDeque::new();
+        q.push_back(from.clone());
+        visited.insert(from.clone());
+
+        while let Some(curr) = q.pop_front() {
+            if &curr == to {
+                break;
+            }
+            let Some(neighbors) = adjacency.get(&curr) else {
+                continue;
+            };
+            for (next, edge) in neighbors {
+                if visited.insert(next.clone()) {
+                    prev.insert(next.clone(), (curr.clone(), (*edge).clone()));
+                    q.push_back(next.clone());
+                }
+            }
+        }
+
+        if !visited.contains(to) {
+            return None;
+        }
+        let mut chain: Vec<Transfer> = Vec::new();
+        let mut cursor = to.clone();
+        while let Some((p, e)) = prev.remove(&cursor) {
+            chain.push(e);
+            cursor = p;
+            if &cursor == from {
+                break;
+            }
+        }
+        chain.reverse();
+        Some(chain)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

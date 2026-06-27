@@ -79,6 +79,9 @@ pub struct TraceLimits {
     max_addresses: usize,
     max_paths: usize,
     min_amount_ratio: Option<Ratio>,
+    /// Edges with `edge_significance < min_edge_significance` are skipped.
+    /// `None` keeps the trace inclusive (default behaviour).
+    min_edge_significance: Option<f64>,
 }
 
 impl TraceLimits {
@@ -93,7 +96,13 @@ impl TraceLimits {
             max_addresses,
             max_paths,
             min_amount_ratio,
+            min_edge_significance: None,
         }
+    }
+
+    pub fn with_min_edge_significance(mut self, value: f64) -> Self {
+        self.min_edge_significance = Some(value);
+        self
     }
 
     pub fn max_hops(self) -> u32 {
@@ -111,6 +120,10 @@ impl TraceLimits {
     pub fn min_amount_ratio(self) -> Option<Ratio> {
         self.min_amount_ratio
     }
+
+    pub fn min_edge_significance(self) -> Option<f64> {
+        self.min_edge_significance
+    }
 }
 
 impl Default for TraceLimits {
@@ -120,6 +133,7 @@ impl Default for TraceLimits {
             max_addresses: 1_000,
             max_paths: 500,
             min_amount_ratio: Some(Ratio::from_percent(1)),
+            min_edge_significance: None,
         }
     }
 }

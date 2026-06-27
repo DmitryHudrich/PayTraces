@@ -2,6 +2,7 @@ server:
   host: "0.0.0.0"
   port: 8080
   api_key: ""
+  admin_api_key: ""           # X-Admin-Api-Key for /labels/*, /entities/*, /watchlist, /alerts, POST /address/.../kind
 
 log:
   directives:
@@ -12,8 +13,15 @@ log:
     - "usecase=debug"
 
 ethereum:
-  # Источник истины для ETH-транзакций: moralis | bigquery | etherscan
-  source: etherscan
+  source: routed
+
+routed:
+  transfers:    [etherscan]
+
+  is_contract:  [alchemy]
+  latest_block: [etherscan, alchemy]
+  fetch_block:  [alchemy]
+  source_cooldown_secs: 10
 
 bigquery:
   project_id: "secret"
@@ -24,7 +32,13 @@ bigquery:
   query_timeout_secs: 60
 
 etherscan:
-  api_key: ~
+  api_keys: []
+  key_cooldown_secs: 1
+  requests_per_second: 5.0
+  requests_per_second_burst: 5.0
+
+  http_max_attempts: 6           # retries for txlist / tokentx / txlistinternal
+  is_contract_max_attempts: 4    # retries for eth_getCode
   base_url: "https://api.etherscan.io/v2/api"
   page_size: 1000           # rows per HTTP page (max 10000)
   max_pages: 20             # hard cap on pages per (endpoint, address, range)
@@ -34,14 +48,49 @@ etherscan:
   confirmation_depth: 12    # ETH finality depth
   latest_block_ttl_secs: 15    # eth_blockNumber cache TTL
   page_max_capacity: 10000     # weighed by rows-per-page; controls moka size
-  max_concurrent_requests: 4   # semaphore bound; etherscan free tier is 5 req/sec
+  max_concurrent_requests: 1   # in-flight cap (concurrency, not rate)
   file_cache:
     enabled: true              # disk cache stores only cold (finalized) pages
     dir: "./etherscan_cache"
 
+alchemy:
+  base_url: "https://eth-mainnet.g.alchemy.com/v2"
+  api_key: ~
+  api_keys: []
+  key_cooldown_secs: 5
+  latest_block_ttl_secs: 15
+  max_concurrent_requests: 8
+  # Token-bucket throttle measured in Alchemy Compute Units / second.
+  # Free tier: 500 CU/s sustained, with up to 5000 CU consumed in any 10s
+  # window (the "burst"). The source charges each call by method:
+  # eth_blockNumber = 10, eth_getCode = 19, eth_getBlockByNumber = 16,
+  # eth_getLogs = 75, trace_filter = 75. A JSON-RPC batch costs the SUM of
+  # its inner methods — so batched eth_getCode × 100 = 1900 CU and the
+  # bucket throttles correctly. Without CU-pricing a 100-batch request
+  # would burn 100× the budget on what looks like one request.
+  requests_per_second: 500.0          # CU per second sustained
+  requests_per_second_burst: 5000.0   # CU available in a single drain
+  http_max_attempts: 5
+
+  enable_transfers: false
+  log_chunk_blocks: 2000
+  min_log_chunk_blocks: 16
+  trace_page_size: 1000
+  trace_max_pages: 50
+
 moralis:
   base_url: "https://deep-index.moralis.io/api/v2.2"
+  # Один ключ (legacy) — поддерживается. Можно переопределить --moralis-api-key.
   api_key: ~
+  # Пул ключей (round-robin + per-key cooldown на 429).
+  api_keys: []
+  key_cooldown_secs: 5
+  # Token-bucket throttle: req/sec sustained + burst. Moralis Free ≈ 25 RPS;
+  # снижаем до 20 чтобы был запас. На rate-limit (HTTP 429) ключ остывает,
+  # цикл ждёт и реально продолжает ретраить (а не падает после первой 429).
+  requests_per_second: 20.0
+  requests_per_second_burst: 20.0
+  http_max_attempts: 6
   cache:
     cold_ttl_secs: 86400      # TTL for finalized pages (max block_height ≤ latest − confirmation_depth)
     hot_ttl_secs: 15          # TTL for hot-tail pages — short in prod, large in dev
@@ -81,9 +130,52 @@ risk_cache:
   sanctions_ttl_secs: 900    # /sanctions result cache TTL
   sanctions_max_entries: 10000
 
+ingestion:
+  # Adaptive gate over concurrent source.transfers_for_address calls across
+  # all in-flight /build_graph requests. On DomainError::RateLimited the
+  # gate forgets the held permit → effective capacity shrinks by 1 (down to
+  # `min`). After `grow_after_successes` consecutive Ok's it adds 1 permit
+  # back (up to `max`). Both shifts log at WARN
+  # ("adaptive concurrency: ...").
+  transfers_concurrency:
+    initial: 4
+    min: 1
+    max: 8
+    grow_after_successes: 20
+  # Batch size for classify_address_kinds → ChainSource::is_contract_batch.
+  # With Alchemy in the chain — one JSON-RPC batched HTTP per chunk
+  # (1000 addresses ≈ 10 round-trips at 100). With Etherscan — N parallel
+  # eth_getCode calls per chunk (cache hits cost nothing, only stragglers
+  # hit the wire). 100 fits both upstreams comfortably.
+  classify_chain_batch_size: 100
+
 heuristics:
   min_fanout: 5              # unique receivers in window to trigger fan-out
   min_fanin: 5               # unique senders in window to trigger fan-in
   fan_window_secs: 86400     # sliding-window length for fan-in/out (24h)
   smurf_window_secs: 86400   # max delay between distributor->intermediary->cash-out hops
   smurf_max_depth: 2         # BFS hops downstream from each intermediary (1 = direct cash-out)
+
+score:
+  # Strategy for collapsing N RiskSignals into one overall score:
+  #   max            — worst signal sets the score (legacy). One CRITICAL
+  #                    sink outweighs five HIGH ones because we never look
+  #                    past the maximum.
+  #   weighted_count — max_severity + Σ(extra × count_bonus_weight),
+  #                    capped at max_score_cap. Signals are deduped by
+  #                    (kind, evidence-target) first so the same sink in
+  #                    forward+backward traces counts once. 5 HIGH
+  #                    counterparties score meaningfully above 1.
+  aggregation: weighted_count
+  count_bonus_weight: 0.1         # fraction of each extra signal's severity that adds to the base
+  sink_severity_threshold: 75     # sink risk_score >= N to fire as evidence (75 = HIGH)
+  max_score_cap: 100              # final score clamp (100 = CRITICAL)
+  # Internal trace knobs used by /score to find sink exposure. Smaller →
+  # faster scoring with less coverage; larger → slower with deeper reach.
+  trace_max_depth: 5
+  trace_max_nodes: 200
+  trace_max_paths: 100
+  trace_min_amount_ratio_percent: 5  # min % of inflow that must reach a sink for it to count
+
+labels:
+  bootstrap_file: ""         # absolute/relative path to JSON array of LabelRequest objects loaded at startup

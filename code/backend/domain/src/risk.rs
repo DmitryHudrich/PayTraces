@@ -47,8 +47,22 @@ pub struct RiskReport {
 }
 
 impl RiskReport {
+    /// Construct a report and auto-aggregate with the legacy "max severity"
+    /// strategy. Kept for callers that don't have a `ScoreConfig` handy.
     pub fn new(subject: Address, signals: Vec<RiskSignal>) -> Self {
         let overall_score = Self::aggregate_score(&signals);
+        Self {
+            subject,
+            overall_score,
+            signals,
+            generated_at: Utc::now(),
+        }
+    }
+
+    /// Construct a report with a pre-computed score — used by callers that
+    /// run their own aggregation (e.g. `RiskService` with config-driven
+    /// dedup + weighted-count rules).
+    pub fn with_score(subject: Address, signals: Vec<RiskSignal>, overall_score: RiskScore) -> Self {
         Self {
             subject,
             overall_score,

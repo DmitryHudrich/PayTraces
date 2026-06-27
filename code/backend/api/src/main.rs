@@ -32,36 +32,67 @@ use domain::trace::{
 use domain::transfer::TransferKind;
 use infra::fetch_wallet_api::MoralisEthSource;
 use infra::{
-    BigQueryEthSource, ChainSources, EtherscanEthSource, JobRepository, PostgresEntityRepository,
-    PostgresTransferRepository, TronGridSource,
+    AlchemyEthSource, BigQueryEthSource, ChainSources, EtherscanEthSource, JobRepository,
+    PostgresAddressKinds, PostgresAlerts, PostgresEntityRepository, PostgresTransferRepository,
+    PostgresWatchlist, RoutedChains, RoutedEthSource, StaticLabelProvider, StaticPriceProvider,
+    TronGridSource,
 };
-use usecase::{IngestionService, RiskService};
+use usecase::{AdaptiveConcurrency, IngestionService, RiskService};
 
 mod config;
 
 pub struct AppState {
     ingestion: IngestionService<ChainSources, PostgresTransferRepository>,
     risk: RiskService<PostgresTransferRepository, PostgresEntityRepository>,
+    entities: Arc<PostgresEntityRepository>,
     chains: ChainRegistry,
     jobs: JobRepository,
     api_key: Option<String>,
+    admin_api_key: Option<String>,
+    prices: Arc<StaticPriceProvider>,
+    labels: Arc<StaticLabelProvider>,
+    address_kinds: Arc<PostgresAddressKinds>,
+    watchlist: Arc<PostgresWatchlist>,
+    alerts: Arc<PostgresAlerts>,
 }
 
 impl AppState {
     pub fn new(
         ingestion: IngestionService<ChainSources, PostgresTransferRepository>,
         risk: RiskService<PostgresTransferRepository, PostgresEntityRepository>,
+        entities: Arc<PostgresEntityRepository>,
         chains: ChainRegistry,
         jobs: JobRepository,
         api_key: Option<String>,
+        admin_api_key: Option<String>,
+        prices: Arc<StaticPriceProvider>,
+        labels: Arc<StaticLabelProvider>,
+        address_kinds: Arc<PostgresAddressKinds>,
+        watchlist: Arc<PostgresWatchlist>,
+        alerts: Arc<PostgresAlerts>,
     ) -> Self {
         Self {
             ingestion,
             risk,
+            entities,
             chains,
             jobs,
             api_key,
+            admin_api_key,
+            prices,
+            labels,
+            address_kinds,
+            watchlist,
+            alerts,
         }
+    }
+
+    pub fn entities(&self) -> &PostgresEntityRepository {
+        &self.entities
+    }
+
+    pub fn admin_api_key(&self) -> Option<&str> {
+        self.admin_api_key.as_deref()
     }
 
     pub fn ingestion(&self) -> &IngestionService<ChainSources, PostgresTransferRepository> {
@@ -82,6 +113,26 @@ impl AppState {
 
     pub fn api_key(&self) -> Option<&str> {
         self.api_key.as_deref()
+    }
+
+    pub fn prices(&self) -> &StaticPriceProvider {
+        &self.prices
+    }
+
+    pub fn labels(&self) -> &StaticLabelProvider {
+        &self.labels
+    }
+
+    pub fn address_kinds(&self) -> &PostgresAddressKinds {
+        &self.address_kinds
+    }
+
+    pub fn watchlist(&self) -> &PostgresWatchlist {
+        &self.watchlist
+    }
+
+    pub fn alerts(&self) -> &PostgresAlerts {
+        &self.alerts
     }
 }
 
@@ -141,8 +192,10 @@ impl utoipa::Modify for ApiSecurity {
     tags(
         (name = "Graph",      description = "Transfer graph construction and read-back."),
         (name = "Risk",       description = "Risk scoring, sanctions screening, fund tracing, behavioural heuristics."),
+        (name = "Labels",     description = "Entity/label CRUD (admin). Adds OFAC/exchange/mixer/etc. attribution to addresses; powers /score and /sanctions."),
         (name = "Jobs",       description = "Asynchronous ingestion jobs."),
         (name = "Chains",     description = "Supported blockchain registry."),
+        (name = "Discovery",  description = "Service discovery (registered chains, capabilities)."),
     ),
     modifiers(&ApiSecurity),
     security(
@@ -153,7 +206,15 @@ impl utoipa::Modify for ApiSecurity {
         get_graph, score_address, check_sanctions, trace_funds, list_chains,
         create_ingest_job, get_job_status,
         sanctions_batch, score_batch,
-        detect_heuristics
+        detect_heuristics,
+        shortest_path,
+        cluster_address,
+        watchlist_add, watchlist_list, watchlist_remove,
+        list_alerts,
+        get_address_kind, set_address_kind,
+        edge_significance_endpoint,
+        labels_set, labels_get, labels_delete, labels_bulk,
+        entity_create, entity_get, entity_add_addresses, entity_remove_address,
     ),
     components(schemas(
         GraphPage, EdgeDto,
@@ -165,6 +226,14 @@ impl utoipa::Modify for ApiSecurity {
         IngestJobRequest, JobAcceptedResponse, JobStatusResponse,
         SanctionsBatchRequest, ScoreBatchRequest, BatchItem,
         HeuristicsResponse, HeuristicEvidenceDto,
+        PathResponse, PathEdgeDto,
+        ClusterResponse,
+        WatchlistAddRequest, WatchlistEntryDto,
+        AlertDto,
+        AddressKindRequest, AddressKindResponse,
+        EdgeSignificanceResponse, EdgeScoreDto,
+        LabelRequest, LabelResponse, LabelsBulkResponse,
+        EntityCreateRequest, EntityAddAddressesRequest,
     ))
 )]
 struct ApiDoc;
@@ -220,18 +289,14 @@ async fn main() -> anyhow::Result<()> {
 
     match cfg.ethereum().source() {
         EthSourceKind::Moralis => {
-            if let Some(key) = cfg.moralis().api_key().filter(|k| !k.is_empty()) {
-                let eth_source = MoralisEthSource::new(
-                    key.to_owned(),
-                    cfg.moralis().base_url().to_owned(),
-                    http_client.clone(),
-                    cfg.moralis().cache().clone().into_domain(),
-                )
-                .await;
+            if cfg.moralis().has_any_key() {
+                let eth_source =
+                    MoralisEthSource::new(http_client.clone(), cfg.moralis().clone().into_domain())
+                        .await;
                 sources = sources.register(eth_source);
                 tracing::info!(chain = "eth", source = "moralis", "registered ETH source");
             } else {
-                tracing::warn!("moralis.api_key not set — Ethereum chain disabled");
+                tracing::warn!("moralis: no api keys (api_key / api_keys empty) — Ethereum chain disabled");
             }
         }
         EthSourceKind::Bigquery => {
@@ -256,16 +321,114 @@ async fn main() -> anyhow::Result<()> {
                     "ethereum.source=etherscan but `etherscan` section is missing in config"
                 )
             })?;
-            if es_cfg.api_key().is_none() {
+            if !es_cfg.has_any_key() {
                 anyhow::bail!(
-                    "ethereum.source=etherscan but etherscan.api_key is empty — \
-                     set it in config.yaml or pass --etherscan-api-key"
+                    "ethereum.source=etherscan but no api keys configured — \
+                     set etherscan.api_key, etherscan.api_keys, or pass --etherscan-api-key"
                 );
             }
             let eth_source =
                 EtherscanEthSource::new(http_client.clone(), es_cfg.into_domain()).await;
             sources = sources.register(eth_source);
             tracing::info!(chain = "eth", source = "etherscan", "registered ETH source");
+        }
+        EthSourceKind::Routed => {
+            let routed_cfg = cfg.routed().cloned().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "ethereum.source=routed but `routed` section is missing in config"
+                )
+            })?;
+            let referenced = routed_cfg.referenced_sources();
+            let mut builder = RoutedEthSource::builder(ChainId::ETH)
+                .source_cooldown(routed_cfg.source_cooldown())
+                .chains(RoutedChains {
+                    transfers: routed_cfg.transfers.clone(),
+                    is_contract: routed_cfg.is_contract.clone(),
+                    latest_block: routed_cfg.latest_block.clone(),
+                    fetch_block: routed_cfg.fetch_block.clone(),
+                });
+
+            // Construct each referenced leaf source on demand. The router's
+            // own .build() will reject unknown names, but we want a sharper
+            // error message when the config section itself is missing.
+            for name in &referenced {
+                match name.as_str() {
+                    "etherscan" => {
+                        let es_cfg = cfg.etherscan().cloned().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "routed chain references 'etherscan' but the `etherscan` section is missing"
+                            )
+                        })?;
+                        if !es_cfg.has_any_key() {
+                            anyhow::bail!(
+                                "routed.* references 'etherscan' but etherscan has no api keys"
+                            );
+                        }
+                        let src = EtherscanEthSource::new(
+                            http_client.clone(),
+                            es_cfg.into_domain(),
+                        )
+                        .await;
+                        builder = builder.register("etherscan", src);
+                    }
+                    "alchemy" => {
+                        let al_cfg = cfg.alchemy().cloned().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "routed chain references 'alchemy' but the `alchemy` section is missing"
+                            )
+                        })?;
+                        if !al_cfg.has_any_key() {
+                            anyhow::bail!(
+                                "routed.* references 'alchemy' but alchemy has no api keys — \
+                                 set alchemy.api_key / alchemy.api_keys or pass --alchemy-api-key"
+                            );
+                        }
+                        let src =
+                            AlchemyEthSource::new(http_client.clone(), al_cfg.into_domain());
+                        builder = builder.register("alchemy", src);
+                    }
+                    "bigquery" => {
+                        let bq_cfg = cfg.bigquery().cloned().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "routed chain references 'bigquery' but the `bigquery` section is missing"
+                            )
+                        })?;
+                        let src = BigQueryEthSource::new(
+                            http_client.clone(),
+                            bq_cfg.into_domain(),
+                        )
+                        .await?;
+                        builder = builder.register("bigquery", src);
+                    }
+                    "moralis" => {
+                        if !cfg.moralis().has_any_key() {
+                            anyhow::bail!(
+                                "routed.* references 'moralis' but moralis has no api keys — \
+                                 set moralis.api_key / moralis.api_keys or pass --moralis-api-key"
+                            );
+                        }
+                        let src = MoralisEthSource::new(
+                            http_client.clone(),
+                            cfg.moralis().clone().into_domain(),
+                        )
+                        .await;
+                        builder = builder.register("moralis", src);
+                    }
+                    other => anyhow::bail!(
+                        "routed chain references unknown source '{other}' — \
+                         supported: etherscan, alchemy, bigquery, moralis"
+                    ),
+                }
+            }
+
+            let router = builder.build()?;
+            sources = sources.register(router);
+            tracing::info!(
+                chain = "eth",
+                source = "routed",
+                inner = ?referenced,
+                "registered ETH source"
+            );
         }
     }
 
@@ -284,27 +447,130 @@ async fn main() -> anyhow::Result<()> {
     let chain_registry = ChainRegistry::default_registry();
 
     let api_key = cfg.server().api_key().map(str::to_owned);
+    let admin_api_key = cfg.server().admin_api_key().map(str::to_owned);
+    let entities_repo: Arc<PostgresEntityRepository> =
+        Arc::new(PostgresEntityRepository::new(pool.clone()));
+
+    let prices: Arc<StaticPriceProvider> = Arc::new(StaticPriceProvider::with_defaults());
+    let labels: Arc<StaticLabelProvider> = Arc::new(StaticLabelProvider::new());
+    let address_kinds: Arc<PostgresAddressKinds> =
+        Arc::new(PostgresAddressKinds::new(pool.clone()));
+    let watchlist: Arc<PostgresWatchlist> = Arc::new(PostgresWatchlist::new(pool.clone()));
+    let alerts: Arc<PostgresAlerts> = Arc::new(PostgresAlerts::new(pool.clone()));
+
+    let prices_for_state = Arc::clone(&prices);
+    let watchlist_for_state = Arc::clone(&watchlist);
+    let alerts_for_state = Arc::clone(&alerts);
+    let kinds_for_state = Arc::clone(&address_kinds);
+    let prices_for_ingest: Arc<dyn domain::ports::PricePort> = Arc::clone(&prices) as _;
+    let watchlist_for_ingest: Arc<dyn domain::ports::WatchlistRepository> =
+        Arc::clone(&watchlist) as _;
+    let alerts_for_ingest: Arc<dyn domain::ports::AlertSink> = Arc::clone(&alerts) as _;
+    let kinds_for_ingest: Arc<dyn domain::ports::AddressKindRepository> =
+        Arc::clone(&address_kinds) as _;
+
+    let transfers_concurrency = {
+        let c = &cfg.ingestion().transfers_concurrency;
+        Arc::new(AdaptiveConcurrency::new(
+            c.initial,
+            c.min,
+            c.max,
+            c.grow_after_successes,
+        ))
+    };
+    tracing::info!(
+        initial = cfg.ingestion().transfers_concurrency.initial,
+        min = cfg.ingestion().transfers_concurrency.min,
+        max = cfg.ingestion().transfers_concurrency.max,
+        grow_after_successes = cfg.ingestion().transfers_concurrency.grow_after_successes,
+        "ingestion transfers gate configured"
+    );
 
     let state = Arc::new(AppState::new(
         IngestionService::new(
             sources,
             PostgresTransferRepository::new(pool.clone()),
             chain_registry.clone(),
-        ),
-        RiskService::new(
+        )
+        .with_prices(prices_for_ingest)
+        .with_watchlist(watchlist_for_ingest, alerts_for_ingest)
+        .with_address_kinds(kinds_for_ingest)
+        .with_transfers_concurrency(transfers_concurrency)
+        .with_classify_chain_batch_size(cfg.ingestion().classify_chain_batch_size),
+        RiskService::with_score_config(
             PostgresTransferRepository::new(pool.clone()),
             PostgresEntityRepository::new(pool.clone()),
             cfg.risk_cache().clone().into_domain(),
             cfg.heuristics().clone().into_domain(),
+            cfg.score().clone().into_domain(),
         ),
+        Arc::clone(&entities_repo),
         chain_registry,
         JobRepository::new(pool.clone()),
         api_key,
+        admin_api_key,
+        prices_for_state,
+        labels,
+        kinds_for_state,
+        watchlist_for_state,
+        alerts_for_state,
     ));
+
+    if let Some(path) = cfg.labels().bootstrap_file() {
+        match std::fs::read_to_string(path) {
+            Ok(text) => match serde_json::from_str::<Vec<LabelRequest>>(&text) {
+                Ok(entries) => {
+                    let mut applied = 0usize;
+                    let mut failed = 0usize;
+                    for req in entries {
+                        match apply_label(&state, &req).await {
+                            Ok(_) => applied += 1,
+                            Err(e) => {
+                                failed += 1;
+                                let msg = match e {
+                                    ApiError::BadRequest(s) => s,
+                                    ApiError::Unauthorized => "unauthorized".into(),
+                                    ApiError::Internal(de) => de.to_string(),
+                                    ApiError::InternalMsg(s) => s,
+                                };
+                                tracing::warn!(path, address = %req.address, error = %msg, "bootstrap label failed");
+                            }
+                        }
+                    }
+                    tracing::info!(path, applied, failed, "bootstrap labels loaded");
+                }
+                Err(e) => {
+                    tracing::warn!(path, error = %e, "bootstrap labels: invalid JSON");
+                }
+            },
+            Err(e) => {
+                tracing::warn!(path, error = %e, "bootstrap labels: read failed");
+            }
+        }
+    }
 
     let addr = format!("{}:{}", cfg.server().host(), cfg.server().port());
 
-    let api = Router::<Arc<AppState>>::new()
+    let admin_routes = Router::<Arc<AppState>>::new()
+        .route("/labels", post(labels_set))
+        .route("/labels/bulk", post(labels_bulk))
+        .route("/labels/{addr}", get(labels_get).delete(labels_delete))
+        .route("/entities", post(entity_create))
+        .route("/entities/{id}", get(entity_get))
+        .route("/entities/{id}/addresses", post(entity_add_addresses))
+        .route(
+            "/entities/{id}/addresses/{addr}",
+            axum::routing::delete(entity_remove_address),
+        )
+        .route("/watchlist", get(watchlist_list).post(watchlist_add).delete(watchlist_remove))
+        .route("/alerts", get(list_alerts))
+        .route("/address/{addr}/kind", post(set_address_kind))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            admin_auth_middleware,
+        ));
+
+    let public_routes = Router::<Arc<AppState>>::new()
         .route("/chains", get(list_chains))
         .route("/graph", get(get_graph))
         .route("/score", get(score_address))
@@ -313,12 +579,20 @@ async fn main() -> anyhow::Result<()> {
         .route("/sanctions/batch", post(sanctions_batch))
         .route("/trace", get(trace_funds))
         .route("/heuristics", get(detect_heuristics))
+        .route("/path", get(shortest_path))
+        .route("/cluster", get(cluster_address))
+        .route("/edges/significance", get(edge_significance_endpoint))
+        .route("/address/{addr}/kind", get(get_address_kind))
         .route("/jobs/ingest", post(create_ingest_job))
         .route("/jobs/{id}", get(get_job_status))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth_middleware,
-        ))
+        ));
+
+    let api = Router::<Arc<AppState>>::new()
+        .merge(public_routes)
+        .merge(admin_routes)
         .layer(middleware::from_fn(version_middleware));
 
     let app = Router::new()
@@ -785,6 +1059,29 @@ async fn auth_middleware(
     }
 }
 
+async fn admin_auth_middleware(
+    State(state): State<Arc<AppState>>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Result<axum::response::Response, ApiError> {
+    let Some(expected) = state.admin_api_key() else {
+        // If no admin key is configured, fall back to plain api_key behaviour
+        // — admin endpoints stay protected by the regular key.
+        return auth_middleware(State(state), req, next).await;
+    };
+
+    let provided = req
+        .headers()
+        .get("X-Admin-Api-Key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
+    match provided {
+        Some(p) if p == expected => Ok(next.run(req).await),
+        _ => Err(ApiError::Unauthorized),
+    }
+}
+
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
 #[utoipa::path(
@@ -1126,6 +1423,26 @@ pub struct HeuristicsResponse {
     /// back into a single cash-out address within `smurf_window` and
     /// `smurf_max_depth` hops. `null` if not detected.
     smurfing_cycle: Option<HeuristicEvidenceDto>,
+
+    /// Temporal burst — anomalous concentration of transfers (≥ `burst_min_count`
+    /// in a `burst_window`, with the burst ≥ `burst_multiplier` × median baseline).
+    temporal_burst: Option<HeuristicEvidenceDto>,
+
+    /// Fixed-amount clustering — ≥ `fixed_amount_min_count` transfers around the
+    /// address share the same USD bucket (`fixed_amount_bucket_usd` granularity).
+    fixed_amount_clustering: Option<HeuristicEvidenceDto>,
+
+    /// Dwell-time pass-through — median delay between matched in/out pairs
+    /// is below `dwell_max_secs` over ≥ `dwell_min_pairs` matched pairs.
+    dwell_time_pass_through: Option<HeuristicEvidenceDto>,
+
+    /// Peeling chain — small slices of inflow being peeled off into a chain of
+    /// short-lived addresses.
+    peeling_chain: Option<HeuristicEvidenceDto>,
+
+    /// Deposit-address reuse — many distinct senders fund the same single
+    /// deposit address (exchange-style routing).
+    deposit_address_reuse: Option<HeuristicEvidenceDto>,
 }
 
 fn evidence_to_dto(
@@ -1171,13 +1488,979 @@ pub async fn detect_heuristics(
         .detect_smurfing_cycle(&addr)
         .await
         .map_err(ApiError::Internal)?;
+    let burst = risk
+        .detect_temporal_burst(&addr)
+        .await
+        .map_err(ApiError::Internal)?;
+    let fixed = risk
+        .detect_fixed_amount_clustering(&addr)
+        .await
+        .map_err(ApiError::Internal)?;
+    let dwell = risk
+        .detect_dwell_time(&addr)
+        .await
+        .map_err(ApiError::Internal)?;
+    let peeling = risk
+        .detect_peeling_chain(&addr)
+        .await
+        .map_err(ApiError::Internal)?;
+    let deposit = risk
+        .deposit_reuse_cluster(&addr)
+        .await
+        .map_err(ApiError::Internal)?;
 
     Ok(Json(HeuristicsResponse {
         address: addr.canonical(),
         fan_out: fan_out.as_ref().map(evidence_to_dto),
         fan_in: fan_in.as_ref().map(evidence_to_dto),
         smurfing_cycle: smurf.as_ref().map(evidence_to_dto),
+        temporal_burst: burst.as_ref().map(evidence_to_dto),
+        fixed_amount_clustering: fixed.as_ref().map(evidence_to_dto),
+        dwell_time_pass_through: dwell.as_ref().map(evidence_to_dto),
+        peeling_chain: peeling.as_ref().map(evidence_to_dto),
+        deposit_address_reuse: deposit.as_ref().map(evidence_to_dto),
     }))
+}
+
+// ── /path A->B ───────────────────────────────────────────────────────────────
+
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct PathQuery {
+    /// Source address.
+    #[param(example = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045")]
+    from: String,
+    /// Target address.
+    #[param(example = "0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1")]
+    to: String,
+    /// Chain ID. Defaults to 1 (Ethereum mainnet).
+    #[param(example = 1)]
+    chain_id: Option<u32>,
+    /// BFS depth limit for the auxiliary graph (default 3, see /graph).
+    #[param(example = 3)]
+    max_depth: Option<u32>,
+    /// Node cap (default 500).
+    #[param(example = 500)]
+    max_nodes: Option<usize>,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct PathEdgeDto {
+    tx_hash: String,
+    from: String,
+    to: String,
+    amount: String,
+    asset: String,
+    usd_value: Option<f64>,
+    timestamp: String,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct PathResponse {
+    /// Number of hops (== length of `edges`). 0 means from == to.
+    length: usize,
+    /// Set to `true` when no path was found inside the bounded subgraph.
+    not_found: bool,
+    edges: Vec<PathEdgeDto>,
+}
+
+fn edge_dto(t: &domain::transfer::Transfer) -> PathEdgeDto {
+    PathEdgeDto {
+        tx_hash: hex::encode(t.tx_ref().hash()),
+        from: t.from().canonical(),
+        to: t.to().canonical(),
+        amount: t.amount().raw().to_string(),
+        asset: format!("{}", t.asset()),
+        usd_value: t.usd_value().map(|v| v.value()),
+        timestamp: t.timestamp().to_rfc3339(),
+    }
+}
+
+#[utoipa::path(
+    get, path = "/path",
+    params(PathQuery),
+    responses(
+        (status = 200, description = "Shortest-path between two addresses in the bounded graph", body = PathResponse),
+        (status = 400, description = "Invalid address or parameter", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse),
+    ),
+    tag = "Graph"
+)]
+pub async fn shortest_path(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<PathQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let chain = ChainId::new(q.chain_id.unwrap_or(ChainId::ETH.value()));
+    let a = parse_address(&q.from, chain)?;
+    let b = parse_address(&q.to, chain)?;
+    let max_depth = q.max_depth.unwrap_or(3);
+    let max_nodes = q.max_nodes.unwrap_or(500);
+
+    let graph = state
+        .ingestion()
+        .build_graph_from_db(
+            &a,
+            GraphRequest::new(None, max_depth, max_nodes, 10_000),
+        )
+        .await
+        .map_err(ApiError::Internal)?;
+
+    let path = graph.shortest_path(&a, &b);
+    let (not_found, edges) = match path {
+        Some(es) => (false, es.iter().map(edge_dto).collect()),
+        None => (true, Vec::new()),
+    };
+    let length = if not_found { 0 } else { edges_count(&edges) };
+    Ok(Json(PathResponse { length, not_found, edges }))
+}
+
+fn edges_count<T>(v: &[T]) -> usize {
+    v.len()
+}
+
+// ── /cluster (Union-Find) ────────────────────────────────────────────────────
+
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct ClusterQuery {
+    #[param(example = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045")]
+    address: String,
+    #[param(example = 1)]
+    chain_id: Option<u32>,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct ClusterResponse {
+    address: String,
+    /// Components produced by Union-Find over outputs of every detector. The
+    /// queried address is guaranteed to be in component 0.
+    components: Vec<Vec<String>>,
+}
+
+#[utoipa::path(
+    get, path = "/cluster",
+    params(ClusterQuery),
+    responses(
+        (status = 200, description = "Union-Find clustering anchored at the address", body = ClusterResponse),
+        (status = 400, description = "Invalid address", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse),
+    ),
+    tag = "Risk"
+)]
+pub async fn cluster_address(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<ClusterQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let chain = ChainId::new(q.chain_id.unwrap_or(ChainId::ETH.value()));
+    let addr = parse_address(&q.address, chain)?;
+
+    let mut components = state
+        .risk()
+        .cluster_address(&addr)
+        .await
+        .map_err(ApiError::Internal)?;
+    components.sort_by_key(|c| std::cmp::Reverse(c.iter().any(|a| a == &addr) as i32));
+
+    Ok(Json(ClusterResponse {
+        address: addr.canonical(),
+        components: components
+            .into_iter()
+            .map(|c| c.into_iter().map(|a| a.canonical()).collect())
+            .collect(),
+    }))
+}
+
+// ── /edges/significance ─────────────────────────────────────────────────────
+
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct EdgeSignificanceQuery {
+    #[param(example = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045")]
+    address: String,
+    #[param(example = 1)]
+    chain_id: Option<u32>,
+    /// How many top-scored edges to return (default 50).
+    #[param(example = 50)]
+    limit: Option<usize>,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct EdgeScoreDto {
+    tx_hash: String,
+    from: String,
+    to: String,
+    amount: String,
+    asset: String,
+    usd_value: Option<f64>,
+    timestamp: String,
+    score: f64,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct EdgeSignificanceResponse {
+    address: String,
+    edges: Vec<EdgeScoreDto>,
+}
+
+#[utoipa::path(
+    get, path = "/edges/significance",
+    params(EdgeSignificanceQuery),
+    responses(
+        (status = 200, description = "Top edges around address scored by edge-significance heuristic", body = EdgeSignificanceResponse),
+        (status = 400, description = "Invalid address", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse),
+    ),
+    tag = "Risk"
+)]
+pub async fn edge_significance_endpoint(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<EdgeSignificanceQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    use domain::ports::TransferRepository;
+    let chain = ChainId::new(q.chain_id.unwrap_or(ChainId::ETH.value()));
+    let addr = parse_address(&q.address, chain)?;
+    let limit = q.limit.unwrap_or(50);
+
+    let repo = state.ingestion().repo();
+    let mut all = repo
+        .find_outgoing(&addr, None)
+        .await
+        .map_err(ApiError::Internal)?;
+    all.extend(
+        repo.find_incoming(&addr, None)
+            .await
+            .map_err(ApiError::Internal)?,
+    );
+
+    let context = all.clone();
+    let mut scored: Vec<(f64, domain::transfer::Transfer)> = all
+        .into_iter()
+        .map(|t| (usecase::risk::edge_significance(&t, &context), t))
+        .collect();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(limit);
+
+    let edges = scored
+        .into_iter()
+        .map(|(score, t)| EdgeScoreDto {
+            tx_hash: hex::encode(t.tx_ref().hash()),
+            from: t.from().canonical(),
+            to: t.to().canonical(),
+            amount: t.amount().raw().to_string(),
+            asset: format!("{}", t.asset()),
+            usd_value: t.usd_value().map(|v| v.value()),
+            timestamp: t.timestamp().to_rfc3339(),
+            score,
+        })
+        .collect();
+
+    Ok(Json(EdgeSignificanceResponse {
+        address: addr.canonical(),
+        edges,
+    }))
+}
+
+// ── /watchlist + /alerts ─────────────────────────────────────────────────────
+
+#[derive(Deserialize, Serialize, utoipa::ToSchema)]
+pub struct WatchlistAddRequest {
+    #[schema(example = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045")]
+    address: String,
+    #[schema(example = 1)]
+    chain_id: Option<u32>,
+    #[schema(example = "Suspect address from incident #42")]
+    reason: Option<String>,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct WatchlistEntryDto {
+    address: String,
+    reason: Option<String>,
+}
+
+#[utoipa::path(
+    post, path = "/watchlist",
+    request_body = WatchlistAddRequest,
+    responses(
+        (status = 200, description = "Address added to watchlist", body = WatchlistEntryDto),
+        (status = 400, description = "Invalid address", body = ErrorResponse),
+    ),
+    tag = "Risk"
+)]
+pub async fn watchlist_add(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<WatchlistAddRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    use domain::ports::{WatchlistEntry, WatchlistRepository};
+    let chain = ChainId::new(body.chain_id.unwrap_or(ChainId::ETH.value()));
+    let addr = parse_address(&body.address, chain)?;
+    state
+        .watchlist()
+        .add(WatchlistEntry {
+            address: addr.clone(),
+            reason: body.reason.clone(),
+        })
+        .await
+        .map_err(ApiError::Internal)?;
+    Ok(Json(WatchlistEntryDto {
+        address: addr.canonical(),
+        reason: body.reason,
+    }))
+}
+
+#[utoipa::path(
+    get, path = "/watchlist",
+    responses(
+        (status = 200, description = "Current watchlist", body = [WatchlistEntryDto]),
+    ),
+    tag = "Risk"
+)]
+pub async fn watchlist_list(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    use domain::ports::WatchlistRepository;
+    let entries = state.watchlist().list().await.map_err(ApiError::Internal)?;
+    let dto: Vec<WatchlistEntryDto> = entries
+        .into_iter()
+        .map(|e| WatchlistEntryDto {
+            address: e.address.canonical(),
+            reason: e.reason,
+        })
+        .collect();
+    Ok(Json(dto))
+}
+
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct WatchlistRemoveQuery {
+    #[param(example = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045")]
+    address: String,
+    #[param(example = 1)]
+    chain_id: Option<u32>,
+}
+
+#[utoipa::path(
+    delete, path = "/watchlist",
+    params(WatchlistRemoveQuery),
+    responses(
+        (status = 200, description = "Removed (returns whether the address was present)"),
+        (status = 400, description = "Invalid address", body = ErrorResponse),
+    ),
+    tag = "Risk"
+)]
+pub async fn watchlist_remove(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<WatchlistRemoveQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    use domain::ports::WatchlistRepository;
+    let chain = ChainId::new(q.chain_id.unwrap_or(ChainId::ETH.value()));
+    let addr = parse_address(&q.address, chain)?;
+    let removed = state.watchlist().remove(&addr).await.map_err(ApiError::Internal)?;
+    Ok(Json(serde_json::json!({ "removed": removed })))
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct AlertDto {
+    address: String,
+    tx_hash: String,
+    tx_idx: u32,
+    created_at: String,
+    reason: Option<String>,
+}
+
+#[utoipa::path(
+    get, path = "/alerts",
+    responses(
+        (status = 200, description = "Recent alerts triggered by watchlist matches", body = [AlertDto]),
+    ),
+    tag = "Risk"
+)]
+pub async fn list_alerts(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    use domain::ports::AlertSink;
+    let alerts = state.alerts().list().await.map_err(ApiError::Internal)?;
+    let dto: Vec<AlertDto> = alerts
+        .into_iter()
+        .map(|a| AlertDto {
+            address: a.address.canonical(),
+            tx_hash: hex::encode(a.triggered_by_tx),
+            tx_idx: a.triggered_by_idx,
+            created_at: a.created_at.to_rfc3339(),
+            reason: a.reason,
+        })
+        .collect();
+    Ok(Json(dto))
+}
+
+// ── /address/{addr}/kind ─────────────────────────────────────────────────────
+
+#[derive(Deserialize, Serialize, utoipa::ToSchema)]
+pub struct AddressKindRequest {
+    /// One of: `eoa`, `contract`, `known_service`, `unknown`.
+    #[schema(example = "contract")]
+    kind: String,
+    /// Required when `kind = known_service`.
+    #[schema(example = "Binance hot wallet")]
+    service_name: Option<String>,
+    #[schema(example = 1)]
+    chain_id: Option<u32>,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct AddressKindResponse {
+    address: String,
+    kind: String,
+    service_name: Option<String>,
+}
+
+#[utoipa::path(
+    get, path = "/address/{addr}/kind",
+    params(("addr" = String, Path, description = "Address (hex or canonical chain form)")),
+    responses(
+        (status = 200, description = "Current address-kind label", body = AddressKindResponse),
+        (status = 400, description = "Invalid address", body = ErrorResponse),
+    ),
+    tag = "Risk"
+)]
+pub async fn get_address_kind(
+    State(state): State<Arc<AppState>>,
+    Path(addr_param): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    use domain::ports::AddressKindRepository;
+    let chain = ChainId::ETH;
+    let addr = parse_address(&addr_param, chain)?;
+    let kind = state.address_kinds().kind(&addr).await.map_err(ApiError::Internal)?;
+    let (kind_str, name) = match kind {
+        domain::entity::AddressKind::Eoa => ("eoa".to_string(), None),
+        domain::entity::AddressKind::Contract => ("contract".to_string(), None),
+        domain::entity::AddressKind::KnownService(n) => ("known_service".to_string(), Some(n)),
+        domain::entity::AddressKind::Unknown => ("unknown".to_string(), None),
+    };
+    Ok(Json(AddressKindResponse { address: addr.canonical(), kind: kind_str, service_name: name }))
+}
+
+#[utoipa::path(
+    post, path = "/address/{addr}/kind",
+    params(("addr" = String, Path, description = "Address (hex or canonical chain form)")),
+    request_body = AddressKindRequest,
+    responses(
+        (status = 200, description = "Updated address-kind label", body = AddressKindResponse),
+        (status = 400, description = "Invalid address or kind value", body = ErrorResponse),
+    ),
+    tag = "Risk"
+)]
+pub async fn set_address_kind(
+    State(state): State<Arc<AppState>>,
+    Path(addr_param): Path<String>,
+    Json(body): Json<AddressKindRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    use domain::ports::AddressKindRepository;
+    let chain = ChainId::new(body.chain_id.unwrap_or(ChainId::ETH.value()));
+    let addr = parse_address(&addr_param, chain)?;
+    let kind = match body.kind.as_str() {
+        "eoa" => domain::entity::AddressKind::Eoa,
+        "contract" => domain::entity::AddressKind::Contract,
+        "known_service" => domain::entity::AddressKind::KnownService(
+            body.service_name.clone().unwrap_or_default(),
+        ),
+        "unknown" => domain::entity::AddressKind::Unknown,
+        other => {
+            return Err(ApiError::BadRequest(format!(
+                "unknown kind '{other}' (allowed: eoa, contract, known_service, unknown)"
+            )));
+        }
+    };
+    state
+        .address_kinds()
+        .set_kind(&addr, kind.clone())
+        .await
+        .map_err(ApiError::Internal)?;
+    let (kind_str, name) = match kind {
+        domain::entity::AddressKind::Eoa => ("eoa".to_string(), None),
+        domain::entity::AddressKind::Contract => ("contract".to_string(), None),
+        domain::entity::AddressKind::KnownService(n) => ("known_service".to_string(), Some(n)),
+        domain::entity::AddressKind::Unknown => ("unknown".to_string(), None),
+    };
+    Ok(Json(AddressKindResponse { address: addr.canonical(), kind: kind_str, service_name: name }))
+}
+
+// ── /labels + /entities ──────────────────────────────────────────────────────
+
+#[derive(Deserialize, Serialize, utoipa::ToSchema)]
+pub struct LabelRequest {
+    /// Address to tag (hex or canonical chain form).
+    #[schema(example = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045")]
+    address: String,
+    /// Chain ID. Defaults to 1 (Ethereum mainnet).
+    #[schema(example = 1)]
+    chain_id: Option<u32>,
+    /// One of: `exchange`, `mixer`, `bridge`, `defi`, `scam`, `gambling`,
+    /// `darknet`, `mining`, `sanctioned`, `unknown`.
+    #[schema(example = "exchange")]
+    category: String,
+    /// Human label name (e.g. "Binance hot wallet 14"). If matches another
+    /// entity by (category, label_name), this address is appended there.
+    #[schema(example = "Binance 14")]
+    label_name: Option<String>,
+    #[schema(example = "https://etherscan.io/address/0xd8dA…")]
+    label_url: Option<String>,
+    /// One of: `manual`, `chainalysis`, `internal`, `community`. Defaults to `manual`.
+    #[schema(example = "manual")]
+    label_source: Option<String>,
+    /// Only used when `category = sanctioned`. One of `ofac`, `eu`, `un`, or a
+    /// custom string.
+    #[schema(example = "ofac")]
+    sanction_list: Option<String>,
+    /// 0..100. Defaults: sanctioned=100, darknet=95, mixer=90, scam=75,
+    /// bridge=40, exchange=30, others=25.
+    #[schema(example = 30)]
+    risk_score: Option<u8>,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct LabelResponse {
+    entity_id: String,
+    addresses: Vec<String>,
+    category: String,
+    sanction_list: Option<String>,
+    label_name: Option<String>,
+    label_url: Option<String>,
+    label_source: Option<String>,
+    risk_score: u8,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct LabelsBulkResponse {
+    upserted: usize,
+    errors: Vec<String>,
+}
+
+fn parse_category(
+    s: &str,
+    sanction_list: Option<&str>,
+) -> Result<domain::entity::EntityCategory, ApiError> {
+    use domain::entity::{EntityCategory, SanctionList};
+    Ok(match s {
+        "exchange" => EntityCategory::Exchange,
+        "mixer" => EntityCategory::Mixer,
+        "bridge" => EntityCategory::Bridge,
+        "defi" => EntityCategory::DefiProtocol,
+        "scam" => EntityCategory::Scam,
+        "gambling" => EntityCategory::Gambling,
+        "darknet" => EntityCategory::Darknet,
+        "mining" => EntityCategory::Mining,
+        "unknown" => EntityCategory::Unknown,
+        "sanctioned" => {
+            let sl = match sanction_list.unwrap_or("ofac") {
+                "ofac" => SanctionList::Ofac,
+                "eu" => SanctionList::Eu,
+                "un" => SanctionList::Un,
+                other => SanctionList::Other(other.to_string()),
+            };
+            EntityCategory::Sanctioned { sanction_list: sl }
+        }
+        other => return Err(ApiError::bad_request(format!("unknown category: {other}"))),
+    })
+}
+
+fn parse_source(s: Option<&str>) -> domain::entity::LabelSource {
+    use domain::entity::LabelSource;
+    match s.unwrap_or("manual") {
+        "chainalysis" => LabelSource::Chainalysis,
+        "internal" => LabelSource::Internal,
+        "community" => LabelSource::Community,
+        _ => LabelSource::Manual,
+    }
+}
+
+fn default_risk_for(cat: &domain::entity::EntityCategory) -> u8 {
+    use domain::entity::EntityCategory;
+    match cat {
+        EntityCategory::Sanctioned { .. } => 100,
+        EntityCategory::Darknet => 95,
+        EntityCategory::Mixer => 90,
+        EntityCategory::Scam => 75,
+        EntityCategory::Bridge => 40,
+        EntityCategory::Exchange => 30,
+        _ => 25,
+    }
+}
+
+fn entity_to_dto(e: &domain::entity::Entity) -> LabelResponse {
+    use domain::entity::EntityCategory;
+    let (cat_s, sl) = match e.category() {
+        EntityCategory::Exchange => ("exchange".to_string(), None),
+        EntityCategory::Mixer => ("mixer".to_string(), None),
+        EntityCategory::Bridge => ("bridge".to_string(), None),
+        EntityCategory::DefiProtocol => ("defi".to_string(), None),
+        EntityCategory::Scam => ("scam".to_string(), None),
+        EntityCategory::Gambling => ("gambling".to_string(), None),
+        EntityCategory::Darknet => ("darknet".to_string(), None),
+        EntityCategory::Mining => ("mining".to_string(), None),
+        EntityCategory::Unknown => ("unknown".to_string(), None),
+        EntityCategory::Sanctioned { sanction_list } => (
+            "sanctioned".to_string(),
+            Some(match sanction_list {
+                domain::entity::SanctionList::Ofac => "ofac".to_string(),
+                domain::entity::SanctionList::Eu => "eu".to_string(),
+                domain::entity::SanctionList::Un => "un".to_string(),
+                domain::entity::SanctionList::Other(s) => s.clone(),
+            }),
+        ),
+    };
+    LabelResponse {
+        entity_id: e.id().value().to_string(),
+        addresses: e.addresses().iter().map(|a| a.canonical()).collect(),
+        category: cat_s,
+        sanction_list: sl,
+        label_name: e.label().map(|l| l.name().to_string()),
+        label_url: e.label().and_then(|l| l.url()).map(str::to_owned),
+        label_source: e.label().map(|l| match l.source() {
+            domain::entity::LabelSource::Manual => "manual".to_string(),
+            domain::entity::LabelSource::Chainalysis => "chainalysis".to_string(),
+            domain::entity::LabelSource::Internal => "internal".to_string(),
+            domain::entity::LabelSource::Community => "community".to_string(),
+        }),
+        risk_score: e.risk_score().value(),
+    }
+}
+
+async fn apply_label(
+    state: &AppState,
+    body: &LabelRequest,
+) -> Result<domain::entity::Entity, ApiError> {
+    use domain::entity::{Entity, EntityLabel, RiskScore};
+    use domain::ports::EntityRepository;
+
+    let chain = ChainId::new(body.chain_id.unwrap_or(ChainId::ETH.value()));
+    let addr = parse_address(&body.address, chain)?;
+    let category = parse_category(&body.category, body.sanction_list.as_deref())?;
+    let risk = RiskScore::new(body.risk_score.unwrap_or_else(|| default_risk_for(&category)));
+
+    // 1) Prefer the entity already attached to this address.
+    let mut entity = state
+        .entities()
+        .find_by_address(&addr)
+        .await
+        .map_err(ApiError::Internal)?;
+
+    // 2) Otherwise try to merge into an entity with the same (category, name).
+    if entity.is_none() {
+        if let Some(name) = body.label_name.as_deref() {
+            entity = state
+                .entities()
+                .find_by_label(&category, name)
+                .await
+                .map_err(ApiError::Internal)?;
+        }
+    }
+
+    // 3) Otherwise create a new entity.
+    let mut entity = entity.unwrap_or_else(|| Entity::new(category.clone(), risk));
+
+    if let Some(name) = body.label_name.clone() {
+        entity.set_label(EntityLabel::new(
+            name,
+            body.label_url.clone(),
+            parse_source(body.label_source.as_deref()),
+        ));
+    }
+    entity.add_address(addr);
+
+    state
+        .entities()
+        .save(&entity)
+        .await
+        .map_err(ApiError::Internal)?;
+
+    Ok(entity)
+}
+
+#[utoipa::path(
+    post, path = "/labels",
+    request_body = LabelRequest,
+    responses(
+        (status = 200, description = "Address labelled (entity created or extended)", body = LabelResponse),
+        (status = 400, description = "Invalid address or category", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid admin key", body = ErrorResponse),
+    ),
+    tag = "Labels"
+)]
+pub async fn labels_set(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<LabelRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let entity = apply_label(&state, &body).await?;
+    Ok(Json(entity_to_dto(&entity)))
+}
+
+#[utoipa::path(
+    get, path = "/labels/{addr}",
+    params(("addr" = String, Path, description = "Address (hex or canonical chain form)")),
+    responses(
+        (status = 200, description = "Label info for the address (and the other addresses in the same entity)", body = LabelResponse),
+        (status = 404, description = "Address has no label", body = ErrorResponse),
+        (status = 400, description = "Invalid address", body = ErrorResponse),
+    ),
+    tag = "Labels"
+)]
+pub async fn labels_get(
+    State(state): State<Arc<AppState>>,
+    Path(addr_param): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    use domain::ports::EntityRepository;
+    let addr = parse_address(&addr_param, ChainId::ETH)?;
+    let entity = state
+        .entities()
+        .find_by_address(&addr)
+        .await
+        .map_err(ApiError::Internal)?
+        .ok_or_else(|| ApiError::bad_request("no label for this address".to_string()))?;
+    Ok(Json(entity_to_dto(&entity)))
+}
+
+#[utoipa::path(
+    delete, path = "/labels/{addr}",
+    params(("addr" = String, Path, description = "Address (hex or canonical chain form)")),
+    responses(
+        (status = 200, description = "Removed (returns the entity it was detached from, or `null` if the address had no label)"),
+        (status = 400, description = "Invalid address", body = ErrorResponse),
+    ),
+    tag = "Labels"
+)]
+pub async fn labels_delete(
+    State(state): State<Arc<AppState>>,
+    Path(addr_param): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    use domain::entity::Entity;
+    use domain::ports::EntityRepository;
+    let addr = parse_address(&addr_param, ChainId::ETH)?;
+    let Some(entity) = state
+        .entities()
+        .find_by_address(&addr)
+        .await
+        .map_err(ApiError::Internal)?
+    else {
+        return Ok(Json(serde_json::json!({ "removed": false })));
+    };
+
+    let mut addresses = entity.addresses().clone();
+    addresses.remove(&addr);
+    let mut updated = Entity::from_parts(
+        entity.id().clone(),
+        entity.label().cloned(),
+        entity.category().clone(),
+        addresses,
+        entity.risk_score(),
+    );
+    if let Some(label) = entity.label() {
+        updated.set_label(label.clone());
+    }
+    state
+        .entities()
+        .save(&updated)
+        .await
+        .map_err(ApiError::Internal)?;
+    Ok(Json(serde_json::json!({
+        "removed": true,
+        "entity_id": entity.id().value().to_string(),
+        "remaining": updated.addresses().len(),
+    })))
+}
+
+#[utoipa::path(
+    post, path = "/labels/bulk",
+    request_body = [LabelRequest],
+    responses(
+        (status = 200, description = "Bulk import result", body = LabelsBulkResponse),
+    ),
+    tag = "Labels"
+)]
+pub async fn labels_bulk(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Vec<LabelRequest>>,
+) -> Result<impl IntoResponse, ApiError> {
+    let mut upserted = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+    for req in body {
+        match apply_label(&state, &req).await {
+            Ok(_) => upserted += 1,
+            Err(e) => {
+                let msg = match e {
+                    ApiError::BadRequest(s) => s,
+                    ApiError::Unauthorized => "unauthorized".into(),
+                    ApiError::Internal(de) => de.to_string(),
+                    ApiError::InternalMsg(s) => s,
+                };
+                errors.push(format!("{}: {msg}", req.address));
+            }
+        }
+    }
+    Ok(Json(LabelsBulkResponse { upserted, errors }))
+}
+
+#[derive(Deserialize, Serialize, utoipa::ToSchema)]
+pub struct EntityCreateRequest {
+    /// Category. Same vocabulary as `LabelRequest.category`.
+    #[schema(example = "exchange")]
+    category: String,
+    #[schema(example = "OKX hot wallets")]
+    label_name: Option<String>,
+    label_url: Option<String>,
+    label_source: Option<String>,
+    sanction_list: Option<String>,
+    risk_score: Option<u8>,
+}
+
+#[utoipa::path(
+    post, path = "/entities",
+    request_body = EntityCreateRequest,
+    responses(
+        (status = 200, description = "Entity created", body = LabelResponse),
+        (status = 400, description = "Invalid category", body = ErrorResponse),
+    ),
+    tag = "Labels"
+)]
+pub async fn entity_create(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<EntityCreateRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    use domain::entity::{Entity, EntityLabel, RiskScore};
+    use domain::ports::EntityRepository;
+    let category = parse_category(&body.category, body.sanction_list.as_deref())?;
+    let risk = RiskScore::new(body.risk_score.unwrap_or_else(|| default_risk_for(&category)));
+    let mut entity = Entity::new(category, risk);
+    if let Some(name) = body.label_name {
+        entity.set_label(EntityLabel::new(
+            name,
+            body.label_url,
+            parse_source(body.label_source.as_deref()),
+        ));
+    }
+    state
+        .entities()
+        .save(&entity)
+        .await
+        .map_err(ApiError::Internal)?;
+    Ok(Json(entity_to_dto(&entity)))
+}
+
+#[utoipa::path(
+    get, path = "/entities/{id}",
+    params(("id" = String, Path, description = "Entity UUID")),
+    responses(
+        (status = 200, description = "Entity details", body = LabelResponse),
+        (status = 404, description = "Unknown entity_id", body = ErrorResponse),
+    ),
+    tag = "Labels"
+)]
+pub async fn entity_get(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    use domain::entity::EntityId;
+    use domain::ports::EntityRepository;
+    let uuid = uuid::Uuid::parse_str(&id)
+        .map_err(|e| ApiError::bad_request(format!("invalid uuid: {e}")))?;
+    let entity = state
+        .entities()
+        .find_by_id(&EntityId::from_uuid(uuid))
+        .await
+        .map_err(ApiError::Internal)?
+        .ok_or_else(|| ApiError::bad_request("unknown entity_id".to_string()))?;
+    Ok(Json(entity_to_dto(&entity)))
+}
+
+#[derive(Deserialize, Serialize, utoipa::ToSchema)]
+pub struct EntityAddAddressesRequest {
+    chain_id: Option<u32>,
+    addresses: Vec<String>,
+}
+
+#[utoipa::path(
+    post, path = "/entities/{id}/addresses",
+    params(("id" = String, Path, description = "Entity UUID")),
+    request_body = EntityAddAddressesRequest,
+    responses(
+        (status = 200, description = "Updated entity", body = LabelResponse),
+        (status = 400, description = "Invalid address or unknown entity", body = ErrorResponse),
+    ),
+    tag = "Labels"
+)]
+pub async fn entity_add_addresses(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<EntityAddAddressesRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    use domain::entity::EntityId;
+    use domain::ports::EntityRepository;
+    let uuid = uuid::Uuid::parse_str(&id)
+        .map_err(|e| ApiError::bad_request(format!("invalid uuid: {e}")))?;
+    let mut entity = state
+        .entities()
+        .find_by_id(&EntityId::from_uuid(uuid))
+        .await
+        .map_err(ApiError::Internal)?
+        .ok_or_else(|| ApiError::bad_request("unknown entity_id".to_string()))?;
+    let chain = ChainId::new(body.chain_id.unwrap_or(ChainId::ETH.value()));
+    for s in &body.addresses {
+        let a = parse_address(s, chain)?;
+        entity.add_address(a);
+    }
+    state
+        .entities()
+        .save(&entity)
+        .await
+        .map_err(ApiError::Internal)?;
+    Ok(Json(entity_to_dto(&entity)))
+}
+
+#[utoipa::path(
+    delete, path = "/entities/{id}/addresses/{addr}",
+    params(
+        ("id" = String, Path, description = "Entity UUID"),
+        ("addr" = String, Path, description = "Address (hex or canonical)"),
+    ),
+    responses(
+        (status = 200, description = "Address removed", body = LabelResponse),
+        (status = 400, description = "Invalid address or unknown entity", body = ErrorResponse),
+    ),
+    tag = "Labels"
+)]
+pub async fn entity_remove_address(
+    State(state): State<Arc<AppState>>,
+    Path((id, addr_param)): Path<(String, String)>,
+) -> Result<impl IntoResponse, ApiError> {
+    use domain::entity::{Entity, EntityId};
+    use domain::ports::EntityRepository;
+    let uuid = uuid::Uuid::parse_str(&id)
+        .map_err(|e| ApiError::bad_request(format!("invalid uuid: {e}")))?;
+    let entity = state
+        .entities()
+        .find_by_id(&EntityId::from_uuid(uuid))
+        .await
+        .map_err(ApiError::Internal)?
+        .ok_or_else(|| ApiError::bad_request("unknown entity_id".to_string()))?;
+    let addr = parse_address(&addr_param, ChainId::ETH)?;
+    let mut addresses = entity.addresses().clone();
+    addresses.remove(&addr);
+    let mut updated = Entity::from_parts(
+        entity.id().clone(),
+        entity.label().cloned(),
+        entity.category().clone(),
+        addresses,
+        entity.risk_score(),
+    );
+    if let Some(label) = entity.label() {
+        updated.set_label(label.clone());
+    }
+    state
+        .entities()
+        .save(&updated)
+        .await
+        .map_err(ApiError::Internal)?;
+    Ok(Json(entity_to_dto(&updated)))
 }
 
 #[derive(Deserialize, utoipa::IntoParams)]
@@ -1195,6 +2478,10 @@ pub struct TraceQuery {
     max_hops: Option<u32>,
     #[param(example = 500)]
     max_addresses: Option<usize>,
+    /// Per-edge forensic-significance threshold (0..1). Edges scoring below
+    /// this are skipped during traversal. Omit to disable the filter.
+    #[param(example = 0.2)]
+    min_significance: Option<f64>,
 }
 
 #[utoipa::path(
@@ -1235,12 +2522,18 @@ pub async fn trace_funds(
             TraceOrigin::Address(addr),
             direction,
             strategy,
-            TraceLimits::new(
-                q.max_hops.unwrap_or(10),
-                q.max_addresses.unwrap_or(1_000),
-                500,
-                Some(Ratio::from_percent(1)),
-            ),
+            {
+                let mut limits = TraceLimits::new(
+                    q.max_hops.unwrap_or(10),
+                    q.max_addresses.unwrap_or(1_000),
+                    500,
+                    Some(Ratio::from_percent(1)),
+                );
+                if let Some(s) = q.min_significance {
+                    limits = limits.with_min_edge_significance(s);
+                }
+                limits
+            },
             false,
         ))
         .await

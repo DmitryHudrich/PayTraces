@@ -9,15 +9,15 @@ use domain::entity::{
 use domain::error::DomainResult;
 use domain::ports::{EntityRepository, RiskPort, TransferRepository};
 use domain::primitives::{Address, Amount, Confidence, Ratio};
-use domain::risk::{
-    RiskEvidence, RiskReport, RiskSignal, RiskSignalKind, SanctionsCheckResult,
-};
+use domain::risk::{RiskEvidence, RiskReport, RiskSignal, RiskSignalKind, SanctionsCheckResult};
 use domain::trace::{
-    FlowPath, Sink, SinkKind, TaintStrategy, TraceDirection, TraceLimits, TraceOrigin, TraceRequest,
-    TraceResult, TraceStats,
+    FlowPath, Sink, SinkKind, TaintStrategy, TraceDirection, TraceLimits, TraceOrigin,
+    TraceRequest, TraceResult, TraceStats,
 };
 use domain::transfer::Transfer;
 use moka::future::Cache;
+
+use crate::union_find::UnionFind;
 
 #[derive(Debug, Clone)]
 pub struct RiskCacheConfig {
@@ -25,6 +25,8 @@ pub struct RiskCacheConfig {
     pub score_max_entries: u64,
     pub sanctions_ttl: Duration,
     pub sanctions_max_entries: u64,
+    pub trace_ttl: Duration,
+    pub trace_max_entries: u64,
 }
 
 impl Default for RiskCacheConfig {
@@ -34,7 +36,39 @@ impl Default for RiskCacheConfig {
             score_max_entries: 10_000,
             sanctions_ttl: Duration::from_secs(900),
             sanctions_max_entries: 10_000,
+            trace_ttl: Duration::from_secs(300),
+            trace_max_entries: 2_000,
         }
+    }
+}
+
+/// Stable key for caching TraceResult.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct TraceCacheKey(String);
+
+impl TraceCacheKey {
+    fn build(req: &domain::trace::TraceRequest) -> Self {
+        use domain::trace::TraceOrigin;
+        let origin = match req.origin() {
+            TraceOrigin::Address(a) => format!("addr:{}:{}", a.chain().value(), hex::encode(a.bytes())),
+            TraceOrigin::Transaction { chain, hash } => {
+                format!("tx:{}:{}", chain.value(), hex::encode(hash))
+            }
+            TraceOrigin::Transfer(id) => {
+                format!("xfer:{}:{}:{}", id.chain().value(), hex::encode(id.tx_hash()), id.index())
+            }
+        };
+        let key = format!(
+            "{origin}|d={:?}|s={:?}|h={}|a={}|p={}|m={:?}|u={}",
+            req.direction(),
+            req.strategy(),
+            req.limits().max_hops(),
+            req.limits().max_addresses(),
+            req.limits().max_paths(),
+            req.limits().min_amount_ratio().map(|r| (r.as_f64() * 10_000.0) as i64),
+            req.include_unconfirmed(),
+        );
+        Self(key)
     }
 }
 
@@ -45,6 +79,25 @@ pub struct HeuristicsConfig {
     pub fan_window: Duration,
     pub smurf_window: Duration,
     pub smurf_max_depth: u32,
+    /// fraction tolerance for fan-in/out amount-similarity filter (0.0 = off).
+    pub amount_tolerance: f64,
+    /// burst detector — minimum txs/window required to even consider firing.
+    pub burst_min_count: usize,
+    /// burst detector — window length in seconds.
+    pub burst_window: Duration,
+    /// burst detector — multiplier over the baseline (median over the trailing
+    /// 14 windows) above which the latest window is considered anomalous.
+    pub burst_multiplier: f64,
+    /// fixed-amount clustering — minimum repetitions of the same USD bucket
+    /// (rounded to `fixed_amount_bucket_usd`) to fire.
+    pub fixed_amount_min_count: usize,
+    /// fixed-amount clustering — USD bucket size used to round amounts.
+    pub fixed_amount_bucket_usd: f64,
+    /// dwell-time — maximum median dwell (seconds in/out delay) before
+    /// pass-through is suspected.
+    pub dwell_max_secs: u64,
+    /// dwell-time — minimum number of matched in/out pairs to fire.
+    pub dwell_min_pairs: usize,
 }
 
 impl Default for HeuristicsConfig {
@@ -55,7 +108,152 @@ impl Default for HeuristicsConfig {
             fan_window: Duration::from_secs(86_400),
             smurf_window: Duration::from_secs(86_400),
             smurf_max_depth: 2,
+            amount_tolerance: 0.0,
+            burst_min_count: 20,
+            burst_window: Duration::from_secs(3_600),
+            burst_multiplier: 5.0,
+            fixed_amount_min_count: 5,
+            fixed_amount_bucket_usd: 100.0,
+            dwell_max_secs: 600,
+            dwell_min_pairs: 5,
         }
+    }
+}
+
+/// Strategy for collapsing N RiskSignals into a single overall score.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScoreAggregation {
+    /// Worst signal sets the score — legacy behaviour. Drop in if you
+    /// want one CRITICAL sink to outweigh five HIGH ones, period.
+    Max,
+    /// `max_severity + Σ(extra_severity × count_bonus_weight)`, capped at
+    /// `max_score_cap`. Multiple independent signals stack so a wallet
+    /// with 5 HIGH counterparties scores meaningfully above one with 1.
+    /// Signals are deduped by (kind, evidence-target) before aggregation
+    /// so the same sink appearing in forward+backward traces counts once.
+    WeightedCount,
+}
+
+/// Tunables for the per-address risk score. Separate from `HeuristicsConfig`
+/// (those drive cluster detection); this drives signal aggregation and the
+/// internal trace that `score()` walks to find sink exposure.
+#[derive(Debug, Clone, Copy)]
+pub struct ScoreConfig {
+    pub aggregation: ScoreAggregation,
+    /// Fraction of each extra signal's severity that adds to the base
+    /// (max) score under `WeightedCount`. 0.1 means each additional
+    /// HIGH signal contributes ~7.5 points; 0.5 means ~37.5.
+    pub count_bonus_weight: f64,
+    /// Signals whose severity is below this threshold don't fire as
+    /// sink-exposure evidence. Default 75 = `RiskScore::HIGH`.
+    pub sink_severity_threshold: u8,
+    /// Final score is clamped to this ceiling. 100 = CRITICAL.
+    pub max_score_cap: u8,
+    /// Depth, breadth, and per-address transfer limits for the internal
+    /// trace `score()` runs to discover sink exposure. Smaller → faster
+    /// scoring, less coverage; larger → slower, deeper coverage.
+    pub trace_max_depth: u32,
+    pub trace_max_nodes: usize,
+    pub trace_max_paths: usize,
+    /// Minimum fraction of inflow that must reach a sink for the sink to
+    /// count as exposure. Percent (0–100). Default 5 = 5%.
+    pub trace_min_amount_ratio_percent: u8,
+}
+
+impl Default for ScoreConfig {
+    fn default() -> Self {
+        Self {
+            aggregation: ScoreAggregation::WeightedCount,
+            count_bonus_weight: 0.1,
+            sink_severity_threshold: 75,
+            max_score_cap: 100,
+            trace_max_depth: 5,
+            trace_max_nodes: 200,
+            trace_max_paths: 100,
+            trace_min_amount_ratio_percent: 5,
+        }
+    }
+}
+
+impl ScoreConfig {
+    /// Count of distinct signals after dedup — useful for logs/telemetry
+    /// so we can see "scored CRITICAL from 7 raw signals collapsing to 3
+    /// unique entries" rather than just the final score.
+    pub fn unique_count(&self, signals: &[RiskSignal]) -> usize {
+        let mut keys: HashSet<SignalKey> = HashSet::new();
+        for s in signals {
+            keys.insert(signal_key(s));
+        }
+        keys.len()
+    }
+
+    /// Deduplicate signals by a stable key (kind + the most-distinctive
+    /// field of their evidence) and aggregate per the configured strategy.
+    /// Returns the overall score.
+    pub fn aggregate(&self, signals: &[RiskSignal]) -> RiskScore {
+        if signals.is_empty() {
+            return RiskScore::CLEAN;
+        }
+        // Collapse duplicates: same (kind, target) → keep the max severity
+        // of the group. The same sink in forward+backward traces is one
+        // signal, not two.
+        let mut by_key: HashMap<SignalKey, u8> = HashMap::new();
+        for s in signals {
+            let key = signal_key(s);
+            let cur = by_key.get(&key).copied().unwrap_or(0);
+            by_key.insert(key, cur.max(s.severity().value()));
+        }
+
+        let mut severities: Vec<u8> = by_key.into_values().collect();
+        severities.sort_unstable_by(|a, b| b.cmp(a));
+
+        match self.aggregation {
+            ScoreAggregation::Max => {
+                RiskScore::new(severities[0].min(self.max_score_cap))
+            }
+            ScoreAggregation::WeightedCount => {
+                let max = severities[0] as f64;
+                let bonus: f64 = severities[1..]
+                    .iter()
+                    .map(|&s| s as f64 * self.count_bonus_weight)
+                    .sum();
+                let total = (max + bonus).round();
+                let clamped = total.clamp(0.0, self.max_score_cap as f64) as u8;
+                RiskScore::new(clamped)
+            }
+        }
+    }
+}
+
+/// Stable identity for dedup. We choose the most-distinctive field of
+/// each evidence variant: a sink address, a category discriminant, the
+/// pattern string, etc. Same key → same logical signal regardless of
+/// which trace direction surfaced it.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+enum SignalKey {
+    Sink(Address),
+    Category(String),
+    Pattern(String),
+    Manual(String),
+    /// Fallback when evidence carries no distinctive identifier; uses the
+    /// signal kind's debug repr so distinct kinds still don't collapse.
+    Kind(String),
+}
+
+fn signal_key(s: &RiskSignal) -> SignalKey {
+    use domain::risk::RiskEvidence;
+    match s.evidence() {
+        RiskEvidence::SinkExposure(sinks) => {
+            // Multiple sinks in one signal — collapse to the address of
+            // the first one. In practice we emit one Sink per signal.
+            if let Some(first) = sinks.first() {
+                return SignalKey::Sink(first.address().clone());
+            }
+            SignalKey::Kind(format!("{:?}", s.kind()))
+        }
+        RiskEvidence::EntityCategory(cat) => SignalKey::Category(format!("{:?}", cat)),
+        RiskEvidence::TransactionPattern(p) => SignalKey::Pattern(p.clone()),
+        RiskEvidence::Manual(m) => SignalKey::Manual(m.clone()),
     }
 }
 
@@ -64,7 +262,9 @@ pub struct RiskService<R, E> {
     entities: E,
     score_cache: Cache<Address, RiskReport>,
     sanctions_cache: Cache<Address, SanctionsCheckResult>,
+    trace_cache: Cache<TraceCacheKey, TraceResult>,
     heuristics: HeuristicsConfig,
+    score_cfg: ScoreConfig,
 }
 
 impl<R, E> RiskService<R, E> {
@@ -74,6 +274,16 @@ impl<R, E> RiskService<R, E> {
         cache: RiskCacheConfig,
         heuristics: HeuristicsConfig,
     ) -> Self {
+        Self::with_score_config(transfers, entities, cache, heuristics, ScoreConfig::default())
+    }
+
+    pub fn with_score_config(
+        transfers: R,
+        entities: E,
+        cache: RiskCacheConfig,
+        heuristics: HeuristicsConfig,
+        score_cfg: ScoreConfig,
+    ) -> Self {
         let score_cache = Cache::builder()
             .max_capacity(cache.score_max_entries)
             .time_to_live(cache.score_ttl)
@@ -82,12 +292,18 @@ impl<R, E> RiskService<R, E> {
             .max_capacity(cache.sanctions_max_entries)
             .time_to_live(cache.sanctions_ttl)
             .build();
+        let trace_cache = Cache::builder()
+            .max_capacity(cache.trace_max_entries)
+            .time_to_live(cache.trace_ttl)
+            .build();
         Self {
             transfers,
             entities,
             score_cache,
             sanctions_cache,
+            trace_cache,
             heuristics,
+            score_cfg,
         }
     }
 }
@@ -97,13 +313,9 @@ where
     R: TransferRepository,
     E: EntityRepository,
 {
-    pub async fn score_batch(
-        &self,
-        addresses: &[Address],
-    ) -> DomainResult<Vec<RiskReport>> {
+    pub async fn score_batch(&self, addresses: &[Address]) -> DomainResult<Vec<RiskReport>> {
         use futures::stream::{FuturesUnordered, StreamExt};
-        let mut futs: FuturesUnordered<_> =
-            addresses.iter().map(|addr| self.score(addr)).collect();
+        let mut futs: FuturesUnordered<_> = addresses.iter().map(|addr| self.score(addr)).collect();
         let mut results = Vec::with_capacity(addresses.len());
         while let Some(res) = futs.next().await {
             results.push(res?);
@@ -125,6 +337,11 @@ where
         max_addresses = req.limits().max_addresses(),
     ))]
     async fn trace(&self, req: TraceRequest) -> DomainResult<TraceResult> {
+        let cache_key = TraceCacheKey::build(&req);
+        if let Some(cached) = self.trace_cache.get(&cache_key).await {
+            tracing::debug!("trace cache hit");
+            return Ok(cached);
+        }
         tracing::info!(
             direction = ?req.direction(),
             strategy = ?req.strategy(),
@@ -195,17 +412,16 @@ where
                 .await?;
             transfers_evaluated += next_arcs.len();
 
-            let is_haircut = matches!(
-                req.strategy(),
-                TaintStrategy::Haircut | TaintStrategy::Fifo | TaintStrategy::Lifo
-            );
+            let strategy = req.strategy();
+            let is_haircut = matches!(strategy, TaintStrategy::Haircut);
+            let is_ordered = matches!(strategy, TaintStrategy::Fifo | TaintStrategy::Lifo);
 
             let total_in: Amount = if matches!(req.direction(), TraceDirection::Backward) {
                 next_arcs
                     .iter()
                     .filter(|t| t.amount().decimals() == tainted.decimals())
                     .fold(Amount::zero(tainted.decimals()), |acc, t| acc + t.amount())
-            } else if is_haircut || next_arcs.is_empty() {
+            } else if is_haircut || is_ordered || next_arcs.is_empty() {
                 let inc = self
                     .fetch_cached(&mut out_cache, &mut in_cache, &addr, req.direction(), true)
                     .await?;
@@ -226,6 +442,20 @@ where
                 Ratio::ONE
             };
 
+            // Per-edge taint distribution under FIFO/LIFO: pre-compute how much
+            // of `tainted` each outgoing edge carries, draining from the
+            // chronologically-first edges (FIFO) or last edges (LIFO).
+            let ordered_propagation: Option<HashMap<domain::transfer::TransferId, Amount>> =
+                if is_ordered {
+                    Some(distribute_ordered(
+                        &next_arcs,
+                        tainted,
+                        matches!(strategy, TaintStrategy::Lifo),
+                    ))
+                } else {
+                    None
+                };
+
             if next_arcs.is_empty() {
                 let sink = self
                     .classify_sink(&addr, tainted, total_in.max(tainted))
@@ -237,15 +467,36 @@ where
                 continue;
             }
 
+            let context_for_sig: Vec<Transfer> = if req.limits().min_edge_significance().is_some()
+            {
+                next_arcs.iter().map(|a| (**a).clone()).collect()
+            } else {
+                Vec::new()
+            };
+
             for t in next_arcs.iter() {
                 if !req.include_unconfirmed() && !t.is_confirmed() {
                     continue;
                 }
 
-                let propagated = match req.strategy() {
+                if let Some(min_sig) = req.limits().min_edge_significance()
+                    && edge_significance(t, &context_for_sig) < min_sig
+                {
+                    continue;
+                }
+
+                let propagated = match strategy {
                     TaintStrategy::Poison => t.amount(),
-                    _ => taint_ratio.apply_to(t.amount()),
+                    TaintStrategy::Haircut => taint_ratio.apply_to(t.amount()),
+                    TaintStrategy::Fifo | TaintStrategy::Lifo => ordered_propagation
+                        .as_ref()
+                        .and_then(|m| m.get(t.id()).copied())
+                        .unwrap_or_else(|| Amount::zero(tainted.decimals())),
                 };
+
+                if propagated.is_zero() {
+                    continue;
+                }
 
                 if let Some(min_ratio) = req.limits().min_amount_ratio()
                     && propagated.ratio_of(&t.amount()) < min_ratio
@@ -253,9 +504,18 @@ where
                     continue;
                 }
 
+                // For Both: direction follows the edge relative to `addr`,
+                // not the global trace direction.
                 let next_addr = match req.direction() {
-                    TraceDirection::Forward | TraceDirection::Both => t.to().clone(),
+                    TraceDirection::Forward => t.to().clone(),
                     TraceDirection::Backward => t.from().clone(),
+                    TraceDirection::Both => {
+                        if t.from() == &addr {
+                            t.to().clone()
+                        } else {
+                            t.from().clone()
+                        }
+                    }
                 };
 
                 if path_visited.contains(&next_addr) {
@@ -270,8 +530,19 @@ where
             }
         }
 
+        // Dedup by address with max-taint aggregation, then sort.
+        let mut by_addr: HashMap<Address, Sink> = HashMap::new();
+        for s in sinks.into_iter() {
+            match by_addr.get(s.address()) {
+                Some(existing)
+                    if existing.tainted_amount().raw() >= s.tainted_amount().raw() => {}
+                _ => {
+                    by_addr.insert(s.address().clone(), s);
+                }
+            }
+        }
+        let mut sinks: Vec<Sink> = by_addr.into_values().collect();
         sinks.sort_by_key(|s| std::cmp::Reverse(s.risk_score()));
-        sinks.dedup_by(|a, b| a.address() == b.address());
 
         let paths_found = paths.len();
         let depth_reached = paths.iter().map(|p| p.depth()).max().unwrap_or(0);
@@ -286,7 +557,7 @@ where
             "trace complete"
         );
 
-        Ok(TraceResult::new(
+        let result = TraceResult::new(
             req,
             paths,
             sinks,
@@ -297,7 +568,9 @@ where
                 depth_reached,
                 truncated,
             ),
-        ))
+        );
+        self.trace_cache.insert(cache_key, result.clone()).await;
+        Ok(result)
     }
 
     #[tracing::instrument(skip(self, addr), fields(address = %crate::addr_hex(addr)))]
@@ -335,18 +608,26 @@ where
             ));
         }
 
+        // Internal trace knobs are now config-driven so operators can tune
+        // depth/breadth without rebuilding.
+        let limits = TraceLimits::new(
+            self.score_cfg.trace_max_depth,
+            self.score_cfg.trace_max_nodes,
+            self.score_cfg.trace_max_paths,
+            Some(Ratio::from_percent(self.score_cfg.trace_min_amount_ratio_percent)),
+        );
         let backward = self
             .trace(TraceRequest::new(
                 TraceOrigin::Address(addr.clone()),
                 TraceDirection::Backward,
                 TaintStrategy::Haircut,
-                TraceLimits::new(5, 200, 100, Some(Ratio::from_percent(5))),
+                limits,
                 false,
             ))
             .await?;
 
         for sink in backward.terminal_sinks() {
-            if sink.risk_score() >= RiskScore::HIGH.value() {
+            if sink.risk_score() >= self.score_cfg.sink_severity_threshold {
                 let hops = backward
                     .paths()
                     .iter()
@@ -378,13 +659,13 @@ where
                 TraceOrigin::Address(addr.clone()),
                 TraceDirection::Forward,
                 TaintStrategy::Haircut,
-                TraceLimits::new(5, 200, 100, Some(Ratio::from_percent(5))),
+                limits,
                 false,
             ))
             .await?;
 
         for sink in forward.terminal_sinks() {
-            if sink.risk_score() >= RiskScore::HIGH.value() {
+            if sink.risk_score() >= self.score_cfg.sink_severity_threshold {
                 signals.push(RiskSignal::new(
                     RiskSignalKind::DirectExposure,
                     RiskScore::new(sink.risk_score()),
@@ -397,11 +678,19 @@ where
             }
         }
 
-        let report = RiskReport::new(addr.clone(), signals);
+        // Config-driven aggregation: dedup signals by (kind, target), then
+        // either `Max` or `WeightedCount`. `with_score` skips the legacy
+        // max-aggregator in `RiskReport::new` since we've already computed
+        // the right number ourselves.
+        let overall = self.score_cfg.aggregate(&signals);
+        let unique_signals = self.score_cfg.unique_count(&signals);
+        let report = RiskReport::with_score(addr.clone(), signals, overall);
         tracing::info!(
             address = %crate::addr_hex(addr),
             score = report.overall_score().value(),
-            signals = report.signals().len(),
+            raw_signals = report.signals().len(),
+            unique_signals,
+            aggregation = ?self.score_cfg.aggregation,
             is_high_risk = report.is_high_risk(),
             "score complete"
         );
@@ -437,13 +726,10 @@ where
             is_sanctioned,
             "sanctions check result"
         );
-        let result = SanctionsCheckResult::new(
-            addr.clone(),
-            is_sanctioned,
-            sanction_list,
-            label,
-        );
-        self.sanctions_cache.insert(addr.clone(), result.clone()).await;
+        let result = SanctionsCheckResult::new(addr.clone(), is_sanctioned, sanction_list, label);
+        self.sanctions_cache
+            .insert(addr.clone(), result.clone())
+            .await;
         Ok(result)
     }
 
@@ -490,10 +776,7 @@ where
         )))
     }
 
-    async fn detect_peeling_chain(
-        &self,
-        addr: &Address,
-    ) -> DomainResult<Option<ClusterEvidence>> {
+    async fn detect_peeling_chain(&self, addr: &Address) -> DomainResult<Option<ClusterEvidence>> {
         let incoming = self.transfers.find_incoming(addr, None).await?;
         let outgoing = self.transfers.find_outgoing(addr, None).await?;
 
@@ -501,28 +784,55 @@ where
             return Ok(None);
         }
 
-        let in_sum = incoming.iter().fold(None::<Amount>, |acc, t| {
-            Some(acc.map(|a| a + t.amount()).unwrap_or(t.amount()))
-        });
-        let out_sum = outgoing.iter().fold(None::<Amount>, |acc, t| {
-            Some(acc.map(|a| a + t.amount()).unwrap_or(t.amount()))
-        });
-
-        let (Some(in_total), Some(out_total)) = (in_sum, out_sum) else {
-            return Ok(None);
-        };
-
-        let retained = if out_total.raw() <= in_total.raw() {
-            in_total - out_total
-        } else {
-            return Ok(None);
-        };
-
-        let retained_ratio = retained.ratio_of(&in_total);
-
-        if retained_ratio > Ratio::from_percent(5) {
-            return Ok(None);
+        // A peeling chain is a per-asset phenomenon: an address that
+        // received USDC and sent ETH isn't peeling, it's just mixing
+        // activity. `Amount` arithmetic asserts equal decimals (panics on
+        // 18-vs-6 ETH/USDC mixes), so we MUST group by asset before any
+        // summation.
+        use domain::asset::AssetId;
+        let mut in_by_asset: HashMap<AssetId, Amount> = HashMap::new();
+        for t in &incoming {
+            let amt = t.amount();
+            in_by_asset
+                .entry(t.asset().clone())
+                .and_modify(|a| *a = *a + amt)
+                .or_insert(amt);
         }
+        let mut out_by_asset: HashMap<AssetId, Amount> = HashMap::new();
+        for t in &outgoing {
+            let amt = t.amount();
+            out_by_asset
+                .entry(t.asset().clone())
+                .and_modify(|a| *a = *a + amt)
+                .or_insert(amt);
+        }
+
+        // Pick the asset with the strongest peeling signal — the smallest
+        // retained ratio that's still under the 5% threshold. Assets that
+        // either don't appear in outgoing, or have out > in, are skipped.
+        let mut best: Option<Ratio> = None;
+        for (asset, in_total) in &in_by_asset {
+            let Some(out_total) = out_by_asset.get(asset) else {
+                continue;
+            };
+            if out_total.raw() > in_total.raw() {
+                continue;
+            }
+            let retained = *in_total - *out_total;
+            let retained_ratio = retained.ratio_of(in_total);
+            if retained_ratio > Ratio::from_percent(5) {
+                continue;
+            }
+            best = match best {
+                None => Some(retained_ratio),
+                Some(curr) if retained_ratio < curr => Some(retained_ratio),
+                other => other,
+            };
+        }
+
+        let Some(retained_ratio) = best else {
+            return Ok(None);
+        };
 
         let chain_addrs: Vec<Address> = outgoing.into_iter().map(|t| t.to().clone()).collect();
 
@@ -537,10 +847,221 @@ where
         )))
     }
 
-    async fn detect_fan_out(
+    async fn detect_temporal_burst(
         &self,
         addr: &Address,
     ) -> DomainResult<Option<ClusterEvidence>> {
+        let cfg = self.heuristics;
+        let mut all: Vec<Transfer> = self.transfers.find_outgoing(addr, None).await?;
+        all.extend(self.transfers.find_incoming(addr, None).await?);
+        if all.len() < cfg.burst_min_count {
+            return Ok(None);
+        }
+        let window_secs = cfg.burst_window.as_secs() as i64;
+        if window_secs == 0 {
+            return Ok(None);
+        }
+
+        // Bucket transfers by floor(ts / window).
+        let mut counts: HashMap<i64, usize> = HashMap::new();
+        let mut bucket_addrs: HashMap<i64, HashSet<Address>> = HashMap::new();
+        for t in all.iter() {
+            let bucket = t.timestamp().timestamp() / window_secs;
+            *counts.entry(bucket).or_insert(0) += 1;
+            let counter = if t.from() == addr {
+                t.to().clone()
+            } else {
+                t.from().clone()
+            };
+            bucket_addrs.entry(bucket).or_default().insert(counter);
+        }
+
+        // Baseline = median over all populated buckets except the maximum one.
+        let mut buckets: Vec<(i64, usize)> = counts.iter().map(|(k, v)| (*k, *v)).collect();
+        buckets.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+        let (peak_bucket, peak_count) = buckets[0];
+
+        let baseline = if buckets.len() < 2 {
+            0.0
+        } else {
+            let mut tail: Vec<usize> = buckets.iter().skip(1).map(|(_, c)| *c).collect();
+            tail.sort();
+            let mid = tail.len() / 2;
+            tail[mid] as f64
+        };
+
+        if (peak_count as f64) < cfg.burst_min_count as f64 {
+            return Ok(None);
+        }
+        if baseline > 0.0 && (peak_count as f64) < baseline * cfg.burst_multiplier {
+            return Ok(None);
+        }
+
+        let mut addrs: Vec<Address> = bucket_addrs
+            .remove(&peak_bucket)
+            .map(|s| s.into_iter().collect())
+            .unwrap_or_default();
+        addrs.sort_by(|a, b| a.bytes().cmp(b.bytes()));
+
+        Ok(Some(ClusterEvidence::new(
+            addrs,
+            ClusteringHeuristic::TemporalBurst,
+            Confidence::MEDIUM,
+            Some(format!(
+                "Burst of {peak_count} transfers in a {window_secs}s window (baseline median {baseline:.1}) around {addr}"
+            )),
+        )))
+    }
+
+    async fn detect_fixed_amount_clustering(
+        &self,
+        addr: &Address,
+    ) -> DomainResult<Option<ClusterEvidence>> {
+        let cfg = self.heuristics;
+        let mut all: Vec<Transfer> = self.transfers.find_outgoing(addr, None).await?;
+        all.extend(self.transfers.find_incoming(addr, None).await?);
+        if all.len() < cfg.fixed_amount_min_count {
+            return Ok(None);
+        }
+        if cfg.fixed_amount_bucket_usd <= 0.0 {
+            return Ok(None);
+        }
+
+        // Bucket by rounded USD when available; fall back to raw amount if not.
+        let mut buckets: HashMap<i64, Vec<Transfer>> = HashMap::new();
+        for t in all.iter() {
+            let bucket: i64 = if let Some(usd) = t.usd_value() {
+                (usd.value() / cfg.fixed_amount_bucket_usd).round() as i64
+            } else {
+                // Raw u128 lossy bucket — same asset is usually present, so
+                // identical raw amounts cluster together.
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut h = DefaultHasher::new();
+                t.amount().raw().to_string().hash(&mut h);
+                t.asset().hash(&mut h);
+                h.finish() as i64
+            };
+            buckets.entry(bucket).or_default().push(t.clone());
+        }
+
+        let mut hits: Vec<(i64, Vec<Transfer>)> = buckets
+            .into_iter()
+            .filter(|(_, v)| v.len() >= cfg.fixed_amount_min_count)
+            .collect();
+        if hits.is_empty() {
+            return Ok(None);
+        }
+        hits.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
+        let (_bucket, transfers) = hits.into_iter().next().unwrap();
+        let count = transfers.len();
+        let mut addrs: HashSet<Address> = HashSet::new();
+        for t in transfers.iter() {
+            addrs.insert(t.from().clone());
+            addrs.insert(t.to().clone());
+        }
+        addrs.remove(addr);
+        let mut addrs: Vec<Address> = addrs.into_iter().collect();
+        addrs.sort_by(|a, b| a.bytes().cmp(b.bytes()));
+
+        Ok(Some(ClusterEvidence::new(
+            addrs,
+            ClusteringHeuristic::FixedAmountClustering,
+            Confidence::MEDIUM,
+            Some(format!(
+                "{count} transfers cluster into the same ~${} bucket around {addr}",
+                cfg.fixed_amount_bucket_usd as i64
+            )),
+        )))
+    }
+
+    async fn detect_dwell_time(
+        &self,
+        addr: &Address,
+    ) -> DomainResult<Option<ClusterEvidence>> {
+        let cfg = self.heuristics;
+        let mut incoming = self.transfers.find_incoming(addr, None).await?;
+        let mut outgoing = self.transfers.find_outgoing(addr, None).await?;
+        incoming.sort_by_key(|t| t.timestamp());
+        outgoing.sort_by_key(|t| t.timestamp());
+
+        if outgoing.len() < cfg.dwell_min_pairs {
+            return Ok(None);
+        }
+
+        // For each out tx, find the latest in tx with ts <= out.ts. Record the
+        // dwell delta in seconds. Two-pointer over already-sorted vecs.
+        let mut deltas: Vec<i64> = Vec::new();
+        let mut counterparties: HashSet<Address> = HashSet::new();
+        let mut i = 0usize;
+        let mut latest_in_ts: Option<chrono::DateTime<chrono::Utc>> = None;
+        for out in outgoing.iter() {
+            while i < incoming.len() && incoming[i].timestamp() <= out.timestamp() {
+                latest_in_ts = Some(incoming[i].timestamp());
+                i += 1;
+            }
+            if let Some(in_ts) = latest_in_ts {
+                let delta = (out.timestamp() - in_ts).num_seconds();
+                if delta >= 0 {
+                    deltas.push(delta);
+                    counterparties.insert(out.to().clone());
+                }
+            }
+        }
+
+        if deltas.len() < cfg.dwell_min_pairs {
+            return Ok(None);
+        }
+        deltas.sort();
+        let median_delta = deltas[deltas.len() / 2];
+        if (median_delta as u64) > cfg.dwell_max_secs {
+            return Ok(None);
+        }
+
+        let count = deltas.len();
+        let mut addrs: Vec<Address> = counterparties.into_iter().collect();
+        addrs.sort_by(|a, b| a.bytes().cmp(b.bytes()));
+
+        Ok(Some(ClusterEvidence::new(
+            addrs,
+            ClusteringHeuristic::DwellTimePassThrough,
+            Confidence::MEDIUM,
+            Some(format!(
+                "Median dwell time {median_delta}s across {count} in/out matched pairs (cap {}s) — pass-through pattern at {addr}",
+                cfg.dwell_max_secs
+            )),
+        )))
+    }
+
+    async fn cluster_address(
+        &self,
+        addr: &Address,
+    ) -> DomainResult<Vec<Vec<Address>>> {
+        let mut uf = UnionFind::new();
+        uf.insert(addr.clone());
+
+        for ev in [
+            self.detect_fan_out(addr).await?,
+            self.detect_fan_in(addr).await?,
+            self.detect_smurfing_cycle(addr).await?,
+            self.detect_temporal_burst(addr).await?,
+            self.detect_fixed_amount_clustering(addr).await?,
+            self.detect_dwell_time(addr).await?,
+            self.deposit_reuse_cluster(addr).await?,
+            self.detect_peeling_chain(addr).await?,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let mut group: Vec<Address> = ev.addresses().to_vec();
+            group.push(addr.clone());
+            uf.union_all(&group);
+        }
+
+        Ok(uf.components())
+    }
+
+    async fn detect_fan_out(&self, addr: &Address) -> DomainResult<Option<ClusterEvidence>> {
         let outgoing = self.transfers.find_outgoing(addr, None).await?;
         let cfg = self.heuristics;
         Ok(burst_window_evidence(
@@ -549,16 +1070,13 @@ where
             cfg.min_fanout,
             cfg.fan_window,
             ClusteringHeuristic::FanOut,
-            |n, window_secs| format!(
-                "{n} unique receivers within a {window_secs}s window from {addr}"
-            ),
+            |n, window_secs| {
+                format!("{n} unique receivers within a {window_secs}s window from {addr}")
+            },
         ))
     }
 
-    async fn detect_fan_in(
-        &self,
-        addr: &Address,
-    ) -> DomainResult<Option<ClusterEvidence>> {
+    async fn detect_fan_in(&self, addr: &Address) -> DomainResult<Option<ClusterEvidence>> {
         let incoming = self.transfers.find_incoming(addr, None).await?;
         let cfg = self.heuristics;
         Ok(burst_window_evidence(
@@ -567,22 +1085,21 @@ where
             cfg.min_fanin,
             cfg.fan_window,
             ClusteringHeuristic::FanIn,
-            |n, window_secs| format!(
-                "{n} unique senders within a {window_secs}s window into {addr}"
-            ),
+            |n, window_secs| {
+                format!("{n} unique senders within a {window_secs}s window into {addr}")
+            },
         ))
     }
 
-    async fn detect_smurfing_cycle(
-        &self,
-        addr: &Address,
-    ) -> DomainResult<Option<ClusterEvidence>> {
+    async fn detect_smurfing_cycle(&self, addr: &Address) -> DomainResult<Option<ClusterEvidence>> {
         let cfg = self.heuristics;
         let outgoing = self.transfers.find_outgoing(addr, None).await?;
 
         let receivers: Vec<(Address, chrono::DateTime<chrono::Utc>)> = {
-            let mut v: Vec<(Address, chrono::DateTime<chrono::Utc>)> =
-                outgoing.iter().map(|t| (t.to().clone(), t.timestamp())).collect();
+            let mut v: Vec<(Address, chrono::DateTime<chrono::Utc>)> = outgoing
+                .iter()
+                .map(|t| (t.to().clone(), t.timestamp()))
+                .collect();
             v.sort_by(|a, b| a.0.bytes().cmp(b.0.bytes()).then(a.1.cmp(&b.1)));
             v.dedup_by(|a, b| a.0 == b.0);
             v.retain(|(r, _)| r != addr);
@@ -600,9 +1117,15 @@ where
         let mut downstream: HashMap<Address, HashSet<Address>> = HashMap::new();
 
         for (r, r_ts) in receivers.iter() {
-            let reached =
-                bfs_downstream(&self.transfers, &mut outgoing_cache, r, *r_ts, window_chrono, cfg.smurf_max_depth)
-                    .await?;
+            let reached = bfs_downstream(
+                &self.transfers,
+                &mut outgoing_cache,
+                r,
+                *r_ts,
+                window_chrono,
+                cfg.smurf_max_depth,
+            )
+            .await?;
             for y in reached {
                 if &y == addr || &y == r {
                     continue;
@@ -619,7 +1142,11 @@ where
             return Ok(None);
         }
 
-        hits.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.bytes().cmp(b.0.bytes())));
+        hits.sort_by(|a, b| {
+            b.1.len()
+                .cmp(&a.1.len())
+                .then_with(|| a.0.bytes().cmp(b.0.bytes()))
+        });
         let (y, via_set) = hits.into_iter().next().unwrap();
         let mut via: Vec<Address> = via_set.into_iter().collect();
         via.sort_by(|a, b| a.bytes().cmp(b.bytes()));
@@ -821,9 +1348,7 @@ where
             }
         }
 
-        if uniq.len() >= min_unique
-            && best.as_ref().map(|b| b.len() < uniq.len()).unwrap_or(true)
-        {
+        if uniq.len() >= min_unique && best.as_ref().map(|b| b.len() < uniq.len()).unwrap_or(true) {
             best = Some(uniq);
         }
     }
@@ -836,6 +1361,91 @@ where
         Confidence::MEDIUM,
         Some(note(n, window.as_secs())),
     ))
+}
+
+/// Heuristic 0..1 score capturing how "load-bearing" an edge is for forensics.
+/// Combines:
+/// * repetition: ratio of edges between the same (from, to) pair
+/// * diversity: distinct counterparties on either side normalised by transfers
+/// * USD weight: log-scaled USD value when available
+/// * round-number bonus: matches structured-payment pattern
+/// `context` is a list of transfers used to compute the local stats — usually
+/// all transfers touching either endpoint.
+pub fn edge_significance(t: &domain::transfer::Transfer, context: &[domain::transfer::Transfer]) -> f64 {
+    if context.is_empty() {
+        return 0.0;
+    }
+    let pair_count = context
+        .iter()
+        .filter(|c| c.from() == t.from() && c.to() == t.to())
+        .count() as f64;
+    let repetition = (pair_count / context.len() as f64).min(1.0);
+
+    let mut counterparties: std::collections::HashSet<&domain::primitives::Address> =
+        std::collections::HashSet::new();
+    for c in context {
+        if c.from() == t.from() {
+            counterparties.insert(c.to());
+        }
+        if c.to() == t.to() {
+            counterparties.insert(c.from());
+        }
+    }
+    let diversity = 1.0 / (1.0 + counterparties.len() as f64);
+
+    let usd_weight = t
+        .usd_value()
+        .map(|v| (v.value().max(1.0).ln() / 12.0).clamp(0.0, 1.0))
+        .unwrap_or(0.3);
+
+    let amount_str = t.amount().raw().to_string();
+    let trailing_zeros = amount_str.chars().rev().take_while(|c| *c == '0').count() as f64;
+    let round_bonus = (trailing_zeros / 6.0).clamp(0.0, 1.0);
+
+    (0.30 * repetition + 0.20 * diversity + 0.35 * usd_weight + 0.15 * round_bonus).clamp(0.0, 1.0)
+}
+
+/// Pre-compute per-edge taint amounts under FIFO (default) or LIFO
+/// (`reverse=true`). Edges are ordered by timestamp; we drain `tainted` from
+/// the front (FIFO) or back (LIFO), each edge taking `min(remaining, t.amount())`.
+fn distribute_ordered(
+    arcs: &[Arc<Transfer>],
+    tainted: Amount,
+    reverse: bool,
+) -> HashMap<domain::transfer::TransferId, Amount> {
+    let decimals = tainted.decimals();
+    let zero = Amount::zero(decimals);
+    let mut map: HashMap<domain::transfer::TransferId, Amount> = HashMap::new();
+
+    let mut order: Vec<&Arc<Transfer>> = arcs
+        .iter()
+        .filter(|t| t.amount().decimals() == decimals)
+        .collect();
+    order.sort_by_key(|t| t.timestamp());
+    if reverse {
+        order.reverse();
+    }
+
+    let mut remaining = tainted;
+    for t in order {
+        if remaining.is_zero() {
+            map.insert(t.id().clone(), zero);
+            continue;
+        }
+        let take = if remaining.raw() <= t.amount().raw() {
+            remaining
+        } else {
+            t.amount()
+        };
+        map.insert(t.id().clone(), take);
+        remaining = if remaining.raw() > take.raw() {
+            Amount::new(remaining.raw() - take.raw(), decimals)
+        } else {
+            zero
+        };
+    }
+
+    map
 }
 
 /// BFS downstream from `start` over outgoing transfers, expanding only edges
@@ -855,8 +1465,7 @@ async fn bfs_downstream<R: TransferRepository + ?Sized>(
         return Ok(reached);
     }
 
-    let mut queue: std::collections::VecDeque<(Address, u32)> =
-        std::collections::VecDeque::new();
+    let mut queue: std::collections::VecDeque<(Address, u32)> = std::collections::VecDeque::new();
     queue.push_back((start.clone(), 0));
     let mut visited: HashSet<Address> = HashSet::new();
     visited.insert(start.clone());
@@ -916,12 +1525,7 @@ mod heuristics_tests {
         Address::new(ChainId::ETH, bytes)
     }
 
-    fn make_transfer(
-        from: &Address,
-        to: &Address,
-        ts_secs: i64,
-        idx: u32,
-    ) -> Transfer {
+    fn make_transfer(from: &Address, to: &Address, ts_secs: i64, idx: u32) -> Transfer {
         let chain = ChainId::ETH;
         let mut hash = [0u8; 32];
         hash[28..32].copy_from_slice(&idx.to_be_bytes());
@@ -989,14 +1593,26 @@ mod heuristics_tests {
             addr: &Address,
             _after: Option<chrono::DateTime<Utc>>,
         ) -> DomainResult<Vec<Transfer>> {
-            Ok(self.outgoing.lock().unwrap().get(addr).cloned().unwrap_or_default())
+            Ok(self
+                .outgoing
+                .lock()
+                .unwrap()
+                .get(addr)
+                .cloned()
+                .unwrap_or_default())
         }
         async fn find_incoming(
             &self,
             addr: &Address,
             _after: Option<chrono::DateTime<Utc>>,
         ) -> DomainResult<Vec<Transfer>> {
-            Ok(self.incoming.lock().unwrap().get(addr).cloned().unwrap_or_default())
+            Ok(self
+                .incoming
+                .lock()
+                .unwrap()
+                .get(addr)
+                .cloned()
+                .unwrap_or_default())
         }
         async fn min_block_height(&self, _addr: &Address) -> DomainResult<Option<u64>> {
             Ok(None)
@@ -1025,6 +1641,13 @@ mod heuristics_tests {
         async fn find_by_address(&self, _addr: &Address) -> DomainResult<Option<Entity>> {
             Ok(None)
         }
+        async fn find_by_label(
+            &self,
+            _category: &domain::entity::EntityCategory,
+            _label_name: &str,
+        ) -> DomainResult<Option<Entity>> {
+            Ok(None)
+        }
         async fn save(&self, _entity: &Entity) -> DomainResult<()> {
             Ok(())
         }
@@ -1037,7 +1660,12 @@ mod heuristics_tests {
         transfers: MockTransfers,
         heuristics: HeuristicsConfig,
     ) -> RiskService<MockTransfers, NopEntities> {
-        RiskService::new(transfers, NopEntities, RiskCacheConfig::default(), heuristics)
+        RiskService::new(
+            transfers,
+            NopEntities,
+            RiskCacheConfig::default(),
+            heuristics,
+        )
     }
 
     #[tokio::test]
@@ -1066,7 +1694,12 @@ mod heuristics_tests {
         let repo = MockTransfers::default();
         let src = addr(1);
         for i in 0..4u32 {
-            repo.push(make_transfer(&src, &addr(10 + i as u8), 1_000_000 + i as i64, i));
+            repo.push(make_transfer(
+                &src,
+                &addr(10 + i as u8),
+                1_000_000 + i as i64,
+                i,
+            ));
         }
         let svc = service(
             repo,
@@ -1085,7 +1718,12 @@ mod heuristics_tests {
         let src = addr(1);
         // 5 distinct receivers, but spaced 1 day apart against a 60s window.
         for i in 0..5u32 {
-            repo.push(make_transfer(&src, &addr(10 + i as u8), 1_000_000 + (i as i64) * 86_400, i));
+            repo.push(make_transfer(
+                &src,
+                &addr(10 + i as u8),
+                1_000_000 + (i as i64) * 86_400,
+                i,
+            ));
         }
         let svc = service(
             repo,
@@ -1103,7 +1741,12 @@ mod heuristics_tests {
         let repo = MockTransfers::default();
         let dst = addr(1);
         for i in 0..5u32 {
-            repo.push(make_transfer(&addr(20 + i as u8), &dst, 1_000_000 + i as i64, i));
+            repo.push(make_transfer(
+                &addr(20 + i as u8),
+                &dst,
+                1_000_000 + i as i64,
+                i,
+            ));
         }
         let svc = service(
             repo,
@@ -1138,9 +1781,14 @@ mod heuristics_tests {
                 fan_window: Duration::from_secs(60),
                 smurf_window: Duration::from_secs(3_600),
                 smurf_max_depth: 2,
+                ..HeuristicsConfig::default()
             },
         );
-        let ev = svc.detect_smurfing_cycle(&distributor).await.unwrap().expect("evidence");
+        let ev = svc
+            .detect_smurfing_cycle(&distributor)
+            .await
+            .unwrap()
+            .expect("evidence");
         assert!(matches!(ev.heuristic(), ClusteringHeuristic::SmurfingCycle));
         assert_eq!(ev.addresses().first(), Some(&distributor));
         assert_eq!(ev.addresses().last(), Some(&cash_out));
@@ -1165,9 +1813,15 @@ mod heuristics_tests {
                 fan_window: Duration::from_secs(60),
                 smurf_window: Duration::from_secs(3_600),
                 smurf_max_depth: 2,
+                ..HeuristicsConfig::default()
             },
         );
-        assert!(svc.detect_smurfing_cycle(&distributor).await.unwrap().is_none());
+        assert!(
+            svc.detect_smurfing_cycle(&distributor)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1191,9 +1845,251 @@ mod heuristics_tests {
                 fan_window: Duration::from_secs(60),
                 smurf_window: Duration::from_secs(3_600),
                 smurf_max_depth: 2,
+                ..HeuristicsConfig::default()
             },
         );
-        let ev = svc.detect_smurfing_cycle(&distributor).await.unwrap().expect("evidence");
+        let ev = svc
+            .detect_smurfing_cycle(&distributor)
+            .await
+            .unwrap()
+            .expect("evidence");
         assert_eq!(ev.addresses().last(), Some(&cash_out));
+    }
+
+    /// Build a synthetic transfer with explicit (asset, decimals, raw_amount)
+    /// — needed for the mixed-asset peeling regression below.
+    fn make_transfer_with_asset(
+        from: &Address,
+        to: &Address,
+        asset: AssetId,
+        raw: u64,
+        decimals: u8,
+        ts_secs: i64,
+        idx: u32,
+    ) -> Transfer {
+        let chain = ChainId::ETH;
+        let mut hash = [0u8; 32];
+        hash[28..32].copy_from_slice(&idx.to_be_bytes());
+        Transfer::new(
+            TransferId::new(chain, hash, idx),
+            chain,
+            TxRef::new(chain, hash),
+            from.clone(),
+            to.clone(),
+            asset,
+            Amount::new(U256::from(raw), decimals),
+            BlockRef::new(chain, 100 + idx as u64, [0u8; 32]),
+            Utc.timestamp_opt(ts_secs, 0).unwrap(),
+            TransferKind::Native,
+            Finality::Confirmed,
+        )
+    }
+
+    /// Regression: before the fix, `detect_peeling_chain` summed amounts
+    /// with `+` across heterogeneous assets — panics under
+    /// `decimals mismatch left: 18 right: 6` whenever an address touched
+    /// both ETH and USDC. The fix groups by asset and computes peeling per
+    /// asset; this test passes mixed flows and asserts no panic.
+    #[tokio::test]
+    async fn peeling_chain_mixed_assets_does_not_panic() {
+        let chain = ChainId::ETH;
+        let usdc_addr = vec![0xa0u8; 20];
+        let usdc = AssetId::contract(chain, usdc_addr);
+        let eth = AssetId::native(chain);
+
+        let middle = addr(1);
+        let src = addr(2);
+        let dst = addr(3);
+
+        let repo = MockTransfers::default();
+        // Native ETH inflow + outflow with different decimals (18).
+        repo.push(make_transfer_with_asset(
+            &src, &middle, eth.clone(), 1_000_000_000_000_000_000, 18, 1, 1,
+        ));
+        repo.push(make_transfer_with_asset(
+            &middle, &dst, eth.clone(), 990_000_000_000_000_000, 18, 2, 2,
+        ));
+        // USDC inflow + outflow with decimals=6 in the SAME flow.
+        repo.push(make_transfer_with_asset(
+            &src,
+            &middle,
+            usdc.clone(),
+            1_000_000_000,
+            6,
+            3,
+            3,
+        ));
+        repo.push(make_transfer_with_asset(
+            &middle,
+            &dst,
+            usdc.clone(),
+            500_000_000,
+            6,
+            4,
+            4,
+        ));
+
+        let svc = service(repo, HeuristicsConfig::default());
+        // Before the fix this panicked at Amount::checked_add.
+        let result = svc.detect_peeling_chain(&middle).await.unwrap();
+        // ETH peels (≈ 1% retained) → evidence; USDC keeps 50% → ignored.
+        let ev = result.expect("ETH leg should fire peeling");
+        assert!(matches!(ev.heuristic(), ClusteringHeuristic::PeelingChain));
+    }
+
+    /// When ONLY a non-peeling asset is present (e.g. USDC: 50% retained),
+    /// the detector must stay silent.
+    #[tokio::test]
+    async fn peeling_chain_silent_when_no_asset_peels() {
+        let chain = ChainId::ETH;
+        let usdc = AssetId::contract(chain, vec![0xa0u8; 20]);
+        let middle = addr(1);
+        let src = addr(2);
+        let dst = addr(3);
+
+        let repo = MockTransfers::default();
+        repo.push(make_transfer_with_asset(
+            &src, &middle, usdc.clone(), 1_000_000_000, 6, 1, 1,
+        ));
+        repo.push(make_transfer_with_asset(
+            &middle, &dst, usdc.clone(), 500_000_000, 6, 2, 2,
+        ));
+
+        let svc = service(repo, HeuristicsConfig::default());
+        assert!(svc.detect_peeling_chain(&middle).await.unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod score_config_tests {
+    use super::*;
+    use domain::chain::ChainId;
+    use domain::primitives::Address;
+    use domain::risk::{RiskEvidence, RiskSignal, RiskSignalKind};
+
+    fn addr(seed: u8) -> Address {
+        Address::new(ChainId::ETH, vec![seed; 20])
+    }
+
+    fn sig(severity: u8, sink_addr: Address) -> RiskSignal {
+        use domain::trace::{Sink, SinkKind};
+        // Sink::new derives risk_score from kind; for these tests only the
+        // RiskSignal's severity drives aggregation, the sink is just a
+        // distinguishable evidence-target for dedup.
+        let sink = Sink::new(
+            sink_addr,
+            SinkKind::Mixer,
+            domain::primitives::Amount::new(domain::primitives::U256::zero(), 18),
+            domain::primitives::Ratio::ONE,
+        );
+        RiskSignal::new(
+            RiskSignalKind::DirectExposure,
+            RiskScore::new(severity),
+            "test".into(),
+            RiskEvidence::SinkExposure(vec![sink]),
+        )
+    }
+
+    #[test]
+    fn aggregate_empty_is_clean() {
+        let cfg = ScoreConfig::default();
+        assert_eq!(cfg.aggregate(&[]).value(), 0);
+    }
+
+    #[test]
+    fn max_strategy_returns_max_severity() {
+        let cfg = ScoreConfig {
+            aggregation: ScoreAggregation::Max,
+            ..ScoreConfig::default()
+        };
+        let signals = vec![
+            sig(40, addr(1)),
+            sig(75, addr(2)),
+            sig(60, addr(3)),
+        ];
+        assert_eq!(cfg.aggregate(&signals).value(), 75);
+    }
+
+    #[test]
+    fn weighted_count_stacks_extra_signals() {
+        // max=75 + 0.5 * 60 + 0.5 * 40 = 75 + 30 + 20 = 125 → clamp to 100.
+        let cfg = ScoreConfig {
+            aggregation: ScoreAggregation::WeightedCount,
+            count_bonus_weight: 0.5,
+            ..ScoreConfig::default()
+        };
+        let signals = vec![
+            sig(75, addr(1)),
+            sig(60, addr(2)),
+            sig(40, addr(3)),
+        ];
+        assert_eq!(cfg.aggregate(&signals).value(), 100);
+    }
+
+    #[test]
+    fn weighted_count_below_cap_keeps_actual_value() {
+        // max=50 + 0.2 * 40 + 0.2 * 30 = 50 + 8 + 6 = 64.
+        let cfg = ScoreConfig {
+            aggregation: ScoreAggregation::WeightedCount,
+            count_bonus_weight: 0.2,
+            max_score_cap: 100,
+            ..ScoreConfig::default()
+        };
+        let signals = vec![
+            sig(50, addr(1)),
+            sig(40, addr(2)),
+            sig(30, addr(3)),
+        ];
+        assert_eq!(cfg.aggregate(&signals).value(), 64);
+    }
+
+    #[test]
+    fn dedup_collapses_repeated_sink_address() {
+        // Same sink address appearing 3× should count as ONE signal.
+        // Otherwise weighted_count would boost score by phantom evidence.
+        let cfg = ScoreConfig {
+            aggregation: ScoreAggregation::WeightedCount,
+            count_bonus_weight: 0.5,
+            ..ScoreConfig::default()
+        };
+        let same = addr(42);
+        let signals = vec![
+            sig(75, same.clone()),
+            sig(75, same.clone()),
+            sig(75, same.clone()),
+        ];
+        // All dedupe to one signal → no count bonus → score = max = 75.
+        assert_eq!(cfg.aggregate(&signals).value(), 75);
+        assert_eq!(cfg.unique_count(&signals), 1);
+    }
+
+    #[test]
+    fn dedup_preserves_distinct_sinks() {
+        // Same severity, different sink addresses → 3 unique signals,
+        // weighted_count stacks the extras as expected.
+        let cfg = ScoreConfig {
+            aggregation: ScoreAggregation::WeightedCount,
+            count_bonus_weight: 0.1,
+            ..ScoreConfig::default()
+        };
+        let signals = vec![
+            sig(75, addr(1)),
+            sig(75, addr(2)),
+            sig(75, addr(3)),
+        ];
+        // 75 + 0.1*75 + 0.1*75 = 75 + 7.5 + 7.5 = 90.
+        assert_eq!(cfg.aggregate(&signals).value(), 90);
+        assert_eq!(cfg.unique_count(&signals), 3);
+    }
+
+    #[test]
+    fn max_cap_clamps() {
+        let cfg = ScoreConfig {
+            aggregation: ScoreAggregation::Max,
+            max_score_cap: 50,
+            ..ScoreConfig::default()
+        };
+        let signals = vec![sig(100, addr(1))];
+        assert_eq!(cfg.aggregate(&signals).value(), 50);
     }
 }

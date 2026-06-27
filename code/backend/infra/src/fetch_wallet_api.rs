@@ -12,6 +12,14 @@ use domain::{
 };
 use moka::future::Cache;
 
+use crate::key_pool::KeyPool;
+use crate::rate_limiter::RateLimiter;
+
+const DEFAULT_MORALIS_REQUESTS_PER_SECOND: f64 = 20.0;
+const DEFAULT_MORALIS_REQUESTS_PER_SECOND_BURST: f64 = 20.0;
+const DEFAULT_MORALIS_HTTP_MAX_ATTEMPTS: u8 = 6;
+const DEFAULT_MORALIS_KEY_COOLDOWN_SECS: u64 = 5;
+
 pub mod side_api {
     pub mod moralis {
         pub mod dto;
@@ -97,9 +105,60 @@ impl Default for CacheConfig {
     }
 }
 
+/// Full configuration for `MoralisEthSource`: API keys, base URL, caches,
+/// and the same throttling/retry knobs we standardised on for Etherscan
+/// and Alchemy. Use the builder pattern (`MoralisEthConfig::new(...)`) so
+/// missing values fall back to documented defaults.
+#[derive(Debug, Clone)]
+pub struct MoralisEthConfig {
+    api_keys: Vec<String>,
+    base_url: String,
+    cache: CacheConfig,
+    requests_per_second: f64,
+    requests_per_second_burst: f64,
+    http_max_attempts: u8,
+    key_cooldown: Duration,
+}
+
+impl MoralisEthConfig {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        api_keys: Vec<String>,
+        base_url: impl Into<String>,
+        cache: CacheConfig,
+        requests_per_second: Option<f64>,
+        requests_per_second_burst: Option<f64>,
+        http_max_attempts: Option<u8>,
+        key_cooldown: Option<Duration>,
+    ) -> Self {
+        let api_keys: Vec<String> = api_keys
+            .into_iter()
+            .filter(|k| !k.trim().is_empty())
+            .collect();
+        Self {
+            api_keys,
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            cache,
+            requests_per_second: requests_per_second
+                .unwrap_or(DEFAULT_MORALIS_REQUESTS_PER_SECOND),
+            requests_per_second_burst: requests_per_second_burst
+                .unwrap_or(DEFAULT_MORALIS_REQUESTS_PER_SECOND_BURST),
+            http_max_attempts: http_max_attempts
+                .unwrap_or(DEFAULT_MORALIS_HTTP_MAX_ATTEMPTS)
+                .max(1),
+            key_cooldown: key_cooldown
+                .unwrap_or_else(|| Duration::from_secs(DEFAULT_MORALIS_KEY_COOLDOWN_SECS)),
+        }
+    }
+
+    pub fn has_keys(&self) -> bool {
+        !self.api_keys.is_empty()
+    }
+}
+
 #[derive(Clone)]
 pub struct MoralisEthSource {
-    api_key: String,
+    key_pool: KeyPool,
     base_url: String,
     client: reqwest::Client,
     cold_page_cache: Cache<PageKey, PageValue>,
@@ -109,48 +168,71 @@ pub struct MoralisEthSource {
     latest_block_cache: Cache<(), u64>,
     file_cache_dir: Option<PathBuf>,
     hot_cache: Arc<HashMap<PathBuf, PageValue>>,
+    rate_limiter: Arc<RateLimiter>,
+    http_max_attempts: u8,
 }
 
 impl MoralisEthSource {
-    pub async fn new(
-        api_key: impl Into<String>,
-        base_url: impl Into<String>,
-        client: reqwest::Client,
-        cache: CacheConfig,
-    ) -> Self {
+    /// Construct from the structured `MoralisEthConfig`. Caller is
+    /// responsible for ensuring at least one API key — we panic otherwise
+    /// (config validation in main.rs surfaces a clear error before this).
+    pub async fn new(client: reqwest::Client, cfg: MoralisEthConfig) -> Self {
+        assert!(
+            cfg.has_keys(),
+            "MoralisEthSource: at least one api key required — config validation must guard this"
+        );
+        let key_pool = KeyPool::new(cfg.api_keys.clone(), cfg.key_cooldown);
+
         let cold_page_cache = Cache::builder()
-            .max_capacity(cache.page_cache_max_capacity)
+            .max_capacity(cfg.cache.page_cache_max_capacity)
             .weigher(|_k: &PageKey, v: &PageValue| v.0.len().max(1) as u32)
-            .time_to_live(cache.cold_ttl)
+            .time_to_live(cfg.cache.cold_ttl)
             .build();
 
         let hot_page_cache = Cache::builder()
-            .max_capacity(cache.page_cache_max_capacity)
+            .max_capacity(cfg.cache.page_cache_max_capacity)
             .weigher(|_k: &PageKey, v: &PageValue| v.0.len().max(1) as u32)
-            .time_to_live(cache.hot_ttl)
+            .time_to_live(cfg.cache.hot_ttl)
             .build();
 
         let latest_block_cache = Cache::builder()
             .max_capacity(1)
-            .time_to_live(cache.latest_block_cache_ttl)
+            .time_to_live(cfg.cache.latest_block_cache_ttl)
             .build();
 
-        let hot_cache = match &cache.file_cache_dir {
+        let hot_cache = match &cfg.cache.file_cache_dir {
             Some(dir) => Arc::new(Self::load_hot_cache(dir).await),
             None => Arc::new(HashMap::new()),
         };
 
+        let rate_limiter = Arc::new(RateLimiter::new(
+            cfg.requests_per_second,
+            cfg.requests_per_second_burst,
+        ));
+
+        tracing::info!(
+            base_url = %cfg.base_url,
+            api_keys = key_pool.len(),
+            key_cooldown_secs = cfg.key_cooldown.as_secs(),
+            requests_per_second = cfg.requests_per_second,
+            requests_per_second_burst = cfg.requests_per_second_burst,
+            http_max_attempts = cfg.http_max_attempts,
+            "Moralis ETH source initialized"
+        );
+
         Self {
-            api_key: api_key.into(),
-            base_url: base_url.into().trim_end_matches('/').to_string(),
+            key_pool,
+            base_url: cfg.base_url,
             client,
             cold_page_cache,
             hot_page_cache,
-            cache_hot_tail: cache.cache_hot_tail,
-            confirmation_depth: cache.confirmation_depth,
+            cache_hot_tail: cfg.cache.cache_hot_tail,
+            confirmation_depth: cfg.cache.confirmation_depth,
             latest_block_cache,
-            file_cache_dir: cache.file_cache_dir,
+            file_cache_dir: cfg.cache.file_cache_dir,
             hot_cache,
+            rate_limiter,
+            http_max_attempts: cfg.http_max_attempts,
         }
     }
 
@@ -262,25 +344,53 @@ impl MoralisEthSource {
         map
     }
 
-    fn get_req(&self, url: &str) -> reqwest::RequestBuilder {
-        self.client.get(url).header("X-API-Key", &self.api_key)
+    fn get_req(&self, url: &str, api_key: &str) -> reqwest::RequestBuilder {
+        self.client.get(url).header("X-API-Key", api_key)
     }
 
+    /// Resilient GET: proactive throttling via token bucket + reactive
+    /// per-key cooldown with REAL retries (waits for the soonest cooled
+    /// key to lapse instead of bailing on first 429). On exhaustion
+    /// returns `RateLimited` so a router upstream can fail over to a
+    /// sibling source instead of swallowing into "fall back to DB".
     async fn http_get_text(&self, url: &str) -> DomainResult<String> {
-        const MAX_ATTEMPTS: u8 = 3;
         let mut last_err = String::new();
+        let mut last_was_rate_limit = false;
+        for attempt in 0..self.http_max_attempts {
+            // Layer 1: token bucket (req/s — Moralis bills per request).
+            self.rate_limiter.acquire(1.0).await;
 
-        for attempt in 0..MAX_ATTEMPTS {
-            if attempt > 0 {
-                tokio::time::sleep(std::time::Duration::from_secs(u64::from(attempt) * 2)).await;
+            // Layer 2: live key or wait until soonest cooldown lapses.
+            let api_key = match self.key_pool.pick_or_wait() {
+                Ok(k) => k,
+                Err(wait) => {
+                    tracing::warn!(
+                        attempt,
+                        wait_ms = wait.as_millis() as u64,
+                        "moralis: all keys cooled, waiting before retry"
+                    );
+                    tokio::time::sleep(wait).await;
+                    last_err = "all keys cooled".to_string();
+                    continue;
+                }
+            };
+
+            if attempt > 0 && last_was_rate_limit {
+                // Mild exponential backoff on top of token-bucket throttle,
+                // bounded by attempt count. Doesn't run on network errors —
+                // those usually need to be retried promptly.
+                let backoff =
+                    std::time::Duration::from_secs(u64::from(attempt).min(8));
+                tokio::time::sleep(backoff).await;
             }
+            last_was_rate_limit = false;
 
             tracing::debug!(url, attempt, "moralis GET");
 
-            let resp = match self.get_req(url).send().await {
+            let resp = match self.get_req(url, &api_key).send().await {
                 Ok(r) => r,
                 Err(e) => {
-                    tracing::warn!(url, attempt, error = %e, "request failed, retrying");
+                    tracing::warn!(url, attempt, error = %e, "moralis request failed, retrying");
                     last_err = e.to_string();
                     continue;
                 }
@@ -289,14 +399,17 @@ impl MoralisEthSource {
             let status = resp.status();
 
             if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                tracing::warn!(url, "moralis rate limited");
-                return Err(DomainError::InsufficientData("rate limited".into()));
+                tracing::warn!(url, attempt, "moralis HTTP 429, cooling key and retrying");
+                self.key_pool.cool(&api_key);
+                last_err = format!("http {status}");
+                last_was_rate_limit = true;
+                continue;
             }
 
             let bytes = match resp.bytes().await {
                 Ok(b) => b,
                 Err(e) => {
-                    tracing::warn!(url, attempt, error = %e, "failed to read body, retrying");
+                    tracing::warn!(url, attempt, error = %e, "moralis failed to read body, retrying");
                     last_err = e.to_string();
                     continue;
                 }
@@ -306,7 +419,7 @@ impl MoralisEthSource {
 
             if !status.is_success() {
                 return Err(DomainError::InsufficientData(format!(
-                    "http {status}: {body}"
+                    "moralis http {status}: {body}"
                 )));
             }
 
@@ -315,7 +428,7 @@ impl MoralisEthSource {
                     url,
                     bytes = bytes.len(),
                     status = status.as_u16(),
-                    "response ok"
+                    "moralis response ok"
                 );
                 return Ok(body);
             }
@@ -325,13 +438,24 @@ impl MoralisEthSource {
                 url,
                 attempt,
                 bytes = bytes.len(),
-                "truncated response, retrying"
+                "moralis truncated response, retrying"
             );
         }
 
-        Err(DomainError::InsufficientData(format!(
-            "after {MAX_ATTEMPTS} attempts: {last_err}"
-        )))
+        // Distinguish rate-limit exhaustion (router failover trigger) from
+        // generic failure (just an error). Prior code conflated these as
+        // InsufficientData, which made the router swallow them silently.
+        if last_was_rate_limit || last_err.starts_with("http 429") || last_err == "all keys cooled" {
+            Err(DomainError::RateLimited(format!(
+                "moralis: after {} attempts: {last_err}",
+                self.http_max_attempts
+            )))
+        } else {
+            Err(DomainError::InsufficientData(format!(
+                "moralis: after {} attempts: {last_err}",
+                self.http_max_attempts
+            )))
+        }
     }
 
     fn file_path(

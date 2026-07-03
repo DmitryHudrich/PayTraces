@@ -36,7 +36,7 @@ export const TransactionGraphFlowForm = ({
 
   return (
     <div className='rounded-xl border border-border bg-card p-4'>
-      <div className='grid gap-3 md:grid-cols-2'>
+      <div className='grid gap-3'>
         <label className='flex flex-col gap-1 text-sm'>
           Wallet address (required)
           <input
@@ -83,11 +83,11 @@ export const TransactionGraphFlowForm = ({
 
       <div className='mt-4 flex flex-wrap items-center gap-3'>
         <Button type='button' onClick={onIngest} disabled={isIngesting || isDrawing}>
-          {isIngesting ? 'Стягиваем...' : 'Стянуть данные'}
+          {isIngesting ? 'Fetching...' : 'Fetch data'}
         </Button>
 
         <Button type='button' variant='secondary' onClick={onDrawGraph} disabled={isIngesting || isDrawing}>
-          {isDrawing ? 'Рисуем...' : 'Отрисовать граф'}
+          {isDrawing ? 'Drawing...' : 'Draw graph'}
         </Button>
 
         {ingestJobId ? <span className='text-xs text-muted-foreground'>job_id: {ingestJobId}</span> : null}

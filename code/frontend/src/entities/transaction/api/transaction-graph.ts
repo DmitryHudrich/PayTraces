@@ -1,4 +1,9 @@
 import { apiRequest } from '@/shared/api'
+import {
+  parseIngestJobResponse,
+  parseJobStatusResponse,
+  parseTransactionGraphPage,
+} from '@/entities/transaction/model/schemas'
 import type { TransactionGraphPage } from '@/entities/transaction/model/transaction'
 
 export type IngestWalletPayload = {
@@ -8,12 +13,15 @@ export type IngestWalletPayload = {
   max_nodes?: number
 }
 
-type IngestJobResponse = {
-  job_id: string
+export type FetchGraphPayload = {
+  address: string
+  from_block: number
+  max_depth?: number
+  max_nodes?: number
 }
 
 export async function ingestWallet(payload: IngestWalletPayload) {
-  return apiRequest<IngestJobResponse>('/jobs/ingest', {
+  const response = await apiRequest<unknown>('/jobs/ingest', {
     method: 'POST',
     body: JSON.stringify({
       address: payload.address,
@@ -23,16 +31,16 @@ export async function ingestWallet(payload: IngestWalletPayload) {
       chain_id: 1,
     }),
   })
+
+  return parseIngestJobResponse(response)
 }
 
-export type FetchGraphPayload = {
-  address: string
-  from_block: number
-  max_depth?: number
-  max_nodes?: number
+export async function fetchJobStatus(jobId: string) {
+  const response = await apiRequest<unknown>(`/jobs/${jobId}`)
+  return parseJobStatusResponse(response)
 }
 
-export async function fetchTransactionGraph(payload: FetchGraphPayload) {
+export async function fetchTransactionGraph(payload: FetchGraphPayload): Promise<TransactionGraphPage> {
   const params = new URLSearchParams({
     address: payload.address,
     chain_id: '1',
@@ -43,5 +51,6 @@ export async function fetchTransactionGraph(payload: FetchGraphPayload) {
     page_size: '500',
   })
 
-  return apiRequest<TransactionGraphPage>(`/graph?${params.toString()}`)
+  const response = await apiRequest<unknown>(`/graph?${params.toString()}`)
+  return parseTransactionGraphPage(response)
 }

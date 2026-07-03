@@ -1,25 +1,37 @@
-import { motion } from 'framer-motion'
-import { useMemo, useState } from 'react'
+import { lazy, Suspense, useMemo, useState } from 'react'
 
 import {
-  fetchTransactionGraph,
-  ingestWallet,
+  emptyTransactionGraphPage,
+  filterGraphData,
+  getTransactionNodeDetails,
   mockTransactionGraphPage,
   transactionGraphPageToGraphData,
+  useFetchTransactionGraphMutation,
+  useIngestJobStatusQuery,
+  useIngestWalletMutation,
+  type TransactionGraphPage as TransactionGraphPageData,
 } from '@/entities/transaction'
 import { TransactionGraphControls } from '@/features/transaction-graph-controls'
 import { TransactionGraphFlowForm } from '@/features/transaction-graph-flow'
-import { type GraphData, type GraphLayoutMode } from '@/shared/graph'
-import { TransactionGraphWidget } from '@/widgets/transaction-graph'
+import { TransactionGraphSourceToggle, type GraphSourceMode } from '@/features/transaction-graph-source'
+import { TransactionNodeDetailsDrawer } from '@/features/transaction-node-details'
+import { getErrorMessage } from '@/shared/api'
+import { type GraphLayoutMode } from '@/shared/graph'
+import { useDebouncedValue } from '@/shared/lib/use-debounced-value'
 
-const mockPage = mockTransactionGraphPage
+const TransactionGraphWidget = lazy(async () => {
+  const module = await import('@/widgets/transaction-graph')
+  return { default: module.TransactionGraphWidget }
+})
 
 export const TransactionGraphPage = () => {
   const [layout, setLayout] = useState<GraphLayoutMode>('force')
   const [selectedNodeId, setSelectedNodeId] = useState('')
   const [query, setQuery] = useState('')
-  const [graphPage, setGraphPage] = useState(mockPage)
-  const [sourceMode, setSourceMode] = useState<'mock' | 'backend'>('mock')
+  const [sourceMode, setSourceMode] = useState<GraphSourceMode>('mock')
+  const [backendGraph, setBackendGraph] = useState<TransactionGraphPageData | null>(null)
+  const [ingestJobId, setIngestJobId] = useState<string | null>(null)
+  const [statusMessage, setStatusMessage] = useState<string | null>('Showing mock graph data.')
 
   const [form, setForm] = useState({
     address: '',
@@ -28,46 +40,36 @@ export const TransactionGraphPage = () => {
     maxNodes: '500',
   })
 
-  const [isIngesting, setIsIngesting] = useState(false)
-  const [isDrawing, setIsDrawing] = useState(false)
-  const [ingestJobId, setIngestJobId] = useState<string | null>(null)
-  const [statusMessage, setStatusMessage] = useState<string | null>(
-    'Сейчас отображаются моковые данные. Заполни форму и стяни данные с backend.',
-  )
-  const [errorMessage, setErrorMessage] = useState<string | null>(null)
+  const debouncedQuery = useDebouncedValue(query, 200)
+  const ingestMutation = useIngestWalletMutation()
+  const drawGraphMutation = useFetchTransactionGraphMutation()
+  const jobStatusQuery = useIngestJobStatusQuery(ingestJobId)
+
+  const graphPage =
+    sourceMode === 'mock' ? mockTransactionGraphPage : (backendGraph ?? emptyTransactionGraphPage)
+  const hasBackendData = backendGraph !== null
+  const showBackendEmptyState = sourceMode === 'backend' && !hasBackendData
 
   const baseGraph = useMemo(() => transactionGraphPageToGraphData(graphPage), [graphPage])
 
-  const filteredGraph = useMemo(() => {
-    const normalized = query.trim().toLowerCase()
-    if (!normalized) {
-      return baseGraph
+  const filteredGraph = useMemo(
+    () => filterGraphData(baseGraph, graphPage, debouncedQuery),
+    [baseGraph, debouncedQuery, graphPage],
+  )
+
+  const visibleNodeIds = useMemo(() => {
+    if (!debouncedQuery.trim()) {
+      return null
     }
+    return new Set(filteredGraph.nodes.map((node) => node.id))
+  }, [debouncedQuery, filteredGraph.nodes])
 
-    const visibleNodeIds = new Set(
-      baseGraph.nodes
-        .filter((node) => node.id.toLowerCase().includes(normalized) || node.label.toLowerCase().includes(normalized))
-        .map((node) => node.id),
-    )
-
-    const matchingEdges = graphPage.edges.filter((edge) => {
-      const edgeText = `${edge.formatted} ${edge.symbol} ${edge.tx_hash}`.toLowerCase()
-      return edgeText.includes(normalized) || visibleNodeIds.has(edge.from) || visibleNodeIds.has(edge.to)
-    })
-
-    matchingEdges.forEach((edge) => {
-      visibleNodeIds.add(edge.from)
-      visibleNodeIds.add(edge.to)
-    })
-
-    const nodes = baseGraph.nodes.filter((node) => visibleNodeIds.has(node.id))
-    const edgeIds = new Set(
-      matchingEdges.map((edge, idx) => `${edge.tx_hash}-${edge.index}-${idx}`),
-    )
-    const edges = baseGraph.edges.filter((edge) => edgeIds.has(edge.id))
-
-    return { nodes, edges } satisfies GraphData
-  }, [baseGraph, graphPage.edges, query])
+  const visibleEdgeIds = useMemo(() => {
+    if (!debouncedQuery.trim()) {
+      return null
+    }
+    return new Set(filteredGraph.edges.map((edge) => edge.id))
+  }, [debouncedQuery, filteredGraph.edges])
 
   const selectedNodeLabel = useMemo(() => {
     if (!selectedNodeId) {
@@ -76,6 +78,14 @@ export const TransactionGraphPage = () => {
 
     return baseGraph.nodes.find((node) => node.id === selectedNodeId)?.label ?? selectedNodeId
   }, [baseGraph.nodes, selectedNodeId])
+
+  const selectedNodeDetails = useMemo(() => {
+    if (!selectedNodeId) {
+      return null
+    }
+
+    return getTransactionNodeDetails(graphPage, baseGraph, selectedNodeId)
+  }, [baseGraph, graphPage, selectedNodeId])
 
   const parsePositiveInt = (value: string) => {
     const trimmed = value.trim()
@@ -94,95 +104,143 @@ export const TransactionGraphPage = () => {
     const fromBlock = parsePositiveInt(form.fromBlock)
 
     if (!address) {
-      throw new Error('Поле address обязательно.')
+      throw new Error('Field address is required.')
     }
     if (fromBlock === null) {
-      throw new Error('Поле from_block обязательно и должно быть целым числом >= 0.')
+      throw new Error('Field from_block is required and must be a non-negative integer.')
     }
 
     return { address, fromBlock }
   }
 
+  const buildRequestPayload = () => {
+    const { address, fromBlock } = validateRequiredFields()
+    const maxDepth = parsePositiveInt(form.maxDepth)
+    const maxNodes = parsePositiveInt(form.maxNodes)
+
+    return {
+      address,
+      from_block: fromBlock,
+      max_depth: maxDepth ?? 3,
+      max_nodes: maxNodes ?? 500,
+    }
+  }
+
+  const onSourceModeChange = (mode: GraphSourceMode) => {
+    setSourceMode(mode)
+    setSelectedNodeId('')
+
+    if (mode === 'mock') {
+      setStatusMessage('Showing mock graph data.')
+      return
+    }
+
+    if (!backendGraph) {
+      setStatusMessage(null)
+      return
+    }
+
+    setStatusMessage(`Graph loaded: ${backendGraph.total_nodes} nodes, ${backendGraph.total_edges} edges.`)
+  }
+
   const onIngest = async () => {
-    setErrorMessage(null)
     try {
-      const { address, fromBlock } = validateRequiredFields()
-      const maxDepth = parsePositiveInt(form.maxDepth)
-      const maxNodes = parsePositiveInt(form.maxNodes)
-
-      setIsIngesting(true)
-      setStatusMessage('Запускаем ingest job...')
-
-      const result = await ingestWallet({
-        address,
-        from_block: fromBlock,
-        max_depth: maxDepth ?? 3,
-        max_nodes: maxNodes ?? 500,
-      })
-
+      const payload = buildRequestPayload()
+      const result = await ingestMutation.mutateAsync(payload)
       setIngestJobId(result.job_id)
-      setStatusMessage(`Ingest job accepted: ${result.job_id}. Теперь нажми "Отрисовать граф".`)
+      setStatusMessage(`Ingest job accepted: ${result.job_id}. Waiting for completion...`)
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : 'Не удалось запустить ingest.')
-    } finally {
-      setIsIngesting(false)
+      setStatusMessage(null)
     }
   }
 
   const onDrawGraph = async () => {
-    setErrorMessage(null)
     try {
-      const { address, fromBlock } = validateRequiredFields()
-      const maxDepth = parsePositiveInt(form.maxDepth)
-      const maxNodes = parsePositiveInt(form.maxNodes)
-
-      setIsDrawing(true)
-      setStatusMessage('Загружаем граф из backend...')
-
-      const page = await fetchTransactionGraph({
-        address,
-        from_block: fromBlock,
-        max_depth: maxDepth ?? 3,
-        max_nodes: maxNodes ?? 500,
-      })
-
-      setGraphPage(page)
+      const payload = buildRequestPayload()
+      const page = await drawGraphMutation.mutateAsync(payload)
+      setBackendGraph(page)
       setSourceMode('backend')
       setSelectedNodeId('')
-      setStatusMessage(`Граф загружен: ${page.total_nodes} nodes, ${page.total_edges} edges.`)
+      setStatusMessage(`Graph loaded: ${page.total_nodes} nodes, ${page.total_edges} edges.`)
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : 'Не удалось загрузить граф.')
-    } finally {
-      setIsDrawing(false)
+      setStatusMessage(null)
     }
   }
 
-  return (
-    <main className='min-h-screen bg-background text-foreground'>
-      <section className='mx-auto flex w-full max-w-7xl flex-col gap-6 px-6 py-10'>
-        <motion.h1
-          className='text-4xl font-semibold tracking-tight'
-          initial={{ opacity: 0, y: 20 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.35 }}
-        >
-          Transaction Graph
-        </motion.h1>
+  const jobStatus = jobStatusQuery.data?.status.toLowerCase()
+  const jobStatusMessage = useMemo(() => {
+    if (!ingestJobId || !jobStatusQuery.data) {
+      return null
+    }
 
-        <p className='text-muted-foreground'>
-          Flow: ingest by wallet {'->'} fetch /graph {'->'} render Sigma graph. Current source: {sourceMode}.
-        </p>
+    if (jobStatus === 'done') {
+      return `Ingest job ${ingestJobId} completed. Click "Draw graph" to render.`
+    }
+
+    if (jobStatus === 'failed') {
+      return jobStatusQuery.data.error ?? `Ingest job ${ingestJobId} failed.`
+    }
+
+    return `Ingest job ${ingestJobId}: ${jobStatusQuery.data.status}`
+  }, [ingestJobId, jobStatus, jobStatusQuery.data])
+
+  const resolvedStatusMessage = jobStatusMessage ?? statusMessage
+  const resolvedErrorMessage =
+    drawGraphMutation.error || ingestMutation.error
+      ? getErrorMessage(drawGraphMutation.error ?? ingestMutation.error, 'Request failed.')
+      : null
+
+  return (
+    <main className='flex h-screen w-full flex-col overflow-hidden bg-background text-foreground lg:flex-row'>
+      <section className='relative min-h-0 w-full flex-1 p-3 lg:h-full lg:w-4/5'>
+        <Suspense
+          fallback={
+            <div className='flex h-full min-h-90 items-center justify-center rounded-xl border border-border bg-card/40 text-sm text-muted-foreground'>
+              Loading graph...
+            </div>
+          }
+        >
+          <TransactionGraphWidget
+            graph={baseGraph}
+            layout={layout}
+            selectedNodeId={selectedNodeId}
+            visibleNodeIds={visibleNodeIds}
+            visibleEdgeIds={visibleEdgeIds}
+            onSelectNode={setSelectedNodeId}
+          />
+        </Suspense>
+
+        {showBackendEmptyState ? (
+          <div className='pointer-events-none absolute inset-3 flex items-center justify-center rounded-xl border border-dashed border-border bg-background/80 backdrop-blur-sm'>
+            <div className='max-w-sm px-6 text-center'>
+              <p className='text-sm font-medium'>No backend data loaded</p>
+              <p className='mt-2 text-xs text-muted-foreground'>
+                Fill in the form on the right and use Fetch data, then Draw graph to load transactions from the
+                backend.
+              </p>
+            </div>
+          </div>
+        ) : null}
+      </section>
+
+      <aside className='flex h-full w-full flex-col gap-4 overflow-y-auto border-t border-border bg-card/40 p-4 lg:w-1/5 lg:min-w-[320px] lg:border-l lg:border-t-0'>
+        <div className='flex flex-col gap-1'>
+          <h1 className='text-2xl font-semibold tracking-tight'>PayTraces</h1>
+          <p className='text-xs text-muted-foreground'>Transaction graph explorer</p>
+        </div>
+
+        <TransactionGraphSourceToggle value={sourceMode} onChange={onSourceModeChange} />
 
         <TransactionGraphFlowForm
           value={form}
           onChange={setForm}
           onIngest={onIngest}
           onDrawGraph={onDrawGraph}
-          isIngesting={isIngesting}
-          isDrawing={isDrawing}
+          isIngesting={ingestMutation.isPending}
+          isDrawing={drawGraphMutation.isPending}
           ingestJobId={ingestJobId}
-          statusMessage={statusMessage}
-          errorMessage={errorMessage}
+          statusMessage={resolvedStatusMessage}
+          errorMessage={resolvedErrorMessage}
         />
 
         <TransactionGraphControls
@@ -194,14 +252,17 @@ export const TransactionGraphPage = () => {
           edgeCount={filteredGraph.edges.length}
           selectedNodeLabel={selectedNodeLabel}
         />
+      </aside>
 
-        <TransactionGraphWidget
-          graph={filteredGraph}
-          layout={layout}
-          selectedNodeId={selectedNodeId}
-          onSelectNode={setSelectedNodeId}
-        />
-      </section>
+      <TransactionNodeDetailsDrawer
+        open={Boolean(selectedNodeId)}
+        onOpenChange={(open) => {
+          if (!open) {
+            setSelectedNodeId('')
+          }
+        }}
+        details={selectedNodeDetails}
+      />
     </main>
   )
 }

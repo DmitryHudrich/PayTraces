@@ -24,5 +24,7 @@ export type GraphAdapterProps = {
   graph: GraphData
   layout: GraphLayoutMode
   selectedNodeId?: string
+  visibleNodeIds?: ReadonlySet<string> | null
+  visibleEdgeIds?: ReadonlySet<string> | null
   onNodeSelect?: (nodeId: string) => void
 }

@@ -21,15 +21,15 @@ export const TransactionGraphControls = ({
   selectedNodeLabel,
 }: TransactionGraphControlsProps) => {
   return (
-    <div className='grid gap-3 rounded-xl border border-border bg-card p-4 md:grid-cols-[1fr_auto_auto] md:items-center'>
+    <div className='flex flex-col gap-3 rounded-xl border border-border bg-card p-4'>
       <input
         value={query}
         onChange={(event) => onQueryChange(event.target.value)}
         placeholder='Filter by address, amount or symbol (USDT / ETH)'
-        className='h-10 rounded-md border border-input bg-background px-3 text-sm outline-none ring-offset-background placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring'
+        className='h-10 w-full rounded-md border border-input bg-background px-3 text-sm outline-none ring-offset-background placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring'
       />
 
-      <div className='flex items-center gap-2'>
+      <div className='grid grid-cols-3 gap-2'>
         <Button variant={layout === 'force' ? 'default' : 'outline'} size='sm' onClick={() => onLayoutChange('force')}>
           Force
         </Button>

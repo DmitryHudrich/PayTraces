@@ -6,6 +6,22 @@ import { useEffect, useMemo, useRef } from 'react'
 
 import type { GraphAdapterProps, GraphData, GraphLayoutMode } from '@/shared/graph/contract/graph'
 
+const GRAPH_THEME = {
+  canvas: '#09090b',
+  edge: '#2a2a30',
+  edgeActive: '#52525c',
+  label: '#52525c',
+  labelActive: '#a1a1aa',
+  dimmedNode: '#18181b',
+  dimmedEdge: '#18181b',
+  groups: {
+    wallet: '#7eb6ff',
+    exchange: '#c4b0f5',
+    risk: '#f09494',
+    default: '#a1a1aa',
+  },
+} as const
+
 type SigmaNodeAttrs = {
   x: number
   y: number
@@ -20,12 +36,52 @@ type SigmaEdgeAttrs = {
   color: string
 }
 
-export const SigmaGraphAdapter = ({ graph, layout, selectedNodeId, onNodeSelect }: GraphAdapterProps) => {
+type NodePosition = { x: number; y: number }
+
+export const SigmaGraphAdapter = ({
+  graph,
+  layout,
+  selectedNodeId = '',
+  visibleNodeIds = null,
+  visibleEdgeIds = null,
+  onNodeSelect,
+}: GraphAdapterProps) => {
   const containerRef = useRef<HTMLDivElement | null>(null)
   const rendererRef = useRef<Sigma<SigmaNodeAttrs, SigmaEdgeAttrs> | null>(null)
   const graphRef = useRef<Graph<SigmaNodeAttrs, SigmaEdgeAttrs> | null>(null)
+  const nodePositionsRef = useRef<Map<string, NodePosition>>(new Map())
+  const selectedNodeIdRef = useRef(selectedNodeId)
+  const visibleNodeIdsRef = useRef(visibleNodeIds)
+  const visibleEdgeIdsRef = useRef(visibleEdgeIds)
+  const onNodeSelectRef = useRef(onNodeSelect)
+  const layoutRef = useRef(layout)
+  const graphSignatureRef = useRef('')
 
-  const preparedGraph = useMemo(() => buildGraph(graph, layout), [graph, layout])
+  selectedNodeIdRef.current = selectedNodeId
+  visibleNodeIdsRef.current = visibleNodeIds
+  visibleEdgeIdsRef.current = visibleEdgeIds
+  onNodeSelectRef.current = onNodeSelect
+
+  const graphSignature = useMemo(() => graph.nodes.map((node) => node.id).join('|'), [graph.nodes])
+
+  useEffect(() => {
+    if (layoutRef.current !== layout) {
+      nodePositionsRef.current.clear()
+      layoutRef.current = layout
+    }
+  }, [layout])
+
+  useEffect(() => {
+    if (graphSignatureRef.current !== graphSignature) {
+      nodePositionsRef.current.clear()
+      graphSignatureRef.current = graphSignature
+    }
+  }, [graphSignature])
+
+  const preparedGraph = useMemo(
+    () => buildGraph(graph, layout, nodePositionsRef.current),
+    [graph, layout],
+  )
 
   useEffect(() => {
     const container = containerRef.current
@@ -33,83 +89,111 @@ export const SigmaGraphAdapter = ({ graph, layout, selectedNodeId, onNodeSelect 
       return
     }
 
-    const renderer = new Sigma<SigmaNodeAttrs, SigmaEdgeAttrs>(preparedGraph, container, {
+    const sigmaGraph = preparedGraph
+
+    const renderer = new Sigma<SigmaNodeAttrs, SigmaEdgeAttrs>(sigmaGraph, container, {
       renderEdgeLabels: false,
       defaultNodeType: 'circle',
       defaultEdgeType: 'arrow',
-      labelColor: { color: '#e4e4e7' },
-      edgeLabelColor: { color: '#e4e4e7' },
-      labelDensity: 0.05,
-      labelGridCellSize: 100,
+      labelColor: { color: GRAPH_THEME.label },
+      edgeLabelColor: { color: GRAPH_THEME.label },
+      labelDensity: 0.04,
+      labelGridCellSize: 120,
+      labelSize: 10,
+      labelFont: 'ui-monospace, SFMono-Regular, Menlo, monospace',
       minCameraRatio: 0.2,
       maxCameraRatio: 5,
-      stagePadding: 24,
+      stagePadding: 32,
       zoomToSizeRatioFunction: (ratio) => ratio,
       nodeReducer: (node, data) => {
-        if (!selectedNodeId) {
-          return data
+        const visibleIds = visibleNodeIdsRef.current
+        if (visibleIds && !visibleIds.has(node)) {
+          return { ...data, hidden: true, label: '' }
         }
 
-        const neighborSet = getNeighborhood(preparedGraph, selectedNodeId)
-        const isActive = node === selectedNodeId || neighborSet.has(node)
+        const activeNodeId = selectedNodeIdRef.current
+        if (!activeNodeId) {
+          return {
+            ...data,
+            labelColor: GRAPH_THEME.label,
+          }
+        }
+
+        const neighborSet = getNeighborhood(sigmaGraph, activeNodeId)
+        const isActive = node === activeNodeId || neighborSet.has(node)
         return {
           ...data,
-          color: isActive ? data.color : '#27272a',
+          color: isActive ? data.color : GRAPH_THEME.dimmedNode,
           label: isActive ? data.label : '',
+          labelColor: isActive ? GRAPH_THEME.labelActive : GRAPH_THEME.dimmedNode,
         }
       },
       edgeReducer: (edge, data) => {
-        if (!selectedNodeId) {
+        const visibleIds = visibleEdgeIdsRef.current
+        if (visibleIds && !visibleIds.has(edge)) {
+          return { ...data, hidden: true }
+        }
+
+        const activeNodeId = selectedNodeIdRef.current
+        if (!activeNodeId) {
           return data
         }
 
-        const [source, target] = preparedGraph.extremities(edge)
-        const neighborSet = getNeighborhood(preparedGraph, selectedNodeId)
+        const [source, target] = sigmaGraph.extremities(edge)
+        const neighborSet = getNeighborhood(sigmaGraph, activeNodeId)
         const isActive =
-          source === selectedNodeId ||
-          target === selectedNodeId ||
+          source === activeNodeId ||
+          target === activeNodeId ||
           (neighborSet.has(source) && neighborSet.has(target))
 
         return {
           ...data,
-          color: isActive ? data.color : '#27272a',
+          color: isActive ? GRAPH_THEME.edgeActive : GRAPH_THEME.dimmedEdge,
           hidden: !isActive,
         }
       },
     })
 
     rendererRef.current = renderer
-    graphRef.current = preparedGraph
+    graphRef.current = sigmaGraph
 
-    renderer.on('clickNode', ({ node }) => {
-      onNodeSelect?.(node)
-    })
-
-    renderer.on('clickStage', () => {
-      onNodeSelect?.('')
+    const dragState = bindNodeDragging(renderer, sigmaGraph, nodePositionsRef, (nodeId) => {
+      onNodeSelectRef.current?.(nodeId)
     })
 
     return () => {
+      dragState.cleanup()
       renderer.kill()
       rendererRef.current = null
       graphRef.current = null
     }
-  }, [onNodeSelect, preparedGraph, selectedNodeId])
+  }, [preparedGraph])
 
   useEffect(() => {
     rendererRef.current?.refresh()
-  }, [selectedNodeId])
+  }, [selectedNodeId, visibleNodeIds, visibleEdgeIds])
 
-  return <div ref={containerRef} className='h-[70vh] min-h-[540px] w-full rounded-xl border border-border bg-zinc-950' />
+  return (
+    <div
+      ref={containerRef}
+      className='h-full min-h-[360px] w-full rounded-xl border border-zinc-800/60'
+      style={{ backgroundColor: GRAPH_THEME.canvas }}
+    />
+  )
 }
 
-function buildGraph(graphData: GraphData, layout: GraphLayoutMode) {
-  const graph = new Graph<SigmaNodeAttrs, SigmaEdgeAttrs>({ type: 'directed', multi: false, allowSelfLoops: false })
+function buildGraph(
+  graphData: GraphData,
+  layout: GraphLayoutMode,
+  savedPositions: Map<string, NodePosition>,
+) {
+  const graph = new Graph<SigmaNodeAttrs, SigmaEdgeAttrs>({ type: 'directed', multi: true, allowSelfLoops: false })
 
   graphData.nodes.forEach((node) => {
+    const saved = savedPositions.get(node.id)
     graph.addNode(node.id, {
-      x: Math.random(),
-      y: Math.random(),
+      x: saved?.x ?? seededCoordinate(node.id, 0),
+      y: saved?.y ?? seededCoordinate(node.id, 1),
       size: mapWeightToSize(node.weight ?? 1),
       label: node.label,
       color: colorByGroup(node.group),
@@ -122,18 +206,138 @@ function buildGraph(graphData: GraphData, layout: GraphLayoutMode) {
       return
     }
     graph.addEdgeWithKey(edge.id, edge.source, edge.target, {
-      size: Math.max(1, Math.min(5, edge.weight ?? 1)),
-      color: '#52525b',
+      size: mapWeightToEdgeSize(edge.weight ?? 1),
+      color: GRAPH_THEME.edge,
     })
   })
 
-  applyLayout(graph, layout)
+  const hasSavedLayout = graphData.nodes.some((node) => savedPositions.has(node.id))
+  if (!hasSavedLayout) {
+    applyLayout(graph, layout)
+    compactGraphPositions(graph, 0.72)
+  }
+
+  graph.forEachNode((node, attributes) => {
+    savedPositions.set(node, { x: attributes.x, y: attributes.y })
+  })
+
   return graph
+}
+
+function seededCoordinate(id: string, salt: number) {
+  let hash = salt + 1
+  for (let index = 0; index < id.length; index += 1) {
+    hash = (hash * 31 + id.charCodeAt(index)) >>> 0
+  }
+  return (hash % 1000) / 500 - 1
+}
+
+function compactGraphPositions(graph: Graph<SigmaNodeAttrs, SigmaEdgeAttrs>, factor: number) {
+  const nodes = graph.nodes()
+  if (nodes.length === 0) {
+    return
+  }
+
+  let centerX = 0
+  let centerY = 0
+
+  nodes.forEach((node) => {
+    centerX += graph.getNodeAttribute(node, 'x')
+    centerY += graph.getNodeAttribute(node, 'y')
+  })
+
+  centerX /= nodes.length
+  centerY /= nodes.length
+
+  nodes.forEach((node) => {
+    const x = graph.getNodeAttribute(node, 'x')
+    const y = graph.getNodeAttribute(node, 'y')
+    graph.setNodeAttribute(node, 'x', centerX + (x - centerX) * factor)
+    graph.setNodeAttribute(node, 'y', centerY + (y - centerY) * factor)
+  })
+}
+
+function bindNodeDragging(
+  renderer: Sigma<SigmaNodeAttrs, SigmaEdgeAttrs>,
+  graph: Graph<SigmaNodeAttrs, SigmaEdgeAttrs>,
+  nodePositionsRef: { current: Map<string, NodePosition> },
+  onNodeSelect?: (nodeId: string) => void,
+) {
+  let draggedNode: string | null = null
+  let dragStart: { x: number; y: number } | null = null
+  let moved = false
+
+  const onDownNode = ({ node, event }: { node: string; event: { x: number; y: number } }) => {
+    draggedNode = node
+    dragStart = { x: event.x, y: event.y }
+    moved = false
+    renderer.getCamera().disable()
+  }
+
+  const onMoveBody = ({ event }: { event: { x: number; y: number; preventSigmaDefault(): void } }) => {
+    if (!draggedNode) {
+      return
+    }
+
+    if (dragStart) {
+      const dx = event.x - dragStart.x
+      const dy = event.y - dragStart.y
+      if (dx * dx + dy * dy > 9) {
+        moved = true
+      }
+    }
+
+    const position = renderer.viewportToGraph(event)
+    graph.setNodeAttribute(draggedNode, 'x', position.x)
+    graph.setNodeAttribute(draggedNode, 'y', position.y)
+    nodePositionsRef.current.set(draggedNode, position)
+    event.preventSigmaDefault()
+  }
+
+  const releaseDrag = () => {
+    draggedNode = null
+    dragStart = null
+    renderer.getCamera().enable()
+  }
+
+  const onClickNode = ({ node }: { node: string }) => {
+    if (moved) {
+      moved = false
+      return
+    }
+    onNodeSelect?.(node)
+  }
+
+  const onClickStage = () => {
+    if (moved) {
+      moved = false
+      return
+    }
+    onNodeSelect?.('')
+  }
+
+  renderer.on('downNode', onDownNode)
+  renderer.on('moveBody', onMoveBody)
+  renderer.on('upNode', releaseDrag)
+  renderer.on('upStage', releaseDrag)
+  renderer.on('clickNode', onClickNode)
+  renderer.on('clickStage', onClickStage)
+
+  return {
+    cleanup: () => {
+      renderer.off('downNode', onDownNode)
+      renderer.off('moveBody', onMoveBody)
+      renderer.off('upNode', releaseDrag)
+      renderer.off('upStage', releaseDrag)
+      renderer.off('clickNode', onClickNode)
+      renderer.off('clickStage', onClickStage)
+    },
+  }
 }
 
 function applyLayout(graph: Graph<SigmaNodeAttrs, SigmaEdgeAttrs>, layout: GraphLayoutMode) {
   if (layout === 'concentric') {
-    assignCircular(graph)
+    assignCircular(graph, { scale: 0.55 })
     return
   }
 
@@ -143,9 +347,17 @@ function applyLayout(graph: Graph<SigmaNodeAttrs, SigmaEdgeAttrs>, layout: Graph
   }
 
   if (graph.order > 1) {
+    const inferred = forceAtlas2.inferSettings(graph)
     forceAtlas2.assign(graph, {
-      iterations: 180,
-      settings: forceAtlas2.inferSettings(graph),
+      iterations: 220,
+      settings: {
+        ...inferred,
+        gravity: Math.max(inferred.gravity ?? 1, 4),
+        scalingRatio: Math.max(2, (inferred.scalingRatio ?? 10) * 0.35),
+        strongGravityMode: true,
+        slowDown: 2,
+        adjustSizes: true,
+      },
     })
   }
 }
@@ -191,8 +403,8 @@ function assignBreadthFirst(graph: Graph<SigmaNodeAttrs, SigmaEdgeAttrs>) {
   const maxWidth = Math.max(...Array.from(layers.values()).map((layer) => layer.length), 1)
   for (const [level, layer] of layers.entries()) {
     layer.forEach((node, index) => {
-      const x = maxWidth === 1 ? 0 : (index / (maxWidth - 1)) * 2 - 1
-      const y = level * 0.55
+      const x = maxWidth === 1 ? 0 : (index / (maxWidth - 1)) * 1.4 - 0.7
+      const y = level * 0.35
       graph.setNodeAttribute(node, 'x', x)
       graph.setNodeAttribute(node, 'y', y)
     })
@@ -207,17 +419,21 @@ function getNeighborhood(graph: Graph<SigmaNodeAttrs, SigmaEdgeAttrs>, nodeId: s
 
 function colorByGroup(group?: string) {
   if (group === 'wallet') {
-    return '#2563eb'
+    return GRAPH_THEME.groups.wallet
   }
   if (group === 'exchange') {
-    return '#7c3aed'
+    return GRAPH_THEME.groups.exchange
   }
   if (group === 'risk') {
-    return '#dc2626'
+    return GRAPH_THEME.groups.risk
   }
-  return '#71717a'
+  return GRAPH_THEME.groups.default
 }
 
 function mapWeightToSize(weight: number) {
-  return Math.max(6, Math.min(22, 5 + weight * 0.8))
+  return Math.max(4, Math.min(14, 3 + weight * 0.55))
+}
+
+function mapWeightToEdgeSize(weight: number) {
+  return Math.max(0.35, Math.min(1.4, 0.3 + weight * 0.12))
 }

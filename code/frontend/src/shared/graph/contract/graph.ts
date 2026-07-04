@@ -27,4 +27,5 @@ export type GraphAdapterProps = {
   visibleNodeIds?: ReadonlySet<string> | null
   visibleEdgeIds?: ReadonlySet<string> | null
   onNodeSelect?: (nodeId: string) => void
+  onNodeHover?: (nodeId: string | null) => void
 }

@@ -2,7 +2,7 @@ import assignCircular from 'graphology-layout/circular'
 import forceAtlas2 from 'graphology-layout-forceatlas2'
 import Graph from 'graphology'
 import Sigma from 'sigma'
-import { useEffect, useMemo, useRef } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
 import type { GraphAdapterProps, GraphData, GraphLayoutMode } from '@/shared/graph/contract/graph'
 
@@ -12,8 +12,6 @@ const GRAPH_THEME = {
   edgeActive: '#52525c',
   label: '#52525c',
   labelActive: '#a1a1aa',
-  dimmedNode: '#18181b',
-  dimmedEdge: '#18181b',
   groups: {
     wallet: '#7eb6ff',
     exchange: '#c4b0f5',
@@ -45,6 +43,7 @@ export const SigmaGraphAdapter = ({
   visibleNodeIds = null,
   visibleEdgeIds = null,
   onNodeSelect,
+  onNodeHover,
 }: GraphAdapterProps) => {
   const containerRef = useRef<HTMLDivElement | null>(null)
   const rendererRef = useRef<Sigma<SigmaNodeAttrs, SigmaEdgeAttrs> | null>(null)
@@ -54,13 +53,16 @@ export const SigmaGraphAdapter = ({
   const visibleNodeIdsRef = useRef(visibleNodeIds)
   const visibleEdgeIdsRef = useRef(visibleEdgeIds)
   const onNodeSelectRef = useRef(onNodeSelect)
+  const onNodeHoverRef = useRef(onNodeHover)
   const layoutRef = useRef(layout)
   const graphSignatureRef = useRef('')
+  const [canRender, setCanRender] = useState(false)
 
   selectedNodeIdRef.current = selectedNodeId
   visibleNodeIdsRef.current = visibleNodeIds
   visibleEdgeIdsRef.current = visibleEdgeIds
   onNodeSelectRef.current = onNodeSelect
+  onNodeHoverRef.current = onNodeHover
 
   const graphSignature = useMemo(() => graph.nodes.map((node) => node.id).join('|'), [graph.nodes])
 
@@ -86,6 +88,35 @@ export const SigmaGraphAdapter = ({
   useEffect(() => {
     const container = containerRef.current
     if (!container) {
+      return
+    }
+
+    const updateContainerState = () => {
+      const ready = container.clientWidth > 0 && container.clientHeight > 0
+      if (!ready) {
+        return
+      }
+
+      setCanRender(true)
+
+      if (rendererRef.current) {
+        rendererRef.current.resize()
+      }
+    }
+
+    updateContainerState()
+
+    const observer = new ResizeObserver(updateContainerState)
+    observer.observe(container)
+
+    return () => {
+      observer.disconnect()
+    }
+  }, [])
+
+  useEffect(() => {
+    const container = containerRef.current
+    if (!container || !canRender) {
       return
     }
 
@@ -119,14 +150,15 @@ export const SigmaGraphAdapter = ({
           }
         }
 
-        const neighborSet = getNeighborhood(sigmaGraph, activeNodeId)
-        const isActive = node === activeNodeId || neighborSet.has(node)
-        return {
-          ...data,
-          color: isActive ? data.color : GRAPH_THEME.dimmedNode,
-          label: isActive ? data.label : '',
-          labelColor: isActive ? GRAPH_THEME.labelActive : GRAPH_THEME.dimmedNode,
+        if (node === activeNodeId) {
+          return {
+            ...data,
+            size: data.size * 1.15,
+            labelColor: GRAPH_THEME.labelActive,
+          }
         }
+
+        return data
       },
       edgeReducer: (edge, data) => {
         const visibleIds = visibleEdgeIdsRef.current
@@ -140,16 +172,12 @@ export const SigmaGraphAdapter = ({
         }
 
         const [source, target] = sigmaGraph.extremities(edge)
-        const neighborSet = getNeighborhood(sigmaGraph, activeNodeId)
-        const isActive =
-          source === activeNodeId ||
-          target === activeNodeId ||
-          (neighborSet.has(source) && neighborSet.has(target))
+        const isConnected = source === activeNodeId || target === activeNodeId
 
         return {
           ...data,
-          color: isActive ? GRAPH_THEME.edgeActive : GRAPH_THEME.dimmedEdge,
-          hidden: !isActive,
+          color: isConnected ? GRAPH_THEME.edgeActive : data.color,
+          size: isConnected ? Math.max(data.size * 1.15, data.size) : data.size,
         }
       },
     })
@@ -161,24 +189,44 @@ export const SigmaGraphAdapter = ({
       onNodeSelectRef.current?.(nodeId)
     })
 
+    const onEnterNode = ({ node }: { node: string }) => {
+      onNodeHoverRef.current?.(node)
+    }
+
+    const onLeaveNode = () => {
+      onNodeHoverRef.current?.(null)
+    }
+
+    renderer.on('enterNode', onEnterNode)
+    renderer.on('leaveNode', onLeaveNode)
+
     return () => {
+      renderer.off('enterNode', onEnterNode)
+      renderer.off('leaveNode', onLeaveNode)
       dragState.cleanup()
       renderer.kill()
       rendererRef.current = null
       graphRef.current = null
     }
-  }, [preparedGraph])
+  }, [canRender, preparedGraph])
 
   useEffect(() => {
     rendererRef.current?.refresh()
   }, [selectedNodeId, visibleNodeIds, visibleEdgeIds])
 
   return (
-    <div
-      ref={containerRef}
-      className='h-full min-h-[360px] w-full rounded-xl border border-zinc-800/60'
-      style={{ backgroundColor: GRAPH_THEME.canvas }}
-    />
+    <div className='relative h-full min-h-[360px] w-full'>
+      <div
+        ref={containerRef}
+        className='h-full w-full rounded-xl border border-zinc-800/60'
+        style={{ backgroundColor: GRAPH_THEME.canvas }}
+      />
+      {!canRender ? (
+        <div className='pointer-events-none absolute inset-0 flex items-center justify-center rounded-xl bg-background/40 text-xs text-muted-foreground'>
+          Preparing graph...
+        </div>
+      ) : null}
+    </div>
   )
 }
 
@@ -409,12 +457,6 @@ function assignBreadthFirst(graph: Graph<SigmaNodeAttrs, SigmaEdgeAttrs>) {
       graph.setNodeAttribute(node, 'y', y)
     })
   }
-}
-
-function getNeighborhood(graph: Graph<SigmaNodeAttrs, SigmaEdgeAttrs>, nodeId: string) {
-  const neighbors = new Set<string>()
-  graph.forEachNeighbor(nodeId, (neighbor: string) => neighbors.add(neighbor))
-  return neighbors
 }
 
 function colorByGroup(group?: string) {

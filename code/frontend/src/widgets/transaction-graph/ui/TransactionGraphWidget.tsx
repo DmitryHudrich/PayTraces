@@ -7,6 +7,7 @@ type TransactionGraphWidgetProps = {
   visibleNodeIds?: ReadonlySet<string> | null
   visibleEdgeIds?: ReadonlySet<string> | null
   onSelectNode: (nodeId: string) => void
+  onHoverNode?: (nodeId: string | null) => void
 }
 
 export const TransactionGraphWidget = ({
@@ -16,6 +17,7 @@ export const TransactionGraphWidget = ({
   visibleNodeIds,
   visibleEdgeIds,
   onSelectNode,
+  onHoverNode,
 }: TransactionGraphWidgetProps) => {
   return (
     <SigmaGraphAdapter
@@ -25,6 +27,7 @@ export const TransactionGraphWidget = ({
       visibleNodeIds={visibleNodeIds}
       visibleEdgeIds={visibleEdgeIds}
       onNodeSelect={onSelectNode}
+      onNodeHover={onHoverNode}
     />
   )
 }

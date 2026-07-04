@@ -3,6 +3,7 @@ export { mockTransactionGraphPage } from '@/entities/transaction/model/mock-tran
 export { emptyTransactionGraphPage } from '@/entities/transaction/model/empty-transaction-graph-page'
 export { transactionGraphPageToGraphData } from '@/entities/transaction/lib/to-graph'
 export { filterGraphData } from '@/entities/transaction/lib/filter-graph'
+export { waitForIngestJob } from '@/entities/transaction/lib/wait-for-job'
 export {
   getTransactionNodeDetails,
   type TransactionNodeDetails,

@@ -1,4 +1,4 @@
-import { Button } from '@/shared/ui/button'
+import { ToggleGroup, ToggleGroupItem } from '@/shared/ui/toggle-group'
 
 export type GraphSourceMode = 'mock' | 'backend'
 
@@ -11,24 +11,25 @@ export const TransactionGraphSourceToggle = ({ value, onChange }: TransactionGra
   return (
     <div className='flex flex-col gap-2'>
       <span className='text-xs font-medium text-muted-foreground'>Data source</span>
-      <div className='grid grid-cols-2 gap-1 rounded-lg border border-border bg-background p-1'>
-        <Button
-          type='button'
-          size='sm'
-          variant={value === 'mock' ? 'default' : 'ghost'}
-          onClick={() => onChange('mock')}
-        >
+      <ToggleGroup
+        type='single'
+        variant='outline'
+        size='sm'
+        value={value}
+        onValueChange={(next) => {
+          if (next === 'mock' || next === 'backend') {
+            onChange(next)
+          }
+        }}
+        className='grid w-full grid-cols-2'
+      >
+        <ToggleGroupItem value='mock' aria-label='Mock data source' className='w-full'>
           Mock
-        </Button>
-        <Button
-          type='button'
-          size='sm'
-          variant={value === 'backend' ? 'default' : 'ghost'}
-          onClick={() => onChange('backend')}
-        >
+        </ToggleGroupItem>
+        <ToggleGroupItem value='backend' aria-label='Backend data source' className='w-full'>
           Backend
-        </Button>
-      </div>
+        </ToggleGroupItem>
+      </ToggleGroup>
     </div>
   )
 }

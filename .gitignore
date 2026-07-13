@@ -1,5 +1,6 @@
 **/target
 moralis_cache
 etherscan_cache
+trongrid_cache
 .idea
 .pnpm-store

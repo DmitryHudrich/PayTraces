@@ -1,3 +1,6 @@
+use chrono::NaiveDateTime;
+use serde::{Deserialize, Deserializer};
+
 use crate::error::ApiError;
 use domain::chain::{ChainId, ChainRegistry};
 use domain::entity::SanctionList;
@@ -8,6 +11,43 @@ use domain::transfer::TransferKind;
 
 pub fn parse_address(s: &str, chain: ChainId) -> Result<Address, ApiError> {
     Address::parse(chain, s).map_err(|e| ApiError::bad_request(e.to_string()))
+}
+
+/// Tronscan's UI date format, e.g. `2026-07-13 08:04:09` — always UTC, since
+/// that's what block/transfer timestamps are stored as everywhere else in
+/// this codebase.
+const TRONSCAN_DATETIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum HeightOrDate {
+    Height(u64),
+    Text(String),
+}
+
+/// Deserializes `from_block`/`to_block`-style fields that, for Tron, are
+/// actually ms-since-epoch timestamps (see `TronGridSource` doc comment).
+/// Accepts either the raw number or a Tronscan-style UTC date string
+/// (`"2026-07-13 08:04:09"`), so callers don't have to convert by hand.
+pub fn deserialize_height_or_date<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(value) = Option::<HeightOrDate>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    let height = match value {
+        HeightOrDate::Height(h) => h,
+        HeightOrDate::Text(s) => match s.parse::<u64>() {
+            Ok(h) => h,
+            Err(_) => {
+                let dt = NaiveDateTime::parse_from_str(&s, TRONSCAN_DATETIME_FORMAT)
+                    .map_err(|e| serde::de::Error::custom(format!("invalid date {s:?}: {e}")))?;
+                dt.and_utc().timestamp_millis().max(0) as u64
+            }
+        },
+    };
+    Ok(Some(height))
 }
 
 pub fn format_amount(raw: U256, decimals: u8) -> String {
@@ -91,5 +131,63 @@ pub fn sanction_list_str(s: &SanctionList) -> String {
         SanctionList::Eu => "eu".into(),
         SanctionList::Un => "un".into(),
         SanctionList::Other(s) => s.to_lowercase().replace([' ', '-'], "_"),
+    }
+}
+
+#[cfg(test)]
+mod height_or_date_tests {
+    use super::*;
+
+    #[derive(serde::Deserialize)]
+    struct T {
+        #[serde(default, deserialize_with = "deserialize_height_or_date")]
+        v: Option<u64>,
+    }
+
+    #[test]
+    fn accepts_plain_number() {
+        let t: T = serde_json::from_str(r#"{"v": 1783934511001}"#).unwrap();
+        assert_eq!(t.v, Some(1783934511001));
+    }
+
+    #[test]
+    fn accepts_numeric_string() {
+        let t: T = serde_json::from_str(r#"{"v": "1783934511001"}"#).unwrap();
+        assert_eq!(t.v, Some(1783934511001));
+    }
+
+    #[test]
+    fn accepts_tronscan_date_string() {
+        let t: T = serde_json::from_str(r#"{"v": "2026-07-13 08:04:09"}"#).unwrap();
+        assert_eq!(t.v, Some(1783929849000));
+    }
+
+    #[test]
+    fn missing_is_none() {
+        let t: T = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(t.v, None);
+    }
+}
+
+#[cfg(test)]
+mod height_or_date_query_tests {
+    use super::*;
+
+    #[derive(serde::Deserialize)]
+    struct T {
+        #[serde(default, deserialize_with = "deserialize_height_or_date")]
+        v: Option<u64>,
+    }
+
+    #[test]
+    fn accepts_date_via_urlencoded_query_string() {
+        let t: T = serde_urlencoded::from_str("v=2026-07-13%2008%3A04%3A09").unwrap();
+        assert_eq!(t.v, Some(1783929849000));
+    }
+
+    #[test]
+    fn accepts_number_via_urlencoded_query_string() {
+        let t: T = serde_urlencoded::from_str("v=1783929849000").unwrap();
+        assert_eq!(t.v, Some(1783929849000));
     }
 }

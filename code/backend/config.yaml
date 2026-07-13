@@ -139,8 +139,13 @@ moralis:
 
 trongrid:
   enabled: true
-  base_url: "https://api.trongrid.io"
+  base_url: "https://apilist.tronscanapi.com"
   api_key: ~
+  api_keys: []          # up to 3 on the free plan; requests round-robin across them
+  key_cooldown_secs: 5
+  requests_per_second: 5.0   # per key — free plan is 5 calls/(key*second)
+  http_max_attempts: 6
+  max_concurrent_requests: 4
   page_ttl_secs: 3600
   page_max_capacity: 10000
   max_pages_per_endpoint: 50

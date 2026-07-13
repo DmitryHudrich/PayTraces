@@ -170,8 +170,17 @@ impl MoralisConfig {
 pub struct TronGridConfigFile {
     #[serde(default = "TronGridConfigFile::default_base_url")]
     base_url: String,
+    /// Legacy single-key field. Kept for backward compat — merged into the
+    /// resolved key list when set. Prefer `api_keys`.
     #[serde(default)]
     api_key: Option<String>,
+    /// Multi-key pool (Tronscan's free plan allows up to 3 keys per
+    /// account). Each request round-robins across live keys; a 429 cools
+    /// the offending key for `key_cooldown_secs` instead of failing the
+    /// request. Empty means anonymous/keyless requests — Tronscan still
+    /// serves those, just at a stricter, undocumented rate.
+    #[serde(default)]
+    api_keys: Vec<String>,
     #[serde(default = "TronGridConfigFile::default_page_ttl_secs")]
     page_ttl_secs: u64,
     #[serde(default = "TronGridConfigFile::default_page_max_capacity")]
@@ -182,6 +191,18 @@ pub struct TronGridConfigFile {
     file_cache: FileCacheConfig,
     #[serde(default = "TronGridConfigFile::default_enabled")]
     enabled: bool,
+    #[serde(default = "TronGridConfigFile::default_max_concurrent_requests")]
+    max_concurrent_requests: u32,
+    #[serde(default = "TronGridConfigFile::default_key_cooldown_secs")]
+    key_cooldown_secs: u64,
+    /// Steady-state requests per second **per key** — Tronscan's free plan
+    /// is 5 calls/(key*second). With N keys configured, the source scales
+    /// its shared token bucket to `N * requests_per_second` (round-robin
+    /// key selection means that aggregate is safe to allow).
+    #[serde(default = "TronGridConfigFile::default_requests_per_second")]
+    requests_per_second: f64,
+    #[serde(default = "TronGridConfigFile::default_http_max_attempts")]
+    http_max_attempts: u8,
 }
 
 impl Default for TronGridConfigFile {
@@ -189,11 +210,16 @@ impl Default for TronGridConfigFile {
         Self {
             base_url: Self::default_base_url(),
             api_key: None,
+            api_keys: Vec::new(),
             page_ttl_secs: Self::default_page_ttl_secs(),
             page_max_capacity: Self::default_page_max_capacity(),
             max_pages_per_endpoint: Self::default_max_pages(),
             file_cache: FileCacheConfig::default(),
             enabled: Self::default_enabled(),
+            max_concurrent_requests: Self::default_max_concurrent_requests(),
+            key_cooldown_secs: Self::default_key_cooldown_secs(),
+            requests_per_second: Self::default_requests_per_second(),
+            http_max_attempts: Self::default_http_max_attempts(),
         }
     }
 }
@@ -204,7 +230,7 @@ impl TronGridConfigFile {
     }
 
     fn default_base_url() -> String {
-        "https://api.trongrid.io".into()
+        "https://apilist.tronscanapi.com".into()
     }
     fn default_page_ttl_secs() -> u64 {
         3_600
@@ -218,11 +244,45 @@ impl TronGridConfigFile {
     fn default_enabled() -> bool {
         true
     }
+    fn default_max_concurrent_requests() -> u32 {
+        4
+    }
+    fn default_key_cooldown_secs() -> u64 {
+        5
+    }
+    fn default_requests_per_second() -> f64 {
+        5.0
+    }
+    fn default_http_max_attempts() -> u8 {
+        6
+    }
+
+    /// Merged key list: legacy `api_key` (if any) plus `api_keys`, dedupe
+    /// preserving order. Empty / whitespace entries are dropped.
+    fn resolved_keys(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut push = |s: &str| {
+            let k = s.trim();
+            if k.is_empty() || !seen.insert(k.to_string()) {
+                return;
+            }
+            out.push(k.to_string());
+        };
+        if let Some(k) = self.api_key.as_deref() {
+            push(k);
+        }
+        for k in &self.api_keys {
+            push(k);
+        }
+        out
+    }
 
     pub fn into_domain(self) -> infra::TronGridConfig {
+        let keys = self.resolved_keys();
         infra::TronGridConfig::new(
             self.base_url,
-            self.api_key,
+            keys,
             self.page_max_capacity,
             Duration::from_secs(self.page_ttl_secs),
             if self.file_cache.enabled {
@@ -231,6 +291,10 @@ impl TronGridConfigFile {
                 None
             },
             self.max_pages_per_endpoint,
+            Some(self.max_concurrent_requests),
+            Some(Duration::from_secs(self.key_cooldown_secs)),
+            Some(self.requests_per_second),
+            Some(self.http_max_attempts),
         )
     }
 }

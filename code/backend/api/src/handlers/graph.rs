@@ -10,7 +10,10 @@ use domain::ports::BlockRange;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ApiError, ErrorResponse};
-use crate::format::{edge_symbol, format_amount, native_symbol, parse_address, transfer_kind_str};
+use crate::format::{
+    deserialize_height_or_date, edge_symbol, format_amount, native_symbol, parse_address,
+    transfer_kind_str,
+};
 use crate::state::{AppState, resolve_chain_id};
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -59,9 +62,15 @@ pub struct GraphQuery {
     max_nodes: Option<usize>,
     #[param(example = 10000)]
     max_transfers_per_address: Option<usize>,
+    /// Block number for most chains; for Tron, ms-since-epoch or a
+    /// Tronscan-style UTC date string (`"2026-07-13 08:04:09"`).
     #[param(example = 19000000)]
+    #[serde(default, deserialize_with = "deserialize_height_or_date")]
     from_block: Option<u64>,
+    /// Block number for most chains; for Tron, ms-since-epoch or a
+    /// Tronscan-style UTC date string (`"2026-07-13 08:04:09"`).
     #[param(example = 20000000)]
+    #[serde(default, deserialize_with = "deserialize_height_or_date")]
     to_block: Option<u64>,
     #[param(example = 0)]
     page: Option<u32>,

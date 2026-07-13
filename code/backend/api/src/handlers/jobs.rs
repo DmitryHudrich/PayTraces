@@ -11,7 +11,7 @@ use domain::ports::{BlockRange, IngestionPort};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ApiError, ErrorResponse};
-use crate::format::parse_address;
+use crate::format::{deserialize_height_or_date, parse_address};
 use crate::state::{AppState, resolve_chain_id};
 
 #[derive(Deserialize, Serialize, utoipa::ToSchema)]
@@ -26,7 +26,13 @@ pub struct IngestJobRequest {
     max_nodes: Option<usize>,
     #[schema(example = 10000)]
     max_transfers_per_address: Option<usize>,
+    /// Block number for most chains; for Tron, ms-since-epoch or a
+    /// Tronscan-style UTC date string (`"2026-07-13 08:04:09"`).
+    #[serde(default, deserialize_with = "deserialize_height_or_date")]
     from_block: Option<u64>,
+    /// Block number for most chains; for Tron, ms-since-epoch or a
+    /// Tronscan-style UTC date string (`"2026-07-13 08:04:09"`).
+    #[serde(default, deserialize_with = "deserialize_height_or_date")]
     to_block: Option<u64>,
 }
 

@@ -144,12 +144,14 @@ struct PageKey {
 /// signal offset pagination gives us (no opaque cursor to check for `None`).
 type PageValue = Arc<(Vec<Transfer>, bool)>;
 
-/// Reads only solidified (`confirm=true`) data — see
-/// `side_api/tron/endpoints.rs`. TRON DPoS finality means solidified blocks
-/// never reorg, so the hot-tail problem (relevant for ETH/Moralis) doesn't
-/// apply here and pages can be cached aggressively with a single TTL, and
-/// once fetched a page never needs invalidating regardless of which window
-/// it was fetched under.
+/// Reads only solidified data: the native endpoint via `confirm=true`, the
+/// TRC20 endpoint via a client-side `confirmed` check in `map_trc20` (that
+/// endpoint returns zero rows if `confirm=true` is passed as a query param —
+/// see `side_api/tron/endpoints.rs`). TRON DPoS finality means solidified
+/// blocks never reorg, so the hot-tail problem (relevant for ETH/Moralis)
+/// doesn't apply here and pages can be cached aggressively with a single
+/// TTL, and once fetched a page never needs invalidating regardless of which
+/// window it was fetched under.
 ///
 /// ## Incremental fetch and the "height" convention
 ///
@@ -670,6 +672,13 @@ fn map_native(raw: dto::RawTransaction) -> anyhow::Result<Option<Transfer>> {
 }
 
 fn map_trc20(rec: dto::Trc20Transfer) -> anyhow::Result<Option<Transfer>> {
+    // `confirm=true` isn't usable as a query param on this endpoint (see
+    // `endpoints::trc20_transfers`), so the "only solidified data" guarantee
+    // this source promises is enforced here instead.
+    if !rec.confirmed() {
+        return Ok(None);
+    }
+
     let tx_hash = parse_hash32(rec.transaction_id()).context("trc20 tx hash")?;
     let block_ts = rec.block_ts();
     let timestamp = chrono::Utc
@@ -846,6 +855,30 @@ mod tests {
             TransferKind::Token { symbol, .. } => assert_eq!(symbol.as_deref(), Some("USDT")),
             other => panic!("expected Token kind, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_trc20_skips_unconfirmed_rows() {
+        // Tronscan can return `confirmed: false` rows (there's no `confirm=true`
+        // query param for this endpoint — see `endpoints::trc20_transfers`), and
+        // this source promises only solidified data, so these must be dropped.
+        let body = r#"{
+            "total": 1,
+            "token_transfers": [{
+                "transaction_id": "a044bddfa3be40af87f2011c74f0982fdd307bf0ba5c0966b6364368068090f9",
+                "block": 84407622,
+                "block_ts": 1783892910000,
+                "from_address": "TBedwuD4zRp6DsVJhKC9YSgVYCco6JtGBm",
+                "to_address": "TWd4WrZ9wn84f5x1hZhL4DHvk738ns5jwb",
+                "contract_address": "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t",
+                "quant": "1500000",
+                "confirmed": false,
+                "contractRet": "SUCCESS",
+                "tokenInfo": { "tokenAbbr": "USDT", "tokenDecimal": 6 }
+            }]
+        }"#;
+        let (transfers, _) = parse_trc20(body, Endpoint::Trc20.page_size()).expect("parse ok");
+        assert!(transfers.is_empty(), "unconfirmed trc20 rows must be skipped");
     }
 
     #[test]

@@ -85,6 +85,11 @@ pub struct Trc20Transfer {
     quant: String,
     #[serde(default, rename = "tokenInfo")]
     token_info: Trc20TokenInfo,
+    /// Solidified/confirmed flag. Checked client-side because `confirm=true`
+    /// can't be passed as a query param on this endpoint — see the doc
+    /// comment on `endpoints::trc20_transfers`.
+    #[serde(default)]
+    confirmed: bool,
 }
 
 impl Trc20Transfer {
@@ -114,6 +119,10 @@ impl Trc20Transfer {
 
     pub fn token_info(&self) -> &Trc20TokenInfo {
         &self.token_info
+    }
+
+    pub fn confirmed(&self) -> bool {
+        self.confirmed
     }
 }
 

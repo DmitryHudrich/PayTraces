@@ -28,9 +28,17 @@ pub fn transactions(address_b58: &str, start: u32, limit: u32, min_ts: Option<u6
 
 /// TRC20 transfer list for an address. Same ascending-sort rationale as
 /// `transactions` above.
+///
+/// Deliberately omits `confirm=true` — verified live against
+/// `apilist.tronscanapi.com` that this endpoint returns `{"total":0,...}`
+/// for *any* address once `confirm=true` is combined with `start_timestamp`/
+/// `end_timestamp` (and even without a time window at all), silently
+/// dropping every TRC20 transfer. The "only solidified data" guarantee this
+/// param exists for is instead enforced client-side in `map_trc20` via the
+/// row's own `confirmed` field.
 pub fn trc20_transfers(address_b58: &str, start: u32, limit: u32, min_ts: Option<u64>, max_ts: Option<u64>) -> String {
     let mut s = format!(
-        "/api/token_trc20/transfers?sort=timestamp&limit={limit}&start={start}&relatedAddress={address_b58}&confirm=true"
+        "/api/token_trc20/transfers?sort=timestamp&limit={limit}&start={start}&relatedAddress={address_b58}"
     );
     push_window(&mut s, min_ts, max_ts);
     s

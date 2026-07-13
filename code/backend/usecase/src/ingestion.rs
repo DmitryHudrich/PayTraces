@@ -537,10 +537,11 @@ where
             origin = %origin,
             nodes = nodes.len(),
             edges = edges.len(),
+            expanded = visited.len(),
             "DB-only graph build complete"
         );
 
-        Ok(TransferGraph::new(nodes, edges))
+        Ok(TransferGraph::new(nodes, edges).with_expanded(visited))
     }
 }
 

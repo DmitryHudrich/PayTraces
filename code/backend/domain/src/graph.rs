@@ -1,18 +1,45 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::ports::BlockRange;
 use crate::primitives::Address;
 use crate::transfer::Transfer;
 
+/// Per-node degree counts derived from a single pass over a `TransferGraph`'s
+/// edges. `tx_count` is deliberately not stored here — it's always
+/// `in_degree + out_degree`, computed by the caller so this stays a pure
+/// counter with no derived-field drift.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NodeDegree {
+    pub in_degree: u32,
+    pub out_degree: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct TransferGraph {
     nodes: HashSet<Address>,
     edges: Vec<Transfer>,
+    /// Addresses whose own transfer list was actually queried while
+    /// building this graph (as opposed to addresses merely discovered as
+    /// the counterparty of an edge). Defaults to every node — callers that
+    /// stop expanding early (BFS bounded by `max_depth`/`max_nodes`) should
+    /// call `with_expanded` with the narrower set they actually visited.
+    expanded: HashSet<Address>,
 }
 
 impl TransferGraph {
     pub fn new(nodes: HashSet<Address>, edges: Vec<Transfer>) -> Self {
-        Self { nodes, edges }
+        let expanded = nodes.clone();
+        Self { nodes, edges, expanded }
+    }
+
+    /// Narrows `expanded` to the addresses a bounded BFS actually visited —
+    /// the rest of `nodes` were only ever seen as an edge's counterparty
+    /// (ТЗ: "view boundary" — there may be more to see, just re-query with
+    /// wider `max_depth`/`max_nodes` or centered on that address; no ingest
+    /// needed to find out).
+    pub fn with_expanded(mut self, expanded: HashSet<Address>) -> Self {
+        self.expanded = expanded;
+        self
     }
 
     pub fn nodes(&self) -> &HashSet<Address> {
@@ -21,6 +48,14 @@ impl TransferGraph {
 
     pub fn edges(&self) -> &[Transfer] {
         &self.edges
+    }
+
+    pub fn expanded(&self) -> &HashSet<Address> {
+        &self.expanded
+    }
+
+    pub fn is_expanded(&self, addr: &Address) -> bool {
+        self.expanded.contains(addr)
     }
 
     pub fn neighbors_of(&self, addr: &Address) -> Vec<&Address> {
@@ -41,6 +76,18 @@ impl TransferGraph {
 
     pub fn incoming(&self, addr: &Address) -> Vec<&Transfer> {
         self.edges.iter().filter(|t| t.to() == addr).collect()
+    }
+
+    /// In/out degree for every node touched by `self.edges`, in one pass —
+    /// used to enrich `GET /graph` nodes without an extra DB round-trip
+    /// (the whole edge set for the page is already resident in memory).
+    pub fn degrees(&self) -> HashMap<Address, NodeDegree> {
+        let mut degrees: HashMap<Address, NodeDegree> = HashMap::new();
+        for t in &self.edges {
+            degrees.entry(t.from().clone()).or_default().out_degree += 1;
+            degrees.entry(t.to().clone()).or_default().in_degree += 1;
+        }
+        degrees
     }
 
     /// BFS shortest path from `from` to `to` over the undirected projection of

@@ -254,6 +254,57 @@ impl EntityRepository for PostgresEntityRepository {
         }
         Ok(entities)
     }
+
+    /// One round-trip for the whole address list: for each address, every
+    /// currently-active tag on its entity, sorted by `risk_score` descending
+    /// (ties broken by newest `created_at`). Order of the outer vector
+    /// matches `addrs`; an address with no entity or no active tag comes
+    /// back with an empty `Vec`. Same `UNNEST(...) + generate_subscripts`
+    /// idiom as `PostgresAddressKinds::kind_batch`, except
+    /// `entity_addresses.address` is hex `TEXT` here rather than `BYTEA`.
+    async fn active_tags_batch(&self, addrs: &[Address]) -> DomainResult<Vec<Vec<LabelTag>>> {
+        if addrs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let client = self.pool.get().await.map_err(pool_err)?;
+
+        let chain_ids: Vec<i32> = addrs.iter().map(|a| a.chain().value() as i32).collect();
+        let hex_addrs: Vec<String> = addrs.iter().map(|a| hex::encode(a.bytes())).collect();
+
+        let rows = client
+            .query(
+                "WITH inputs AS (
+                    SELECT unnest($1::INT[]) AS chain_id,
+                           unnest($2::TEXT[]) AS address,
+                           generate_subscripts($1::INT[], 1) AS ord
+                 ),
+                 matched AS (
+                    SELECT i.ord, ea.entity_id
+                    FROM inputs i
+                    JOIN entity_addresses ea
+                      ON ea.chain_id = i.chain_id AND ea.address = i.address
+                 )
+                 SELECT m.ord, lt.tag_id, lt.category, lt.label_name, lt.source,
+                        lt.source_detail, lt.confidence, lt.risk_score, lt.sanction_list,
+                        lt.active, lt.superseded_by, lt.created_at, lt.expires_at,
+                        lt.evidence_url
+                 FROM matched m
+                 JOIN label_tags lt ON lt.entity_id = m.entity_id
+                 WHERE lt.active = true AND (lt.expires_at IS NULL OR lt.expires_at > now())
+                 ORDER BY m.ord, lt.risk_score DESC, lt.created_at DESC",
+                &[&chain_ids, &hex_addrs],
+            )
+            .await
+            .map_err(pg_err)?;
+
+        let mut out: Vec<Vec<LabelTag>> = vec![Vec::new(); addrs.len()];
+        for row in &rows {
+            let ord: i32 = row.get("ord");
+            let idx = (ord - 1) as usize;
+            out[idx].push(row_to_tag(row)?);
+        }
+        Ok(out)
+    }
 }
 
 pub struct PostgresTagHistoryRepository {

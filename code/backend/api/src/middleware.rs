@@ -6,10 +6,16 @@ use crate::error::ApiError;
 use crate::state::AppState;
 
 const API_VERSION_HEADER: &str = "X-API-Version";
-const SUPPORTED_API_VERSION: &str = "1";
+const SUPPORTED_API_VERSIONS: &[&str] = &["1", "2"];
+
+/// Parsed `X-API-Version`, made available to handlers via request
+/// extensions so they can branch on response shape (e.g. `GET /graph`'s
+/// `nodes` field: flat strings on `1`, enriched `NodeDto` on `2`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApiVersion(pub u8);
 
 pub async fn version_middleware(
-    req: axum::extract::Request,
+    mut req: axum::extract::Request,
     next: Next,
 ) -> Result<axum::response::Response, ApiError> {
     match req
@@ -17,9 +23,14 @@ pub async fn version_middleware(
         .get(API_VERSION_HEADER)
         .and_then(|v| v.to_str().ok())
     {
-        Some(v) if v == SUPPORTED_API_VERSION => Ok(next.run(req).await),
+        Some(v) if SUPPORTED_API_VERSIONS.contains(&v) => {
+            let version: u8 = v.parse().expect("validated against SUPPORTED_API_VERSIONS");
+            req.extensions_mut().insert(ApiVersion(version));
+            Ok(next.run(req).await)
+        }
         Some(other) => Err(ApiError::bad_request(format!(
-            "unsupported {API_VERSION_HEADER}: {other}; supported: {SUPPORTED_API_VERSION}"
+            "unsupported {API_VERSION_HEADER}: {other}; supported: {}",
+            SUPPORTED_API_VERSIONS.join(", ")
         ))),
         None => Err(ApiError::bad_request(format!(
             "missing required header: {API_VERSION_HEADER}"

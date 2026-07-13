@@ -7,6 +7,7 @@ pub mod graph;
 pub mod heuristics;
 pub mod jobs;
 pub mod labels;
+pub mod nodes;
 pub mod path;
 pub mod sanctions;
 pub mod score;

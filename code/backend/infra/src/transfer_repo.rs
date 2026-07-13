@@ -341,6 +341,45 @@ impl TransferRepository for PostgresTransferRepository {
             .map_err(pg_err)?;
         Ok(affected)
     }
+
+    /// One round-trip for the whole address list via a batched `EXISTS`
+    /// check. Order of the returned vector matches `addrs`.
+    async fn touches_batch(&self, addrs: &[Address]) -> DomainResult<Vec<bool>> {
+        if addrs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let client = self.pool.get().await.map_err(pool_err)?;
+
+        let chain_ids: Vec<i32> = addrs.iter().map(|a| a.chain().value() as i32).collect();
+        let address_bytes: Vec<&[u8]> = addrs.iter().map(|a| a.bytes()).collect();
+
+        let rows = client
+            .query(
+                "WITH inputs AS (
+                    SELECT unnest($1::INT[]) AS chain_id,
+                           unnest($2::BYTEA[]) AS address,
+                           generate_subscripts($1::INT[], 1) AS ord
+                 )
+                 SELECT i.ord,
+                        EXISTS (
+                            SELECT 1 FROM transfers t
+                            WHERE t.chain_id = i.chain_id
+                              AND (t.from_addr = i.address OR t.to_addr = i.address)
+                        ) AS touched
+                 FROM inputs i
+                 ORDER BY i.ord",
+                &[&chain_ids, &address_bytes],
+            )
+            .await
+            .map_err(pg_err)?;
+
+        let mut out = vec![false; addrs.len()];
+        for row in &rows {
+            let ord: i32 = row.get("ord");
+            out[(ord - 1) as usize] = row.get("touched");
+        }
+        Ok(out)
+    }
 }
 
 impl PostgresTransferRepository {

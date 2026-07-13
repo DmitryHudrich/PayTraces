@@ -13,7 +13,7 @@ use crate::handlers::cluster::{ClusterResponse, __path_cluster_address};
 use crate::handlers::edges::{
     EdgeScoreDto, EdgeSignificanceResponse, __path_edge_significance_endpoint,
 };
-use crate::handlers::graph::{EdgeDto, GraphPage, __path_get_graph};
+use crate::handlers::graph::{EdgeDto, GraphPageV1, GraphPageV2, __path_get_graph};
 use crate::handlers::heuristics::{
     HeuristicEvidenceDto, HeuristicsResponse, __path_detect_heuristics,
 };
@@ -26,6 +26,7 @@ use crate::handlers::labels::{
     LabelsBulkResponse, TagPatchRequest, __path_labels_bulk, __path_labels_delete,
     __path_labels_delete_tag, __path_labels_get, __path_labels_patch_tag, __path_labels_set,
 };
+use crate::handlers::nodes::{NodeDto, NodesBatchResponse, TagDto, __path_nodes_batch};
 use crate::handlers::path::{PathEdgeDto, PathResponse, __path_shortest_path};
 use crate::handlers::sanctions::{SanctionTagDto, SanctionsResponse, __path_check_sanctions};
 use crate::handlers::score::{ScoreResponse, SignalDto, __path_score_address};
@@ -49,7 +50,9 @@ impl utoipa::Modify for ApiSecurity {
             "api_version",
             SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::with_description(
                 "X-API-Version",
-                "Required for every request. Supported value: `1`.",
+                "Required for every request. Supported values: `1`, `2`. `2` changes \
+                 `GET /graph`'s `nodes` field to enriched objects and unlocks \
+                 `GET /nodes/batch`; `1` keeps every response byte-for-byte as before.",
             ))),
         );
         components.add_security_scheme(
@@ -109,14 +112,17 @@ impl utoipa::Modify for ApiSecurity {
                        of this UI) lets you set both headers once per session.\n\n\
                        ---\n\n\
                        ## API versioning\n\n\
-                       Every request MUST carry an `X-API-Version: 1` header. Without \
-                       it the server returns `HTTP 400 missing required header`. With an \
+                       Every request MUST carry an `X-API-Version` header set to `1` or `2`. \
+                       Without it the server returns `HTTP 400 missing required header`. With an \
                        unsupported value it returns the same status with the supported \
-                       version listed. Only `/scalar` (this UI) and \
+                       versions listed. Only `/scalar` (this UI) and \
                        `/api-docs/openapi.json` (the raw spec) are exempt.\n\n\
                        This is a deliberately strict policy: it makes breaking schema \
                        changes safe to introduce on a new version while old clients \
-                       keep working on `v1`.\n\n\
+                       keep working on `v1`. Today the only version-dependent behaviour is \
+                       `GET /graph`'s `nodes` field (`GraphPageV1`'s flat `string[]` on `1` vs. \
+                       `GraphPageV2`'s enriched `NodeDto[]` on `2`) and `GET /nodes/batch`, which \
+                       requires `2`. Every other endpoint behaves identically on both.\n\n\
                        ---\n\n\
                        ## End-to-end workflow\n\n\
                        Most use cases follow the same shape: ingest first, then read.\n\n\
@@ -244,7 +250,7 @@ impl utoipa::Modify for ApiSecurity {
         ("api_key" = []),
     ),
     paths(
-        get_graph, score_address, check_sanctions, trace_funds, list_chains,
+        get_graph, nodes_batch, score_address, check_sanctions, trace_funds, list_chains,
         create_ingest_job, get_job_status,
         sanctions_batch, score_batch,
         detect_heuristics,
@@ -257,7 +263,7 @@ impl utoipa::Modify for ApiSecurity {
         labels_set, labels_get, labels_delete, labels_bulk, labels_patch_tag, labels_delete_tag,
     ),
     components(schemas(
-        GraphPage, EdgeDto,
+        GraphPageV1, GraphPageV2, EdgeDto, NodeDto, TagDto, NodesBatchResponse,
         ScoreResponse, SignalDto,
         SanctionsResponse, SanctionTagDto,
         TraceResponse, TraceStatsDto, SinkDto, PathDto,

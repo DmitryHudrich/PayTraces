@@ -176,6 +176,22 @@ pub trait TransferRepository: Send + Sync {
         from_block: u64,
         to_block: u64,
     ) -> DomainResult<u64>;
+
+    /// For each address (same order as input), whether *any* transfer in
+    /// this chain touches it (either side) — the "ingest boundary" signal
+    /// for `GET /graph` / `GET /nodes/batch`: `false` means nothing has ever
+    /// been persisted for this address, so the frontend should offer
+    /// `POST /jobs/ingest` rather than a plain re-query.
+    ///
+    /// Default impl loops `find_by_address` with `limit: 1`; Postgres
+    /// overrides with a single batched `EXISTS` query.
+    async fn touches_batch(&self, addrs: &[Address]) -> DomainResult<Vec<bool>> {
+        let mut out = Vec::with_capacity(addrs.len());
+        for a in addrs {
+            out.push(!self.find_by_address(a, None, None, 1).await?.is_empty());
+        }
+        Ok(out)
+    }
 }
 
 #[async_trait]
@@ -198,6 +214,27 @@ pub trait EntityRepository: Send + Sync {
     async fn upsert_tag(&self, entity_id: &EntityId, tag: &LabelTag) -> DomainResult<()>;
     /// Entities with at least one currently-active `Sanctioned` tag.
     async fn list_sanctioned(&self) -> DomainResult<Vec<Entity>>;
+
+    /// For each address (same order as input), every currently-active tag
+    /// on its entity (empty `Vec` where there's no entity or no active
+    /// tag), sorted by `risk_score` descending — used to enrich `GET /graph`
+    /// nodes and `GET /nodes/batch` without an N+1 `GET /labels/{addr}` per
+    /// node.
+    ///
+    /// Default impl loops `find_by_address`; Postgres overrides with a
+    /// single `UNNEST`-based query for the whole address list.
+    async fn active_tags_batch(&self, addrs: &[Address]) -> DomainResult<Vec<Vec<LabelTag>>> {
+        let mut out = Vec::with_capacity(addrs.len());
+        for a in addrs {
+            let mut tags: Vec<LabelTag> = match self.find_by_address(a).await? {
+                Some(entity) => entity.active_tags().cloned().collect(),
+                None => Vec::new(),
+            };
+            tags.sort_by_key(|t| std::cmp::Reverse(t.risk_score().value()));
+            out.push(tags);
+        }
+        Ok(out)
+    }
 }
 
 /// Append-only audit log for tag lifecycle events. Stored separately from
@@ -339,6 +376,16 @@ pub trait RiskPort: Send + Sync {
     async fn trace(&self, req: TraceRequest) -> DomainResult<TraceResult>;
 
     async fn score(&self, addr: &Address) -> DomainResult<RiskReport>;
+
+    /// Cache-only read of a previously-computed score — never runs the
+    /// trace/aggregation `score()` does, so it's safe to call from a hot,
+    /// never-block-on-heavy-compute path like `GET /graph`. `Ok(None)` means
+    /// either a cache miss or (for the default impl) no cache at all;
+    /// callers should treat that as "unknown, don't block for it" rather
+    /// than triggering `score()` themselves.
+    async fn peek_score(&self, _addr: &Address) -> DomainResult<Option<RiskReport>> {
+        Ok(None)
+    }
 
     async fn check_sanctions(&self, addr: &Address) -> DomainResult<SanctionsCheckResult>;
 

@@ -768,6 +768,10 @@ where
         Ok(report)
     }
 
+    async fn peek_score(&self, addr: &Address) -> DomainResult<Option<RiskReport>> {
+        Ok(self.score_cache.get(addr).await)
+    }
+
     #[tracing::instrument(skip(self, addr), fields(address = %crate::addr_hex(addr)))]
     async fn check_sanctions(&self, addr: &Address) -> DomainResult<SanctionsCheckResult> {
         if let Some(cached) = self.sanctions_cache.get(addr).await {

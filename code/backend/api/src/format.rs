@@ -4,7 +4,7 @@ use serde::{Deserialize, Deserializer};
 use crate::error::ApiError;
 use domain::chain::{ChainId, ChainRegistry};
 use domain::label_tag::{TagCategory, TagSource};
-use domain::primitives::{Address, U256};
+use domain::primitives::{Address, Confidence, U256};
 use domain::risk::RiskSignalKind;
 use domain::trace::SinkKind;
 use domain::transfer::TransferKind;
@@ -150,6 +150,18 @@ pub fn tag_category_str(c: TagCategory) -> &'static str {
         TagCategory::Mining => "mining",
         TagCategory::KnownService => "known_service",
         TagCategory::Unknown => "unknown",
+    }
+}
+
+/// Same thresholds as `domain::label_tag::confidence_weight` — kept in sync
+/// by hand since that one drives score aggregation and this one is purely
+/// display, but both should call the same tag "high" vs "confirmed".
+pub fn confidence_str(c: Confidence) -> &'static str {
+    match c.value() {
+        v if v >= Confidence::CERTAIN.value() => "confirmed",
+        v if v >= Confidence::HIGH.value() => "high",
+        v if v >= Confidence::MEDIUM.value() => "medium",
+        _ => "low",
     }
 }
 

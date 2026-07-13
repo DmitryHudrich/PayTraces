@@ -12,6 +12,7 @@ use usecase::{IngestionService, RiskService};
 pub struct AppState {
     ingestion: IngestionService<ChainSources, PostgresTransferRepository>,
     risk: RiskService<PostgresTransferRepository, PostgresEntityRepository>,
+    transfers: Arc<PostgresTransferRepository>,
     entities: Arc<PostgresEntityRepository>,
     tag_history: Arc<PostgresTagHistoryRepository>,
     tag_aggregation: TagAggregationStrategy,
@@ -32,6 +33,7 @@ impl AppState {
     pub fn new(
         ingestion: IngestionService<ChainSources, PostgresTransferRepository>,
         risk: RiskService<PostgresTransferRepository, PostgresEntityRepository>,
+        transfers: Arc<PostgresTransferRepository>,
         entities: Arc<PostgresEntityRepository>,
         tag_history: Arc<PostgresTagHistoryRepository>,
         tag_aggregation: TagAggregationStrategy,
@@ -49,6 +51,7 @@ impl AppState {
         Self {
             ingestion,
             risk,
+            transfers,
             entities,
             tag_history,
             tag_aggregation,
@@ -63,6 +66,10 @@ impl AppState {
             alerts,
             default_chain_id,
         }
+    }
+
+    pub fn transfers(&self) -> &PostgresTransferRepository {
+        &self.transfers
     }
 
     pub fn entities(&self) -> &PostgresEntityRepository {

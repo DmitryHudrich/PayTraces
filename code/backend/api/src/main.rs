@@ -44,6 +44,7 @@ use crate::handlers::labels::{
     LabelRequest, apply_label, labels_bulk, labels_delete, labels_delete_tag, labels_get,
     labels_patch_tag, labels_set,
 };
+use crate::handlers::nodes::nodes_batch;
 use crate::handlers::path::shortest_path;
 use crate::handlers::sanctions::check_sanctions;
 use crate::handlers::score::score_address;
@@ -124,6 +125,8 @@ async fn main() -> anyhow::Result<()> {
 
     let api_key = cfg.server().api_key().map(str::to_owned);
     let admin_api_key = cfg.server().admin_api_key().map(str::to_owned);
+    let transfers_repo: Arc<PostgresTransferRepository> =
+        Arc::new(PostgresTransferRepository::new(pool.clone()));
     let entities_repo: Arc<PostgresEntityRepository> =
         Arc::new(PostgresEntityRepository::new(pool.clone()));
     let tag_history_repo: Arc<PostgresTagHistoryRepository> =
@@ -237,6 +240,7 @@ async fn main() -> anyhow::Result<()> {
             cfg.score().clone().into_domain(),
         )
         .with_address_kinds(kinds_for_risk),
+        Arc::clone(&transfers_repo),
         Arc::clone(&entities_repo),
         Arc::clone(&tag_history_repo),
         tag_aggregation,
@@ -306,6 +310,7 @@ async fn main() -> anyhow::Result<()> {
     let public_routes = Router::<Arc<AppState>>::new()
         .route("/chains", get(list_chains))
         .route("/graph", get(get_graph))
+        .route("/nodes/batch", get(nodes_batch))
         .route("/score", get(score_address))
         .route("/score/batch", post(score_batch))
         .route("/sanctions", get(check_sanctions))

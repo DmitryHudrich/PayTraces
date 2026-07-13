@@ -11,7 +11,7 @@ use domain::trace::{TaintStrategy, TraceDirection, TraceLimits, TraceOrigin, Tra
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ApiError, ErrorResponse};
-use crate::format::{format_amount, parse_address, sink_kind_str};
+use crate::format::{format_amount, parse_address, sink_kind_str, tag_category_str};
 use crate::state::{AppState, resolve_chain_id};
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -32,6 +32,10 @@ pub struct SinkDto {
     tainted_amount: String,
     formatted: String,
     taint_ratio: f64,
+    /// Every active tag category on the sink's entity — a mixer that's
+    /// also sanctioned surfaces both flags here, unlike `kind` which only
+    /// names the single highest-risk one.
+    flags: Vec<String>,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -138,6 +142,7 @@ pub async fn trace_funds(
                 tainted_amount: s.tainted_amount().raw().to_string(),
                 formatted: format_amount(s.tainted_amount().raw(), s.tainted_amount().decimals()),
                 taint_ratio: s.taint_ratio().as_f64(),
+                flags: s.categories().iter().map(|c| tag_category_str(*c).to_string()).collect(),
             }
         })
         .collect();

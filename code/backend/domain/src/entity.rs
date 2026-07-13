@@ -1,5 +1,6 @@
+use crate::label_tag::{LabelTag, TagAggregationStrategy, aggregate_risk_score};
 use crate::primitives::{Address, Confidence};
-use std::collections::HashSet;
+use chrono::{DateTime, Utc};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EntityId(uuid::Uuid);
@@ -24,28 +25,10 @@ impl Default for EntityId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EntityCategory {
-    Exchange,
-    Mixer,
-    Bridge,
-    DefiProtocol,
-    Sanctioned { sanction_list: SanctionList },
-    Scam,
-    Gambling,
-    Darknet,
-    Mining,
-    Unknown,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SanctionList {
-    Ofac,
-    Eu,
-    Un,
-    Other(String),
-}
-
+/// A single free-text label resolved by an external, best-effort source
+/// (e.g. Tronscan's `addressTag`). Distinct from `LabelTag` — this is the
+/// raw "name + url + who said so" shape returned by `ports::LabelProvider`,
+/// not an entity-attached, lifecycle-managed tag.
 #[derive(Debug, Clone)]
 pub struct EntityLabel {
     name: String,
@@ -100,39 +83,56 @@ impl AddressKind {
     }
 }
 
+/// One address attached to an `Entity`, with when it was attached.
+#[derive(Debug, Clone)]
+pub struct AddressRef {
+    address: Address,
+    attached_at: DateTime<Utc>,
+}
+
+impl AddressRef {
+    pub fn new(address: Address, attached_at: DateTime<Utc>) -> Self {
+        Self { address, attached_at }
+    }
+
+    pub fn address(&self) -> &Address {
+        &self.address
+    }
+
+    pub fn attached_at(&self) -> DateTime<Utc> {
+        self.attached_at
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Entity {
     id: EntityId,
-    label: Option<EntityLabel>,
-    category: EntityCategory,
-    addresses: HashSet<Address>,
-    risk_score: RiskScore,
+    addresses: Vec<AddressRef>,
+    tags: Vec<LabelTag>,
+    created_at: DateTime<Utc>,
 }
 
 impl Entity {
-    pub fn new(category: EntityCategory, risk_score: RiskScore) -> Self {
+    pub fn new() -> Self {
         Self {
             id: EntityId::new(),
-            label: None,
-            category,
-            addresses: HashSet::new(),
-            risk_score,
+            addresses: Vec::new(),
+            tags: Vec::new(),
+            created_at: Utc::now(),
         }
     }
 
     pub fn from_parts(
         id: EntityId,
-        label: Option<EntityLabel>,
-        category: EntityCategory,
-        addresses: HashSet<Address>,
-        risk_score: RiskScore,
+        addresses: Vec<AddressRef>,
+        tags: Vec<LabelTag>,
+        created_at: DateTime<Utc>,
     ) -> Self {
         Self {
             id,
-            label,
-            category,
             addresses,
-            risk_score,
+            tags,
+            created_at,
         }
     }
 
@@ -140,32 +140,53 @@ impl Entity {
         &self.id
     }
 
-    pub fn label(&self) -> Option<&EntityLabel> {
-        self.label.as_ref()
+    pub fn created_at(&self) -> DateTime<Utc> {
+        self.created_at
     }
 
-    pub fn set_label(&mut self, label: EntityLabel) {
-        self.label = Some(label);
-    }
-
-    pub fn category(&self) -> &EntityCategory {
-        &self.category
-    }
-
-    pub fn addresses(&self) -> &HashSet<Address> {
+    pub fn addresses(&self) -> &[AddressRef] {
         &self.addresses
     }
 
-    pub fn risk_score(&self) -> RiskScore {
-        self.risk_score
+    pub fn add_address(&mut self, addr: Address) {
+        if !self.addresses.iter().any(|a| a.address() == &addr) {
+            self.addresses.push(AddressRef::new(addr, Utc::now()));
+        }
     }
 
-    pub fn add_address(&mut self, addr: Address) {
-        self.addresses.insert(addr);
+    pub fn remove_address(&mut self, addr: &Address) {
+        self.addresses.retain(|a| a.address() != addr);
     }
 
     pub fn contains(&self, addr: &Address) -> bool {
-        self.addresses.contains(addr)
+        self.addresses.iter().any(|a| a.address() == addr)
+    }
+
+    pub fn tags(&self) -> &[LabelTag] {
+        &self.tags
+    }
+
+    pub fn tags_mut(&mut self) -> &mut Vec<LabelTag> {
+        &mut self.tags
+    }
+
+    pub fn active_tags(&self) -> impl Iterator<Item = &LabelTag> + '_ {
+        let now = Utc::now();
+        self.tags.iter().filter(move |t| t.is_active_at(now))
+    }
+
+    pub fn add_tag(&mut self, tag: LabelTag) {
+        self.tags.push(tag);
+    }
+
+    pub fn aggregate_risk_score(&self, strategy: TagAggregationStrategy) -> RiskScore {
+        aggregate_risk_score(&self.tags, strategy, Utc::now())
+    }
+}
+
+impl Default for Entity {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

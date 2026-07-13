@@ -3,10 +3,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use domain::entity::{
-    AddressKind, ClusterEvidence, ClusteringHeuristic, EntityCategory, RiskScore, SanctionList,
-};
+use domain::entity::{AddressKind, ClusterEvidence, ClusteringHeuristic, RiskScore};
 use domain::error::DomainResult;
+use domain::label_tag::{TagAggregationStrategy, TagCategory};
 use domain::ports::{AddressKindRepository, EntityRepository, RiskPort, TransferRepository};
 use domain::primitives::{Address, Amount, Confidence, Ratio};
 use domain::risk::{RiskEvidence, RiskReport, RiskSignal, RiskSignalKind, SanctionsCheckResult};
@@ -175,6 +174,12 @@ pub struct ScoreConfig {
     /// Minimum fraction of inflow that must reach a sink for the sink to
     /// count as exposure. Percent (0–100). Default 5 = 5%.
     pub trace_min_amount_ratio_percent: u8,
+    /// Strategy used to collapse a sink entity's active tags into one
+    /// 0-100 `Sink::risk_score()` (`score.aggregate_strategy` in
+    /// config.yaml). Distinct from `aggregation` above, which collapses
+    /// *signals* for `/score` — this one collapses *tags* for a single
+    /// entity.
+    pub tag_aggregation: TagAggregationStrategy,
 }
 
 impl Default for ScoreConfig {
@@ -188,6 +193,7 @@ impl Default for ScoreConfig {
             trace_max_nodes: 200,
             trace_max_paths: 100,
             trace_min_amount_ratio_percent: 5,
+            tag_aggregation: TagAggregationStrategy::MaxActive,
         }
     }
 }
@@ -268,7 +274,7 @@ fn signal_key(s: &RiskSignal) -> SignalKey {
             }
             SignalKey::Kind(format!("{:?}", s.kind()))
         }
-        RiskEvidence::EntityCategory(cat) => SignalKey::Category(format!("{:?}", cat)),
+        RiskEvidence::Tag { category, .. } => SignalKey::Category(format!("{:?}", category)),
         RiskEvidence::TransactionPattern(p) => SignalKey::Pattern(p.clone()),
         RiskEvidence::Manual(m) => SignalKey::Manual(m.clone()),
     }
@@ -353,17 +359,19 @@ where
     /// deliberately excluded — those satellite addresses are exactly what
     /// clustering is meant to surface, not infrastructure noise to filter.
     async fn is_shared_infrastructure(&self, addr: &Address) -> DomainResult<bool> {
-        let entity = self.entities.find_by_address(addr).await?;
-        Ok(matches!(
-            entity.map(|e| e.category().clone()),
-            Some(
-                EntityCategory::Exchange
-                    | EntityCategory::Bridge
-                    | EntityCategory::DefiProtocol
-                    | EntityCategory::Mixer
-                    | EntityCategory::Mining
+        let Some(entity) = self.entities.find_by_address(addr).await? else {
+            return Ok(false);
+        };
+        Ok(entity.active_tags().any(|t| {
+            matches!(
+                t.category(),
+                TagCategory::Exchange
+                    | TagCategory::Bridge
+                    | TagCategory::DefiProtocol
+                    | TagCategory::Mixer
+                    | TagCategory::Mining
             )
-        ))
+        }))
     }
 
     /// Is `addr` a smart contract? Used to keep clustering heuristics that
@@ -640,29 +648,34 @@ where
         let mut signals: Vec<RiskSignal> = Vec::new();
 
         if let Some(entity) = self.entities.find_by_address(addr).await? {
+            let active_count = entity.active_tags().count();
             tracing::debug!(
                 address = %crate::addr_hex(addr),
-                category = ?entity.category(),
-                "direct entity label found"
+                active_tags = active_count,
+                "direct entity tags found"
             );
-            let (severity, kind) = match entity.category() {
-                EntityCategory::Sanctioned { .. } => {
-                    (RiskScore::CRITICAL, RiskSignalKind::SanctionedCounterparty)
-                }
-                EntityCategory::Mixer => (RiskScore::HIGH, RiskSignalKind::MixerInteraction),
-                EntityCategory::Darknet => (RiskScore::CRITICAL, RiskSignalKind::DarknetMarket),
-                EntityCategory::Scam => (RiskScore::HIGH, RiskSignalKind::DirectExposure),
-                _ => (RiskScore::LOW, RiskSignalKind::DirectExposure),
-            };
-            signals.push(RiskSignal::new(
-                kind,
-                severity,
-                format!(
-                    "Address is labelled: {}",
-                    entity.label().map(|l| l.name()).unwrap_or("unknown")
-                ),
-                RiskEvidence::EntityCategory(entity.category().clone()),
-            ));
+            for tag in entity.active_tags() {
+                let kind = match tag.category() {
+                    TagCategory::Sanctioned => RiskSignalKind::SanctionedCounterparty,
+                    TagCategory::Mixer => RiskSignalKind::MixerInteraction,
+                    TagCategory::Darknet => RiskSignalKind::DarknetMarket,
+                    TagCategory::Scam => RiskSignalKind::DirectExposure,
+                    _ => RiskSignalKind::DirectExposure,
+                };
+                signals.push(RiskSignal::new(
+                    kind,
+                    tag.risk_score(),
+                    format!(
+                        "Address is labelled: {} ({:?})",
+                        tag.label_name().unwrap_or("unknown"),
+                        tag.category()
+                    ),
+                    RiskEvidence::Tag {
+                        tag_id: tag.tag_id(),
+                        category: tag.category(),
+                    },
+                ));
+            }
         }
 
         // Internal trace knobs are now config-driven so operators can tune
@@ -764,26 +777,22 @@ where
         tracing::debug!(address = %crate::addr_hex(addr), "sanctions check");
         let entity = self.entities.find_by_address(addr).await?;
 
-        let (is_sanctioned, sanction_list, label) = match entity {
-            Some(e) => {
-                let list: Option<SanctionList> =
-                    if let EntityCategory::Sanctioned { sanction_list } = e.category() {
-                        Some(sanction_list.clone())
-                    } else {
-                        None
-                    };
-                let label = e.label().map(|l| l.name().to_string());
-                (list.is_some(), list, label)
-            }
-            None => (false, None, None),
-        };
+        let sanction_tags: Vec<_> = entity
+            .map(|e| {
+                e.active_tags()
+                    .filter(|t| t.category() == TagCategory::Sanctioned)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
 
         tracing::debug!(
             address = %crate::addr_hex(addr),
-            is_sanctioned,
+            is_sanctioned = !sanction_tags.is_empty(),
+            sanction_tags = sanction_tags.len(),
             "sanctions check result"
         );
-        let result = SanctionsCheckResult::new(addr.clone(), is_sanctioned, sanction_list, label);
+        let result = SanctionsCheckResult::new(addr.clone(), sanction_tags);
         self.sanctions_cache
             .insert(addr.clone(), result.clone())
             .await;
@@ -1385,27 +1394,38 @@ where
     ) -> DomainResult<Sink> {
         let ratio = tainted.ratio_of(&total);
 
-        let kind = match self.entities.find_by_address(addr).await? {
-            Some(entity) => match entity.category() {
-                EntityCategory::Exchange => SinkKind::Exchange {
-                    name: entity
-                        .label()
-                        .map(|l| l.name().to_string())
-                        .unwrap_or_default(),
-                    requires_subpoena: true,
-                },
-                EntityCategory::Bridge => SinkKind::Bridge {
-                    destination_chain: None,
-                },
-                EntityCategory::Mixer => SinkKind::Mixer,
-                EntityCategory::Sanctioned { .. } => SinkKind::Sanctioned,
-                EntityCategory::Darknet => SinkKind::Darknet,
-                _ => SinkKind::Unresolved,
-            },
-            None => SinkKind::Unresolved,
+        let (kind, categories, risk_score) = match self.entities.find_by_address(addr).await? {
+            Some(entity) => {
+                let categories: Vec<TagCategory> =
+                    entity.active_tags().map(|t| t.category()).collect();
+                // Highest-risk active tag drives the legacy single-variant
+                // `SinkKind` (kept for existing display code) — `categories`
+                // above carries the full set so e.g. mixer+sanctioned both
+                // surface in `SinkDto.flags`.
+                let primary = entity
+                    .active_tags()
+                    .max_by_key(|t| t.risk_score().value())
+                    .map(|t| (t.category(), t.label_name().unwrap_or_default().to_string()));
+                let kind = match primary {
+                    Some((TagCategory::Exchange, name)) => SinkKind::Exchange {
+                        name,
+                        requires_subpoena: true,
+                    },
+                    Some((TagCategory::Bridge, _)) => SinkKind::Bridge {
+                        destination_chain: None,
+                    },
+                    Some((TagCategory::Mixer, _)) => SinkKind::Mixer,
+                    Some((TagCategory::Sanctioned, _)) => SinkKind::Sanctioned,
+                    Some((TagCategory::Darknet, _)) => SinkKind::Darknet,
+                    _ => SinkKind::Unresolved,
+                };
+                let risk_score = entity.aggregate_risk_score(self.score_cfg.tag_aggregation).value();
+                (kind, categories, risk_score)
+            }
+            None => (SinkKind::Unresolved, Vec::new(), 20),
         };
 
-        Ok(Sink::new(addr.clone(), kind, tainted, ratio))
+        Ok(Sink::new(addr.clone(), kind, categories, risk_score, tainted, ratio))
     }
 }
 
@@ -1753,14 +1773,22 @@ mod heuristics_tests {
         async fn find_by_address(&self, _addr: &Address) -> DomainResult<Option<Entity>> {
             Ok(None)
         }
-        async fn find_by_label(
+        async fn find_active_tag(
             &self,
-            _category: &domain::entity::EntityCategory,
-            _label_name: &str,
-        ) -> DomainResult<Option<Entity>> {
+            _entity_id: &EntityId,
+            _category: TagCategory,
+            _source: &domain::label_tag::TagSource,
+        ) -> DomainResult<Option<domain::label_tag::LabelTag>> {
             Ok(None)
         }
-        async fn save(&self, _entity: &Entity) -> DomainResult<()> {
+        async fn save_entity(&self, _entity: &Entity) -> DomainResult<()> {
+            Ok(())
+        }
+        async fn upsert_tag(
+            &self,
+            _entity_id: &EntityId,
+            _tag: &domain::label_tag::LabelTag,
+        ) -> DomainResult<()> {
             Ok(())
         }
         async fn list_sanctioned(&self) -> DomainResult<Vec<Entity>> {
@@ -2073,7 +2101,7 @@ mod heuristics_tests {
 
     struct LabelledEntities {
         addr: Address,
-        category: EntityCategory,
+        category: TagCategory,
     }
 
     #[async_trait]
@@ -2083,21 +2111,39 @@ mod heuristics_tests {
         }
         async fn find_by_address(&self, addr: &Address) -> DomainResult<Option<Entity>> {
             if addr == &self.addr {
-                let mut e = Entity::new(self.category.clone(), RiskScore::MEDIUM);
+                let mut e = Entity::new();
                 e.add_address(addr.clone());
+                e.add_tag(domain::label_tag::LabelTag::new(
+                    self.category,
+                    None,
+                    domain::label_tag::TagSource::InternalAnalyst,
+                    Confidence::MEDIUM,
+                    RiskScore::MEDIUM,
+                    None,
+                    None,
+                    None,
+                ));
                 Ok(Some(e))
             } else {
                 Ok(None)
             }
         }
-        async fn find_by_label(
+        async fn find_active_tag(
             &self,
-            _category: &EntityCategory,
-            _label_name: &str,
-        ) -> DomainResult<Option<Entity>> {
+            _entity_id: &EntityId,
+            _category: TagCategory,
+            _source: &domain::label_tag::TagSource,
+        ) -> DomainResult<Option<domain::label_tag::LabelTag>> {
             Ok(None)
         }
-        async fn save(&self, _entity: &Entity) -> DomainResult<()> {
+        async fn save_entity(&self, _entity: &Entity) -> DomainResult<()> {
+            Ok(())
+        }
+        async fn upsert_tag(
+            &self,
+            _entity_id: &EntityId,
+            _tag: &domain::label_tag::LabelTag,
+        ) -> DomainResult<()> {
             Ok(())
         }
         async fn list_sanctioned(&self) -> DomainResult<Vec<Entity>> {
@@ -2190,7 +2236,7 @@ mod heuristics_tests {
             repo,
             LabelledEntities {
                 addr: deposit.clone(),
-                category: EntityCategory::Exchange,
+                category: TagCategory::Exchange,
             },
             HeuristicsConfig::default(),
         );
@@ -2301,7 +2347,7 @@ mod heuristics_tests {
             repo,
             LabelledEntities {
                 addr: hub.clone(),
-                category: EntityCategory::Exchange,
+                category: TagCategory::Exchange,
             },
             HeuristicsConfig {
                 min_fanout: 5,
@@ -2390,6 +2436,8 @@ mod score_config_tests {
         let sink = Sink::new(
             sink_addr,
             SinkKind::Mixer,
+            vec![TagCategory::Mixer],
+            90,
             domain::primitives::Amount::new(domain::primitives::U256::zero(), 18),
             domain::primitives::Ratio::ONE,
         );

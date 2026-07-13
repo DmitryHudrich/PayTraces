@@ -1,9 +1,10 @@
 use crate::asset::{AssetId, AssetMeta};
 use crate::chain::ChainId;
-use crate::entity::{ClusterEvidence, Entity, EntityCategory, EntityId};
+use crate::entity::{ClusterEvidence, Entity, EntityId};
 use crate::error::DomainResult;
 use crate::graph::{GraphRequest, TransferGraph};
-use crate::primitives::{Address, BlockRef};
+use crate::label_tag::{LabelTag, TagCategory, TagHistoryEvent, TagId, TagSource};
+use crate::primitives::{Address, BlockRef, Confidence};
 use crate::risk::{RiskReport, SanctionsCheckResult};
 use crate::trace::{TraceRequest, TraceResult};
 use crate::transfer::{NormalizedBlock, Transfer};
@@ -181,15 +182,53 @@ pub trait TransferRepository: Send + Sync {
 pub trait EntityRepository: Send + Sync {
     async fn find_by_id(&self, id: &EntityId) -> DomainResult<Option<Entity>>;
     async fn find_by_address(&self, addr: &Address) -> DomainResult<Option<Entity>>;
-    /// Find an entity by exact `(category, label.name)` match — used by the
-    /// labels API to merge a new address into an existing labelled cluster.
-    async fn find_by_label(
+    /// Active tag on `entity_id` matching `(category, source)` exactly —
+    /// used by the tag-resolution rules to decide update-in-place vs.
+    /// auto-supersede vs. independent-new-tag.
+    async fn find_active_tag(
         &self,
-        category: &EntityCategory,
-        label_name: &str,
-    ) -> DomainResult<Option<Entity>>;
-    async fn save(&self, entity: &Entity) -> DomainResult<()>;
+        entity_id: &EntityId,
+        category: TagCategory,
+        source: &TagSource,
+    ) -> DomainResult<Option<LabelTag>>;
+    /// Persists the entity's id + address set only. Tags are written via
+    /// `upsert_tag`, not this method.
+    async fn save_entity(&self, entity: &Entity) -> DomainResult<()>;
+    /// Insert a new tag or update an existing one (matched by `tag_id`).
+    async fn upsert_tag(&self, entity_id: &EntityId, tag: &LabelTag) -> DomainResult<()>;
+    /// Entities with at least one currently-active `Sanctioned` tag.
     async fn list_sanctioned(&self) -> DomainResult<Vec<Entity>>;
+}
+
+/// Append-only audit log for tag lifecycle events. Stored separately from
+/// `Entity`/`LabelTag` — never mutated or pruned by application code.
+#[async_trait]
+pub trait TagHistoryRepository: Send + Sync {
+    async fn append(&self, event: &TagHistoryEvent) -> DomainResult<()>;
+    async fn history_for_tag(&self, tag_id: &TagId) -> DomainResult<Vec<TagHistoryEvent>>;
+    async fn history_for_entity(&self, entity_id: &EntityId) -> DomainResult<Vec<TagHistoryEvent>>;
+}
+
+/// One tag candidate resolved by an external, best-effort label source
+/// (Tronscan `addressTag`, eth-labels.com, ...). Not yet attached to an
+/// entity — the auto-tagging usecase runs these through the same
+/// resolution rules as `POST /labels`.
+#[derive(Debug, Clone)]
+pub struct ExternalTagCandidate {
+    pub category: TagCategory,
+    pub label_name: Option<String>,
+    pub raw_label: String,
+    pub source: TagSource,
+    pub confidence: Confidence,
+    pub evidence_url: Option<String>,
+}
+
+/// Chain-scoped external tag source for automatic enrichment during
+/// ingestion. One address can yield zero, one, or many candidates (e.g.
+/// eth-labels.com returns one row per matched taxonomy slug).
+#[async_trait]
+pub trait TagProvider: Send + Sync {
+    async fn resolve_tags(&self, addr: &Address) -> DomainResult<Vec<ExternalTagCandidate>>;
 }
 
 #[async_trait]

@@ -17,6 +17,10 @@ pub struct SignalDto {
     kind: String,
     severity: u8,
     description: String,
+    /// The specific `LabelTag` that produced this signal, when the
+    /// evidence traces back to one (ТЗ §7) — lets an investigator jump
+    /// straight from a signal to the tag behind it via `GET /labels/{addr}`.
+    tag_id: Option<String>,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -96,6 +100,10 @@ pub(crate) fn report_to_dto(report: &domain::risk::RiskReport) -> ScoreResponse 
             kind: signal_kind_str(s.kind()).into(),
             severity: s.severity().value(),
             description: s.description().to_string(),
+            tag_id: match s.evidence() {
+                domain::risk::RiskEvidence::Tag { tag_id, .. } => Some(tag_id.value().to_string()),
+                _ => None,
+            },
         })
         .collect();
 

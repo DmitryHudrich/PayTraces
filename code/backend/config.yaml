@@ -231,9 +231,37 @@ score:
   trace_max_nodes: 200
   trace_max_paths: 100
   trace_min_amount_ratio_percent: 5  # min % of inflow that must reach a sink for it to count
+  # Strategy for collapsing an entity's active LabelTags into one 0-100
+  # score (Entity Tags aggregate_risk_score, ТЗ §5). Distinct from
+  # `aggregation` above, which collapses /score *signals*, not an
+  # entity's *tags*:
+  #   max_active         — max risk_score among active tags (default).
+  #   weighted_sum        — sum of risk_score * confidence_weight, capped at 100.
+  #   max_confirmed_only — max risk_score among Confidence::Confirmed tags only.
+  aggregate_strategy: max_active
 
 labels:
   bootstrap_file: "api/examples/wallet_labels.jsonc"         # absolute/relative path to JSON array of LabelRequest objects loaded at startup
+
+# Automatic Entity Tags enrichment during ingestion (usecase::AutoTagging).
+# For each address touched by a freshly-ingested batch that has no active
+# tag yet, the chain-appropriate provider below is queried and any hits are
+# applied via the same resolution rules as POST /labels, tagged with
+# source: third_party. Best-effort — provider failures are logged and
+# never fail ingestion.
+auto_tagging:
+  enabled: true
+
+# Public, unauthenticated EVM label dataset (https://eth-labels.com,
+# https://github.com/dawsbot/eth-labels). Used by auto_tagging for every
+# EVM chain in `chains: [...]`; Tron (chain 195) instead reuses TronGrid's
+# addressTag (see trongrid: above) — eth-labels.com doesn't cover Tron.
+eth_labels:
+  enabled: true
+  base_url: "https://eth-labels.com"
+  requests_per_second: 5.0
+  cache_ttl_secs: 86400      # how long a resolved (chain, address) result is cached
+  cache_max_capacity: 50000
 
 api:
   # Chain id used when a request omits chain_id (e.g. GET /score?address=...).

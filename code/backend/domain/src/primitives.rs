@@ -206,7 +206,7 @@ impl TxRef {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Confidence(u8);
 
 impl Confidence {

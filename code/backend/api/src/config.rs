@@ -482,6 +482,12 @@ pub struct ScoreConfigFile {
     pub trace_max_paths: usize,
     #[serde(default = "ScoreConfigFile::default_trace_min_amount_ratio_percent")]
     pub trace_min_amount_ratio_percent: u8,
+    /// Strategy for collapsing an entity's active `LabelTag`s into one
+    /// 0-100 score: `max_active` (default), `weighted_sum`, or
+    /// `max_confirmed_only`. Distinct from `aggregation` above, which
+    /// collapses `/score` *signals*, not an entity's *tags*.
+    #[serde(default = "ScoreConfigFile::default_aggregate_strategy")]
+    pub aggregate_strategy: String,
 }
 
 impl Default for ScoreConfigFile {
@@ -495,6 +501,7 @@ impl Default for ScoreConfigFile {
             trace_max_nodes: Self::default_trace_max_nodes(),
             trace_max_paths: Self::default_trace_max_paths(),
             trace_min_amount_ratio_percent: Self::default_trace_min_amount_ratio_percent(),
+            aggregate_strategy: Self::default_aggregate_strategy(),
         }
     }
 }
@@ -524,6 +531,9 @@ impl ScoreConfigFile {
     fn default_trace_min_amount_ratio_percent() -> u8 {
         5
     }
+    fn default_aggregate_strategy() -> String {
+        "max_active".into()
+    }
 
     pub fn into_domain(self) -> usecase::risk::ScoreConfig {
         let aggregation = match self.aggregation.to_ascii_lowercase().as_str() {
@@ -539,6 +549,20 @@ impl ScoreConfigFile {
                 usecase::risk::ScoreAggregation::WeightedCount
             }
         };
+        let tag_aggregation = match self.aggregate_strategy.to_ascii_lowercase().as_str() {
+            "max_active" | "max-active" => domain::label_tag::TagAggregationStrategy::MaxActive,
+            "weighted_sum" | "weighted-sum" => domain::label_tag::TagAggregationStrategy::WeightedSum,
+            "max_confirmed_only" | "max-confirmed-only" => {
+                domain::label_tag::TagAggregationStrategy::MaxConfirmedOnly
+            }
+            other => {
+                tracing::warn!(
+                    aggregate_strategy = other,
+                    "unknown score.aggregate_strategy, falling back to max_active"
+                );
+                domain::label_tag::TagAggregationStrategy::MaxActive
+            }
+        };
         usecase::risk::ScoreConfig {
             aggregation,
             count_bonus_weight: self.count_bonus_weight,
@@ -548,6 +572,7 @@ impl ScoreConfigFile {
             trace_max_nodes: self.trace_max_nodes,
             trace_max_paths: self.trace_max_paths,
             trace_min_amount_ratio_percent: self.trace_min_amount_ratio_percent,
+            tag_aggregation,
         }
     }
 }
@@ -1397,6 +1422,10 @@ pub struct AppConfig {
     #[serde(default)]
     labels: LabelsConfigFile,
     #[serde(default)]
+    auto_tagging: AutoTaggingConfigFile,
+    #[serde(default)]
+    eth_labels: EthLabelsConfigFile,
+    #[serde(default)]
     ingestion: IngestionConfigFile,
     #[serde(default)]
     api: ApiConfig,
@@ -1515,6 +1544,75 @@ impl LabelsConfigFile {
     }
 }
 
+/// Toggle for the ingestion-time Entity Tags auto-enrichment pass
+/// (`usecase::AutoTagging`, wired against `eth_labels:` for EVM chains and
+/// TronGrid's `addressTag` for chain 195). Off by default in case an
+/// operator wants ingestion to stay purely local/deterministic.
+#[derive(Deserialize, Debug, Clone)]
+pub struct AutoTaggingConfigFile {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl Default for AutoTaggingConfigFile {
+    fn default() -> Self {
+        Self { enabled: false }
+    }
+}
+
+/// Public, unauthenticated EVM label dataset (https://eth-labels.com) used
+/// by auto-tagging for every EVM chain. See `infra::eth_labels_source` for
+/// the taxonomy-slug → `TagCategory` mapping.
+#[derive(Deserialize, Debug, Clone)]
+pub struct EthLabelsConfigFile {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "EthLabelsConfigFile::default_base_url")]
+    pub base_url: String,
+    #[serde(default = "EthLabelsConfigFile::default_requests_per_second")]
+    pub requests_per_second: f64,
+    #[serde(default = "EthLabelsConfigFile::default_cache_ttl_secs")]
+    pub cache_ttl_secs: u64,
+    #[serde(default = "EthLabelsConfigFile::default_cache_max_capacity")]
+    pub cache_max_capacity: u64,
+}
+
+impl EthLabelsConfigFile {
+    fn default_base_url() -> String {
+        "https://eth-labels.com".to_string()
+    }
+    fn default_requests_per_second() -> f64 {
+        5.0
+    }
+    fn default_cache_ttl_secs() -> u64 {
+        86_400
+    }
+    fn default_cache_max_capacity() -> u64 {
+        50_000
+    }
+
+    pub fn into_domain(self) -> infra::EthLabelsConfig {
+        infra::EthLabelsConfig::new(
+            Some(self.base_url),
+            Some(self.requests_per_second),
+            Some(self.cache_ttl_secs),
+            Some(self.cache_max_capacity),
+        )
+    }
+}
+
+impl Default for EthLabelsConfigFile {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: Self::default_base_url(),
+            requests_per_second: Self::default_requests_per_second(),
+            cache_ttl_secs: Self::default_cache_ttl_secs(),
+            cache_max_capacity: Self::default_cache_max_capacity(),
+        }
+    }
+}
+
 impl AppConfig {
     pub fn server(&self) -> &ServerConfig {
         &self.server
@@ -1562,6 +1660,14 @@ impl AppConfig {
 
     pub fn labels(&self) -> &LabelsConfigFile {
         &self.labels
+    }
+
+    pub fn auto_tagging(&self) -> &AutoTaggingConfigFile {
+        &self.auto_tagging
+    }
+
+    pub fn eth_labels(&self) -> &EthLabelsConfigFile {
+        &self.eth_labels
     }
 
     pub fn ingestion(&self) -> &IngestionConfigFile {

@@ -10,11 +10,24 @@ use domain::graph::{GraphRequest, TransferGraph};
 use domain::entity::AddressKind;
 use domain::ports::{
     AddressKindRepository, Alert, AlertSink, BlockRange, ChainSource, ChainSourceRegistry,
-    IngestionPort, PricePort, TransferCursor, TransferRepository, WatchlistRepository,
+    EntityRepository, IngestionPort, PricePort, TagHistoryRepository, TagProvider,
+    TransferCursor, TransferRepository, WatchlistRepository,
 };
 use domain::primitives::Address;
 use domain::transfer::Transfer;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+use crate::labels::{TagApplyInput, apply_tag};
+
+/// Chain-scoped external tag sources + the repos needed to apply what they
+/// find, wired in via `IngestionService::with_auto_tagging`. Best-effort:
+/// every failure is logged and swallowed so a flaky third-party API never
+/// fails ingestion itself.
+pub struct AutoTagging {
+    pub providers: HashMap<ChainId, Arc<dyn TagProvider>>,
+    pub entities: Arc<dyn EntityRepository>,
+    pub history: Arc<dyn TagHistoryRepository>,
+}
 
 /// Adaptive limiter for concurrent `transfers_for_address` calls.
 ///
@@ -139,6 +152,7 @@ pub struct IngestionService<S, R> {
     watchlist: Option<Arc<dyn WatchlistRepository>>,
     alerts: Option<Arc<dyn AlertSink>>,
     address_kinds: Option<Arc<dyn AddressKindRepository>>,
+    auto_tagging: Option<AutoTagging>,
     transfers_gate: Arc<AdaptiveConcurrency>,
     classify_chain_batch_size: usize,
 }
@@ -153,6 +167,7 @@ impl<S, R> IngestionService<S, R> {
             watchlist: None,
             alerts: None,
             address_kinds: None,
+            auto_tagging: None,
             transfers_gate: Arc::new(AdaptiveConcurrency::transfers_default()),
             // 100 fits inside Alchemy's batch limit and typical Postgres
             // ARRAY parameter sizes comfortably. Tunable via config.
@@ -172,6 +187,11 @@ impl<S, R> IngestionService<S, R> {
 
     pub fn with_address_kinds(mut self, kinds: Arc<dyn AddressKindRepository>) -> Self {
         self.address_kinds = Some(kinds);
+        self
+    }
+
+    pub fn with_auto_tagging(mut self, auto_tagging: AutoTagging) -> Self {
+        self.auto_tagging = Some(auto_tagging);
         self
     }
 
@@ -310,6 +330,68 @@ async fn classify_address_kinds(
         elapsed_ms,
         "address kinds classified"
     );
+}
+
+/// Best-effort auto-enrichment: for each address touched by this batch that
+/// has a `TagProvider` registered for its chain and no active tag yet,
+/// resolve external candidates and apply them through the same
+/// `apply_tag` resolution rules `POST /labels` uses (source is
+/// `ThirdParty(...)`, so it never fights a manually-applied tag — per the
+/// resolution rules a different source on the same category just
+/// coexists). Every failure is logged at DEBUG and skipped; this must
+/// never fail ingestion itself.
+async fn auto_tag_addresses(auto_tagging: Option<&AutoTagging>, fetched: &[Transfer]) {
+    let Some(cfg) = auto_tagging else { return };
+
+    let mut seen: HashSet<Address> = HashSet::new();
+    for t in fetched {
+        seen.insert(t.from().clone());
+        seen.insert(t.to().clone());
+    }
+
+    for addr in seen {
+        let Some(provider) = cfg.providers.get(&addr.chain()) else {
+            continue;
+        };
+
+        match cfg.entities.find_by_address(&addr).await {
+            Ok(Some(entity)) if entity.active_tags().next().is_some() => continue,
+            Ok(_) => {}
+            Err(e) => {
+                tracing::debug!(address = %addr, error = %e, "auto-tag: entity lookup failed, skipping");
+                continue;
+            }
+        }
+
+        let candidates = match provider.resolve_tags(&addr).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(address = %addr, error = %e, "auto-tag: provider lookup failed, skipping");
+                continue;
+            }
+        };
+        if candidates.is_empty() {
+            continue;
+        }
+
+        let count = candidates.len();
+        for candidate in candidates {
+            let input = TagApplyInput {
+                category: candidate.category,
+                label_name: candidate.label_name.or(Some(candidate.raw_label)),
+                source: candidate.source,
+                confidence: candidate.confidence,
+                risk_score: crate::labels::default_risk_for(candidate.category),
+                sanction_list: None,
+                expires_at: None,
+                evidence_url: candidate.evidence_url,
+            };
+            if let Err(e) = apply_tag(cfg.entities.as_ref(), cfg.history.as_ref(), &addr, input).await {
+                tracing::debug!(address = %addr, error = %e, "auto-tag: apply_tag failed");
+            }
+        }
+        tracing::debug!(address = %addr, tags = count, "auto-tag: applied external candidates");
+    }
 }
 
 async fn enrich_and_alert(
@@ -629,6 +711,7 @@ where
                                 self.classify_chain_batch_size,
                             )
                             .await;
+                            auto_tag_addresses(self.auto_tagging.as_ref(), &fetched).await;
                         }
                     }
                     Err(e) => {

@@ -4,7 +4,7 @@ use axum::{
     Router,
     middleware::{from_fn, from_fn_with_state},
     response::Redirect,
-    routing::{get, post},
+    routing::{get, patch, post},
 };
 use clap::Parser;
 use tower_http::trace::TraceLayer;
@@ -16,7 +16,8 @@ use crate::config::{AppConfig, Cli};
 use domain::chain::{ChainId, ChainRegistry};
 use infra::{
     JobRepository, PostgresAddressKinds, PostgresAlerts, PostgresEntityRepository,
-    PostgresTransferRepository, PostgresWatchlist, StaticLabelProvider, StaticPriceProvider,
+    PostgresTagHistoryRepository, PostgresTransferRepository, PostgresWatchlist,
+    StaticLabelProvider, StaticPriceProvider, TronGridSource,
 };
 use usecase::{AdaptiveConcurrency, IngestionService, RiskService};
 
@@ -40,7 +41,8 @@ use crate::handlers::graph::get_graph;
 use crate::handlers::heuristics::detect_heuristics;
 use crate::handlers::jobs::{create_ingest_job, get_job_status};
 use crate::handlers::labels::{
-    LabelRequest, apply_label, labels_bulk, labels_delete, labels_get, labels_set,
+    LabelRequest, apply_label, labels_bulk, labels_delete, labels_delete_tag, labels_get,
+    labels_patch_tag, labels_set,
 };
 use crate::handlers::path::shortest_path;
 use crate::handlers::sanctions::check_sanctions;
@@ -124,6 +126,9 @@ async fn main() -> anyhow::Result<()> {
     let admin_api_key = cfg.server().admin_api_key().map(str::to_owned);
     let entities_repo: Arc<PostgresEntityRepository> =
         Arc::new(PostgresEntityRepository::new(pool.clone()));
+    let tag_history_repo: Arc<PostgresTagHistoryRepository> =
+        Arc::new(PostgresTagHistoryRepository::new(pool.clone()));
+    let tag_aggregation = cfg.score().clone().into_domain().tag_aggregation;
 
     let prices: Arc<StaticPriceProvider> = Arc::new(StaticPriceProvider::with_defaults());
     let labels: Arc<StaticLabelProvider> = Arc::new(StaticLabelProvider::new());
@@ -145,6 +150,52 @@ async fn main() -> anyhow::Result<()> {
     let kinds_for_risk: Arc<dyn domain::ports::AddressKindRepository> =
         Arc::clone(&address_kinds) as _;
 
+    // Entity Tags auto-enrichment (ТЗ: "автоматически тянуть лейблы из
+    // tronscan и etherscan"). eth-labels.com covers every EVM chain via one
+    // shared client; Tron reuses TronGrid's addressTag through a dedicated
+    // `TronGridSource` instance (independent rate-limit/cache state from
+    // the one ingestion uses for transfers — auto-tagging traffic is low
+    // volume, so that's an acceptable tradeoff for the simpler wiring).
+    let mut tag_providers: std::collections::HashMap<ChainId, Arc<dyn domain::ports::TagProvider>> =
+        std::collections::HashMap::new();
+    if cfg.eth_labels().enabled {
+        let eth_labels_source: Arc<dyn domain::ports::TagProvider> = Arc::new(
+            infra::EthLabelsSource::new(http_client.clone(), cfg.eth_labels().clone().into_domain()),
+        );
+        let evm_chain_ids: Vec<u32> = if cfg.chains().is_empty() {
+            vec![1]
+        } else {
+            cfg.chains().iter().map(|c| c.id).filter(|&id| id != 195).collect()
+        };
+        for id in evm_chain_ids {
+            tag_providers.insert(ChainId::new(id), Arc::clone(&eth_labels_source));
+        }
+        tracing::info!(chains = tag_providers.len(), "eth-labels.com auto-tagging enabled");
+    }
+    if cfg.trongrid().enabled() {
+        let tron_source = Arc::new(TronGridSource::new(
+            http_client.clone(),
+            cfg.trongrid().clone().into_domain(),
+        ));
+        let tron_tag_source: Arc<dyn domain::ports::TagProvider> =
+            Arc::new(infra::TronTagSource::new(tron_source));
+        tag_providers.insert(ChainId::new(195), tron_tag_source);
+        tracing::info!("TronGrid addressTag auto-tagging enabled");
+    }
+    let entities_for_ingest: Arc<dyn domain::ports::EntityRepository> =
+        Arc::clone(&entities_repo) as _;
+    let tag_history_for_ingest: Arc<dyn domain::ports::TagHistoryRepository> =
+        Arc::clone(&tag_history_repo) as _;
+    let auto_tagging = if cfg.auto_tagging().enabled && !tag_providers.is_empty() {
+        Some(usecase::AutoTagging {
+            providers: tag_providers,
+            entities: entities_for_ingest,
+            history: tag_history_for_ingest,
+        })
+    } else {
+        None
+    };
+
     let transfers_concurrency = {
         let c = &cfg.ingestion().transfers_concurrency;
         Arc::new(AdaptiveConcurrency::new(
@@ -162,17 +213,22 @@ async fn main() -> anyhow::Result<()> {
         "ingestion transfers gate configured"
     );
 
+    let mut ingestion_service = IngestionService::new(
+        sources,
+        PostgresTransferRepository::new(pool.clone()),
+        chain_registry.clone(),
+    )
+    .with_prices(prices_for_ingest)
+    .with_watchlist(watchlist_for_ingest, alerts_for_ingest)
+    .with_address_kinds(kinds_for_ingest)
+    .with_transfers_concurrency(transfers_concurrency)
+    .with_classify_chain_batch_size(cfg.ingestion().classify_chain_batch_size);
+    if let Some(auto_tagging) = auto_tagging {
+        ingestion_service = ingestion_service.with_auto_tagging(auto_tagging);
+    }
+
     let state = Arc::new(AppState::new(
-        IngestionService::new(
-            sources,
-            PostgresTransferRepository::new(pool.clone()),
-            chain_registry.clone(),
-        )
-        .with_prices(prices_for_ingest)
-        .with_watchlist(watchlist_for_ingest, alerts_for_ingest)
-        .with_address_kinds(kinds_for_ingest)
-        .with_transfers_concurrency(transfers_concurrency)
-        .with_classify_chain_batch_size(cfg.ingestion().classify_chain_batch_size),
+        ingestion_service,
         RiskService::with_score_config(
             PostgresTransferRepository::new(pool.clone()),
             PostgresEntityRepository::new(pool.clone()),
@@ -182,6 +238,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .with_address_kinds(kinds_for_risk),
         Arc::clone(&entities_repo),
+        Arc::clone(&tag_history_repo),
+        tag_aggregation,
         chain_registry,
         JobRepository::new(pool.clone()),
         api_key,
@@ -233,6 +291,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/labels", post(labels_set))
         .route("/labels/bulk", post(labels_bulk))
         .route("/labels/{addr}", get(labels_get).delete(labels_delete))
+        .route(
+            "/labels/{addr}/tags/{tag_id}",
+            patch(labels_patch_tag).delete(labels_delete_tag),
+        )
         .route("/watchlist", get(watchlist_list).post(watchlist_add).delete(watchlist_remove))
         .route("/alerts", get(list_alerts))
         .route("/address/{addr}/kind", post(set_address_kind))

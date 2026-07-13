@@ -1,9 +1,11 @@
 use std::sync::Arc;
 
 use domain::chain::{ChainId, ChainRegistry};
+use domain::label_tag::TagAggregationStrategy;
 use infra::{
     ChainSources, JobRepository, PostgresAddressKinds, PostgresAlerts, PostgresEntityRepository,
-    PostgresTransferRepository, PostgresWatchlist, StaticLabelProvider, StaticPriceProvider,
+    PostgresTagHistoryRepository, PostgresTransferRepository, PostgresWatchlist,
+    StaticLabelProvider, StaticPriceProvider,
 };
 use usecase::{IngestionService, RiskService};
 
@@ -11,6 +13,8 @@ pub struct AppState {
     ingestion: IngestionService<ChainSources, PostgresTransferRepository>,
     risk: RiskService<PostgresTransferRepository, PostgresEntityRepository>,
     entities: Arc<PostgresEntityRepository>,
+    tag_history: Arc<PostgresTagHistoryRepository>,
+    tag_aggregation: TagAggregationStrategy,
     chains: ChainRegistry,
     jobs: JobRepository,
     api_key: Option<String>,
@@ -24,10 +28,13 @@ pub struct AppState {
 }
 
 impl AppState {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         ingestion: IngestionService<ChainSources, PostgresTransferRepository>,
         risk: RiskService<PostgresTransferRepository, PostgresEntityRepository>,
         entities: Arc<PostgresEntityRepository>,
+        tag_history: Arc<PostgresTagHistoryRepository>,
+        tag_aggregation: TagAggregationStrategy,
         chains: ChainRegistry,
         jobs: JobRepository,
         api_key: Option<String>,
@@ -43,6 +50,8 @@ impl AppState {
             ingestion,
             risk,
             entities,
+            tag_history,
+            tag_aggregation,
             chains,
             jobs,
             api_key,
@@ -58,6 +67,14 @@ impl AppState {
 
     pub fn entities(&self) -> &PostgresEntityRepository {
         &self.entities
+    }
+
+    pub fn tag_history(&self) -> &PostgresTagHistoryRepository {
+        &self.tag_history
+    }
+
+    pub fn tag_aggregation(&self) -> TagAggregationStrategy {
+        self.tag_aggregation
     }
 
     pub fn admin_api_key(&self) -> Option<&str> {

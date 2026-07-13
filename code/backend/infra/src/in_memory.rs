@@ -5,7 +5,9 @@ use std::sync::RwLock;
 
 use domain::entity::{AddressKind, EntityLabel, LabelSource};
 use domain::error::DomainResult;
-use domain::ports::{Alert, AlertSink, AddressKindRepository, LabelProvider, WatchlistEntry, WatchlistRepository};
+use domain::ports::{
+    AddressKindRepository, Alert, AlertSink, LabelProvider, WatchlistEntry, WatchlistRepository,
+};
 use domain::primitives::Address;
 
 #[derive(Default)]

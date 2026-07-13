@@ -10,6 +10,8 @@ pub mod transfer;
 
 pub mod entity;
 
+pub mod label_tag;
+
 pub mod trace;
 
 pub mod risk;

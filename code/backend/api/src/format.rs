@@ -3,7 +3,7 @@ use serde::{Deserialize, Deserializer};
 
 use crate::error::ApiError;
 use domain::chain::{ChainId, ChainRegistry};
-use domain::entity::SanctionList;
+use domain::label_tag::{TagCategory, TagSource};
 use domain::primitives::{Address, U256};
 use domain::risk::RiskSignalKind;
 use domain::trace::SinkKind;
@@ -125,12 +125,31 @@ pub fn signal_kind_str(k: &RiskSignalKind) -> &'static str {
     }
 }
 
-pub fn sanction_list_str(s: &SanctionList) -> String {
+pub fn tag_source_str(s: &TagSource) -> String {
     match s {
-        SanctionList::Ofac => "ofac".into(),
-        SanctionList::Eu => "eu".into(),
-        SanctionList::Un => "un".into(),
-        SanctionList::Other(s) => s.to_lowercase().replace([' ', '-'], "_"),
+        TagSource::OfacSdn => "ofac_sdn".into(),
+        TagSource::EuSanctions => "eu_sanctions".into(),
+        TagSource::UnSanctions => "un_sanctions".into(),
+        TagSource::InternalAnalyst => "internal_analyst".into(),
+        TagSource::HeuristicCluster => "heuristic_cluster".into(),
+        TagSource::ThirdParty(detail) => format!("third_party:{detail}"),
+        TagSource::LegacyImport => "legacy_import".into(),
+    }
+}
+
+pub fn tag_category_str(c: TagCategory) -> &'static str {
+    match c {
+        TagCategory::Exchange => "exchange",
+        TagCategory::Mixer => "mixer",
+        TagCategory::Bridge => "bridge",
+        TagCategory::DefiProtocol => "defi",
+        TagCategory::Sanctioned => "sanctioned",
+        TagCategory::Scam => "scam",
+        TagCategory::Gambling => "gambling",
+        TagCategory::Darknet => "darknet",
+        TagCategory::Mining => "mining",
+        TagCategory::KnownService => "known_service",
+        TagCategory::Unknown => "unknown",
     }
 }
 

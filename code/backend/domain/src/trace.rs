@@ -1,3 +1,4 @@
+use crate::label_tag::TagCategory;
 use crate::primitives::{Address, Amount, Ratio};
 use crate::transfer::Transfer;
 
@@ -238,6 +239,11 @@ impl FlowPath {
 pub struct Sink {
     address: Address,
     kind: SinkKind,
+    /// Every active tag category on the sink's entity — a mixer that's
+    /// also sanctioned surfaces both, unlike `kind` which only names the
+    /// single highest-risk one (for existing display code).
+    categories: Vec<TagCategory>,
+    risk_score: u8,
     tainted_amount: Amount,
     taint_ratio: Ratio,
 }
@@ -246,12 +252,16 @@ impl Sink {
     pub fn new(
         address: Address,
         kind: SinkKind,
+        categories: Vec<TagCategory>,
+        risk_score: u8,
         tainted_amount: Amount,
         taint_ratio: Ratio,
     ) -> Self {
         Self {
             address,
             kind,
+            categories,
+            risk_score,
             tainted_amount,
             taint_ratio,
         }
@@ -265,6 +275,10 @@ impl Sink {
         &self.kind
     }
 
+    pub fn categories(&self) -> &[TagCategory] {
+        &self.categories
+    }
+
     pub fn tainted_amount(&self) -> Amount {
         self.tainted_amount
     }
@@ -274,14 +288,7 @@ impl Sink {
     }
 
     pub fn risk_score(&self) -> u8 {
-        match &self.kind {
-            SinkKind::Exchange { .. } => 30,
-            SinkKind::Bridge { .. } => 40,
-            SinkKind::Mixer => 90,
-            SinkKind::Sanctioned => 100,
-            SinkKind::Darknet => 95,
-            SinkKind::Unresolved => 20,
-        }
+        self.risk_score
     }
 }
 

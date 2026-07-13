@@ -9,16 +9,26 @@ use domain::ports::RiskPort;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ApiError, ErrorResponse};
-use crate::format::{parse_address, sanction_list_str};
+use crate::format::parse_address;
 use crate::state::{AppState, resolve_chain_id};
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct SanctionTagDto {
+    tag_id: String,
+    label_name: Option<String>,
+    source: String,
+    sanction_list: Option<String>,
+    risk_score: u8,
+}
 
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct SanctionsResponse {
     address: String,
     chain_id: u32,
     is_sanctioned: bool,
-    sanction_list: Option<String>,
-    label: Option<String>,
+    /// Every currently-active `Sanctioned` tag — an address can be on
+    /// multiple lists (OFAC + EU) at once.
+    sanction_tags: Vec<SanctionTagDto>,
 }
 
 #[derive(Deserialize, utoipa::IntoParams)]
@@ -80,11 +90,21 @@ pub async fn check_sanctions(
 }
 
 pub(crate) fn sanctions_to_dto(result: &domain::risk::SanctionsCheckResult) -> SanctionsResponse {
+    use crate::format::tag_source_str;
     SanctionsResponse {
         address: result.address().canonical(),
         chain_id: result.address().chain().value(),
         is_sanctioned: result.is_sanctioned(),
-        sanction_list: result.sanction_list().map(sanction_list_str),
-        label: result.label().map(str::to_string),
+        sanction_tags: result
+            .sanction_tags()
+            .iter()
+            .map(|t| SanctionTagDto {
+                tag_id: t.tag_id().value().to_string(),
+                label_name: t.label_name().map(str::to_string),
+                source: tag_source_str(t.source()),
+                sanction_list: t.sanction_list().map(str::to_string),
+                risk_score: t.risk_score().value(),
+            })
+            .collect(),
     }
 }

@@ -4,23 +4,26 @@
     "chain_id": 1,
     "category": "exchange",
     "label_name": "Binance hot wallet 14",
-    "label_url": "https://etherscan.io/address/0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045",
-    "label_source": "manual"
+    "evidence_url": "https://etherscan.io/address/0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045",
+    "source": "internal_analyst",
+    "confidence": "medium"
   },
   {
     "address": "0x28C6c06298d514Db089934071355E5743bf21d60",
     "chain_id": 1,
     "category": "exchange",
     "label_name": "Binance hot wallet 14",
-    "label_source": "manual"
+    "source": "internal_analyst",
+    "confidence": "medium"
   },
   {
     "address": "0x722122dF12D4e14e13Ac3b6895a86e84145b6967",
     "chain_id": 1,
     "category": "mixer",
     "label_name": "Tornado Cash Router",
-    "label_url": "https://etherscan.io/address/0x722122dF12D4e14e13Ac3b6895a86e84145b6967",
-    "label_source": "chainalysis",
+    "evidence_url": "https://etherscan.io/address/0x722122dF12D4e14e13Ac3b6895a86e84145b6967",
+    "source": "third_party:chainalysis",
+    "confidence": "high",
     "risk_score": 90
   },
   {
@@ -29,7 +32,8 @@
     "category": "sanctioned",
     "sanction_list": "ofac",
     "label_name": "Tornado Cash: 100 ETH",
-    "label_source": "chainalysis",
+    "source": "ofac_sdn",
+    "confidence": "confirmed",
     "risk_score": 100
   },
   {
@@ -37,7 +41,8 @@
     "chain_id": 1,
     "category": "bridge",
     "label_name": "Wormhole Bridge",
-    "label_source": "internal",
+    "source": "internal_analyst",
+    "confidence": "medium",
     "risk_score": 40
   },
   {
@@ -45,14 +50,16 @@
     "chain_id": 1,
     "category": "defi",
     "label_name": "Uniswap V2: Router 2",
-    "label_source": "internal"
+    "source": "internal_analyst",
+    "confidence": "medium"
   },
   {
     "address": "0x00000000000000000000000000000000DeaDBeef",
     "chain_id": 1,
     "category": "scam",
     "label_name": "Fake USDT Giveaway",
-    "label_source": "community",
+    "source": "third_party:community",
+    "confidence": "low",
     "risk_score": 80
   },
   {
@@ -60,13 +67,15 @@
     "chain_id": 1,
     "category": "mining",
     "label_name": "F2Pool",
-    "label_source": "internal",
+    "source": "internal_analyst",
+    "confidence": "medium",
     "risk_score": 10
   },
   {
     "address": "0x000000000000000000000000000000000000dEaD",
     "chain_id": 1,
     "category": "unknown",
-    "label_source": "manual"
+    "source": "internal_analyst",
+    "confidence": "low"
   }
 ]

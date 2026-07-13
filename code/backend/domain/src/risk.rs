@@ -1,4 +1,5 @@
-use crate::entity::{EntityCategory, RiskScore, SanctionList};
+use crate::entity::RiskScore;
+use crate::label_tag::{LabelTag, TagCategory, TagId};
 use crate::primitives::Address;
 use crate::trace::Sink;
 use chrono::{DateTime, Utc};
@@ -6,19 +7,15 @@ use chrono::{DateTime, Utc};
 #[derive(Debug, Clone)]
 pub struct SanctionsCheckResult {
     address: Address,
-    is_sanctioned: bool,
-    sanction_list: Option<SanctionList>,
-    label: Option<String>,
+    /// Every currently-active `Sanctioned` tag on the address's entity — an
+    /// address can be on OFAC *and* EU lists simultaneously, so this is a
+    /// list rather than a single `Option<SanctionList>`.
+    sanction_tags: Vec<LabelTag>,
 }
 
 impl SanctionsCheckResult {
-    pub fn new(
-        address: Address,
-        is_sanctioned: bool,
-        sanction_list: Option<SanctionList>,
-        label: Option<String>,
-    ) -> Self {
-        Self { address, is_sanctioned, sanction_list, label }
+    pub fn new(address: Address, sanction_tags: Vec<LabelTag>) -> Self {
+        Self { address, sanction_tags }
     }
 
     pub fn address(&self) -> &Address {
@@ -26,15 +23,11 @@ impl SanctionsCheckResult {
     }
 
     pub fn is_sanctioned(&self) -> bool {
-        self.is_sanctioned
+        !self.sanction_tags.is_empty()
     }
 
-    pub fn sanction_list(&self) -> Option<&SanctionList> {
-        self.sanction_list.as_ref()
-    }
-
-    pub fn label(&self) -> Option<&str> {
-        self.label.as_deref()
+    pub fn sanction_tags(&self) -> &[LabelTag] {
+        &self.sanction_tags
     }
 }
 
@@ -160,7 +153,10 @@ pub enum RiskSignalKind {
 #[derive(Debug, Clone)]
 pub enum RiskEvidence {
     SinkExposure(Vec<Sink>),
-    EntityCategory(EntityCategory),
+    /// A specific active `LabelTag` on the address's entity drove this
+    /// signal — `tag_id` lets an investigator jump straight to the tag
+    /// that produced it (ТЗ §7).
+    Tag { tag_id: TagId, category: TagCategory },
     TransactionPattern(String),
     Manual(String),
 }

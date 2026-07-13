@@ -22,11 +22,12 @@ use crate::handlers::jobs::{
     __path_get_job_status,
 };
 use crate::handlers::labels::{
-    LabelRequest, LabelResponse, LabelsBulkResponse, __path_labels_bulk, __path_labels_delete,
-    __path_labels_get, __path_labels_set,
+    AddressDto as LabelAddressDto, EntityResponse, HistoryEventDto, LabelRequest, LabelTagDto,
+    LabelsBulkResponse, TagPatchRequest, __path_labels_bulk, __path_labels_delete,
+    __path_labels_delete_tag, __path_labels_get, __path_labels_patch_tag, __path_labels_set,
 };
 use crate::handlers::path::{PathEdgeDto, PathResponse, __path_shortest_path};
-use crate::handlers::sanctions::{SanctionsResponse, __path_check_sanctions};
+use crate::handlers::sanctions::{SanctionTagDto, SanctionsResponse, __path_check_sanctions};
 use crate::handlers::score::{ScoreResponse, SignalDto, __path_score_address};
 use crate::handlers::trace::{
     PathDto, SinkDto, TraceResponse, TraceStatsDto, __path_trace_funds,
@@ -253,12 +254,12 @@ impl utoipa::Modify for ApiSecurity {
         list_alerts,
         get_address_kind, set_address_kind,
         edge_significance_endpoint,
-        labels_set, labels_get, labels_delete, labels_bulk,
+        labels_set, labels_get, labels_delete, labels_bulk, labels_patch_tag, labels_delete_tag,
     ),
     components(schemas(
         GraphPage, EdgeDto,
         ScoreResponse, SignalDto,
-        SanctionsResponse,
+        SanctionsResponse, SanctionTagDto,
         TraceResponse, TraceStatsDto, SinkDto, PathDto,
         ChainsResponse, ChainDto,
         ErrorResponse,
@@ -271,7 +272,8 @@ impl utoipa::Modify for ApiSecurity {
         AlertDto,
         AddressKindRequest, AddressKindResponse,
         EdgeSignificanceResponse, EdgeScoreDto,
-        LabelRequest, LabelResponse, LabelsBulkResponse,
+        LabelRequest, EntityResponse, LabelAddressDto, LabelTagDto, HistoryEventDto,
+        TagPatchRequest, LabelsBulkResponse,
     ))
 )]
 pub struct ApiDoc;

@@ -4,3 +4,16 @@ etherscan_cache
 trongrid_cache
 .idea
 .pnpm-store
+
+# .NET / C# (ledgerscope-accounts)
+**/bin
+**/obj
+**/out
+*.user
+*.suo
+*.userprefs
+.vs
+project.lock.json
+*.nupkg
+*.snupkg
+appsettings.*.local.json

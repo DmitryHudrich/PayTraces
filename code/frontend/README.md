@@ -1,32 +1,50 @@
-# React + TypeScript + Vite
+# Ledgerscope Console (frontend)
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+Case-centric investigation UI for the **Ledgerscope.Accounts** C# public API. Log in,
+open a case, stream its transaction graph, then pin canvas views, label entities and
+organise addresses into groups.
 
-Currently, two official plugins are available:
+## Stack
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+React 19 · Vite · TypeScript · TanStack Query · Tailwind v4 · Radix/shadcn UI ·
+Sigma + graphology (graph rendering) · `@microsoft/signalr` (live graph stream).
+Structured with Feature-Sliced Design (`app` / `pages` / `widgets` / `features` /
+`entities` / `shared`).
 
-## React Compiler
+## Running
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+The frontend talks to the C# API (default `http://localhost:5107`) **through the vite
+dev proxy**, because that service ships no CORS policy.
 
-## Expanding the Oxlint configuration
-
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
-
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
+```bash
+npm install
+npm run dev            # http://localhost:5173
 ```
 
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+Start the backend separately (from `code/ledgerscope-accounts`): `dotnet run`. It also
+needs Postgres + Redis (`infrastructure/docker-compose.yaml`) and the Rust `aml-core`
+engine on :8080 for graph data.
+
+Point the proxy elsewhere with `VITE_PROXY_TARGET`, or bypass the proxy entirely with
+`VITE_API_URL` / `VITE_GRAPH_HUB_URL` (see `.env.example`).
+
+## How it fits together
+
+- **Auth** — `POST /auth/login` / `/auth/register`; JWT stored in `localStorage`
+  (`shared/auth`) and attached to every request; a 401 clears the session.
+- **Graph** — delivered over the SignalR hub `/hubs/graph`: `StreamCaseGraph` streams
+  paged BFS around a case address (with saved view positions merged in), `ExpandNode`
+  expands a node on click. See `features/case-graph-stream`.
+- **Permissions** — `GET /me/permissions` drives which controls are shown
+  (`entities/permission`).
+- **Views** — saved canvas layouts; the sigma adapter can seed pinned positions and
+  export the current ones.
+
+## Scripts
+
+```bash
+npm run dev       # dev server
+npm run build     # tsc -b && vite build
+npm run lint      # oxlint
+npm run lint:fsd  # steiger (FSD boundaries)
+```

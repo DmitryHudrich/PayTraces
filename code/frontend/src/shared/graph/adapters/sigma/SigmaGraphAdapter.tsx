@@ -1,9 +1,25 @@
 import Graph from 'graphology'
 import Sigma from 'sigma'
+import type { EdgeProgramType, NodeProgramType } from 'sigma/rendering'
+import { EdgeCurvedArrowProgram } from '@sigma/edge-curve'
+import { createNodeBorderProgram } from '@sigma/node-border'
 import { useEffect, useMemo, useRef, useState } from 'react'
 
 import type { GraphAdapterProps, GraphData, GraphLayoutMode } from '@/shared/graph/contract/graph'
 import { applyGraphLayout } from '@/shared/graph/model/apply-graph-layout'
+
+// Nodes are drawn as a coloured disc (risk fill) ringed by a completeness
+// outline; the outer 20% of the radius is the border colour.
+const NodeBorderProgram = createNodeBorderProgram({
+  borders: [
+    { size: { value: 0.2 }, color: { attribute: 'borderColor' } },
+    { size: { fill: true }, color: { attribute: 'color' } },
+  ],
+})
+
+// Parallel transfers between the same pair fan out as separate arcs so every
+// individual transfer is visible.
+const CURVATURE_SPREAD = 0.5
 
 const GRAPH_THEME = {
   canvas: '#09090b',
@@ -16,7 +32,11 @@ const GRAPH_THEME = {
   groups: {
     wallet: '#7eb6ff',
     exchange: '#c4b0f5',
+    service: '#c4b0f5',
     risk: '#f09494',
+    critical: '#f43f5e',
+    high: '#fb923c',
+    medium: '#38bdf8',
     default: '#a1a1aa',
   },
 } as const
@@ -27,12 +47,15 @@ type SigmaNodeAttrs = {
   size: number
   label: string
   color: string
+  borderColor: string
   group: string
 }
 
 type SigmaEdgeAttrs = {
   size: number
   color: string
+  type?: string
+  curvature?: number
 }
 
 type NodePosition = { x: number; y: number }
@@ -44,8 +67,11 @@ export const SigmaGraphAdapter = ({
   selectedNodeId = '',
   visibleNodeIds = null,
   visibleEdgeIds = null,
+  pinnedPositions = null,
   onNodeSelect,
   onNodeHover,
+  onPositionsChange,
+  onExportReady,
 }: GraphAdapterProps) => {
   const containerRef = useRef<HTMLDivElement | null>(null)
   const rendererRef = useRef<Sigma<SigmaNodeAttrs, SigmaEdgeAttrs> | null>(null)
@@ -57,6 +83,8 @@ export const SigmaGraphAdapter = ({
   const visibleEdgeIdsRef = useRef(visibleEdgeIds)
   const onNodeSelectRef = useRef(onNodeSelect)
   const onNodeHoverRef = useRef(onNodeHover)
+  const onPositionsChangeRef = useRef(onPositionsChange)
+  const onExportReadyRef = useRef(onExportReady)
   const layoutRef = useRef(layout)
   const graphSignatureRef = useRef('')
   const [canRender, setCanRender] = useState(false)
@@ -67,6 +95,8 @@ export const SigmaGraphAdapter = ({
   visibleEdgeIdsRef.current = visibleEdgeIds
   onNodeSelectRef.current = onNodeSelect
   onNodeHoverRef.current = onNodeHover
+  onPositionsChangeRef.current = onPositionsChange
+  onExportReadyRef.current = onExportReady
 
   const graphSignature = useMemo(() => graph.nodes.map((node) => node.id).join('|'), [graph.nodes])
 
@@ -85,8 +115,8 @@ export const SigmaGraphAdapter = ({
   }, [graphSignature])
 
   const preparedGraph = useMemo(
-    () => buildGraph(graph, layout, nodePositionsRef.current, rootNodeIds),
-    [graph, layout, rootNodeIds],
+    () => buildGraph(graph, layout, nodePositionsRef.current, rootNodeIds, pinnedPositions),
+    [graph, layout, rootNodeIds, pinnedPositions],
   )
 
   useEffect(() => {
@@ -128,8 +158,14 @@ export const SigmaGraphAdapter = ({
 
     const renderer = new Sigma<SigmaNodeAttrs, SigmaEdgeAttrs>(sigmaGraph, container, {
       renderEdgeLabels: false,
-      defaultNodeType: 'circle',
+      defaultNodeType: 'bordered',
       defaultEdgeType: 'arrow',
+      nodeProgramClasses: {
+        bordered: NodeBorderProgram as unknown as NodeProgramType<SigmaNodeAttrs, SigmaEdgeAttrs>,
+      },
+      edgeProgramClasses: {
+        curved: EdgeCurvedArrowProgram as unknown as EdgeProgramType<SigmaNodeAttrs, SigmaEdgeAttrs>,
+      },
       labelColor: { color: GRAPH_THEME.label },
       edgeLabelColor: { color: GRAPH_THEME.label },
       labelDensity: 0.04,
@@ -219,9 +255,19 @@ export const SigmaGraphAdapter = ({
     rendererRef.current = renderer
     graphRef.current = sigmaGraph
 
-    const dragState = bindNodeDragging(renderer, sigmaGraph, nodePositionsRef, (nodeId) => {
-      onNodeSelectRef.current?.(nodeId)
-    })
+    onExportReadyRef.current?.(() => new Map(nodePositionsRef.current))
+
+    const dragState = bindNodeDragging(
+      renderer,
+      sigmaGraph,
+      nodePositionsRef,
+      (nodeId) => {
+        onNodeSelectRef.current?.(nodeId)
+      },
+      () => {
+        onPositionsChangeRef.current?.(new Map(nodePositionsRef.current))
+      },
+    )
 
     const onEnterNode = ({ node }: { node: string }) => {
       onNodeHoverRef.current?.(node)
@@ -269,34 +315,64 @@ function buildGraph(
   layout: GraphLayoutMode,
   savedPositions: Map<string, NodePosition>,
   rootNodeIds: ReadonlySet<string> | null,
+  pinnedPositions: ReadonlyMap<string, NodePosition> | null,
 ) {
   const graph = new Graph<SigmaNodeAttrs, SigmaEdgeAttrs>({ type: 'directed', multi: true, allowSelfLoops: false })
 
+  const fixedFor = (id: string) => savedPositions.get(id) ?? pinnedPositions?.get(id) ?? null
+
   graphData.nodes.forEach((node) => {
-    const saved = savedPositions.get(node.id)
+    const fixed = fixedFor(node.id)
     graph.addNode(node.id, {
-      x: saved?.x ?? seededCoordinate(node.id, 0),
-      y: saved?.y ?? seededCoordinate(node.id, 1),
+      x: fixed?.x ?? seededCoordinate(node.id, 0),
+      y: fixed?.y ?? seededCoordinate(node.id, 1),
       size: mapWeightToSize(node.weight ?? 1),
       label: node.label,
       color: colorByGroup(node.group),
+      borderColor: node.borderColor ?? '#64748b',
       group: node.group ?? 'default',
     })
   })
+
+  // Count transfers per unordered pair so parallel ones can be fanned out.
+  const pairTotals = new Map<string, number>()
+  for (const edge of graphData.edges) {
+    const key = pairKey(edge.source, edge.target)
+    pairTotals.set(key, (pairTotals.get(key) ?? 0) + 1)
+  }
+  const pairSeen = new Map<string, number>()
 
   graphData.edges.forEach((edge) => {
     if (!graph.hasNode(edge.source) || !graph.hasNode(edge.target) || graph.hasEdge(edge.id)) {
       return
     }
-    graph.addEdgeWithKey(edge.id, edge.source, edge.target, {
+    const key = pairKey(edge.source, edge.target)
+    const total = pairTotals.get(key) ?? 1
+    const base: SigmaEdgeAttrs = {
       size: mapWeightToEdgeSize(edge.weight ?? 1),
       color: GRAPH_THEME.edge,
-    })
+    }
+    if (total > 1) {
+      const index = pairSeen.get(key) ?? 0
+      pairSeen.set(key, index + 1)
+      base.type = 'curved'
+      base.curvature = curvatureFor(index, total)
+    }
+    graph.addEdgeWithKey(edge.id, edge.source, edge.target, base)
   })
 
-  const hasSavedLayout = graphData.nodes.some((node) => savedPositions.has(node.id))
-  if (!hasSavedLayout) {
+  // Run auto-layout only when some node has no known position, then re-pin the
+  // fixed ones so saved drags and view positions survive the layout pass.
+  const allPlaced = graphData.nodes.every((node) => fixedFor(node.id) !== null)
+  if (!allPlaced) {
     applyGraphLayout(graph, layout, rootNodeIds)
+    graphData.nodes.forEach((node) => {
+      const fixed = fixedFor(node.id)
+      if (fixed) {
+        graph.setNodeAttribute(node.id, 'x', fixed.x)
+        graph.setNodeAttribute(node.id, 'y', fixed.y)
+      }
+    })
   }
 
   graph.forEachNode((node, attributes) => {
@@ -304,6 +380,18 @@ function buildGraph(
   })
 
   return graph
+}
+
+function pairKey(source: string, target: string) {
+  return source < target ? `${source}|${target}` : `${target}|${source}`
+}
+
+function curvatureFor(index: number, total: number) {
+  if (total <= 1) {
+    return 0
+  }
+  // Spread the parallel transfers symmetrically around the straight line.
+  return -CURVATURE_SPREAD + (2 * CURVATURE_SPREAD * index) / (total - 1)
 }
 
 function seededCoordinate(id: string, salt: number) {
@@ -319,6 +407,7 @@ function bindNodeDragging(
   graph: Graph<SigmaNodeAttrs, SigmaEdgeAttrs>,
   nodePositionsRef: { current: Map<string, NodePosition> },
   onNodeSelect?: (nodeId: string) => void,
+  onDragCommit?: () => void,
 ) {
   let draggedNode: string | null = null
   let dragStart: { x: number; y: number } | null = null
@@ -352,9 +441,13 @@ function bindNodeDragging(
   }
 
   const releaseDrag = () => {
+    const wasDragged = draggedNode !== null && moved
     draggedNode = null
     dragStart = null
     renderer.getCamera().enable()
+    if (wasDragged) {
+      onDragCommit?.()
+    }
   }
 
   const onClickNode = ({ node }: { node: string }) => {
@@ -393,16 +486,23 @@ function bindNodeDragging(
 }
 
 function colorByGroup(group?: string) {
-  if (group === 'wallet') {
-    return GRAPH_THEME.groups.wallet
+  switch (group) {
+    case 'wallet':
+      return GRAPH_THEME.groups.wallet
+    case 'exchange':
+    case 'service':
+      return GRAPH_THEME.groups.service
+    case 'risk':
+      return GRAPH_THEME.groups.risk
+    case 'critical':
+      return GRAPH_THEME.groups.critical
+    case 'high':
+      return GRAPH_THEME.groups.high
+    case 'medium':
+      return GRAPH_THEME.groups.medium
+    default:
+      return GRAPH_THEME.groups.default
   }
-  if (group === 'exchange') {
-    return GRAPH_THEME.groups.exchange
-  }
-  if (group === 'risk') {
-    return GRAPH_THEME.groups.risk
-  }
-  return GRAPH_THEME.groups.default
 }
 
 function mapWeightToSize(weight: number) {

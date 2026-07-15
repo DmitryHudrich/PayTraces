@@ -58,8 +58,7 @@ pub struct SanctionsQuery {
                    `POST /sanctions/batch` to amortise round-trips.\n\n\
                    ## Example\n\n\
                    ```bash\n\
-                   curl 'http://localhost:8080/sanctions?address=0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045&chain_id=1' \\\n\
-                     -H 'X-API-Version: 1'\n\
+                   curl 'http://localhost:8080/sanctions?address=0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045&chain_id=1'\n\
                    ```\n\n\
                    ## Notes\n\n\
                    A `false` here only means the exact address is not directly listed. It does \

@@ -45,14 +45,11 @@ pub struct WatchlistEntryDto {
                    ## Example\n\n\
                    ```bash\n\
                    curl -X POST 'http://localhost:8080/watchlist' \\\n\
-                     -H 'X-API-Version: 1' \\\n\
-                     -H 'X-Admin-Api-Key: <admin-key>' \\\n\
                      -H 'Content-Type: application/json' \\\n\
                      -d '{\"address\": \"0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045\", \"chain_id\": 1, \"reason\": \"incident #42\"}'\n\
                    ```\n\n\
                    ## Notes\n\n\
-                   Requires the `X-Admin-Api-Key` header (or the regular `X-Api-Key` when no \
-                   admin key is configured). Adding an address that already exists is a no-op.",
+                   Requires the `X-Api-Key` shared secret. Adding an address that already exists is a no-op.",
     request_body = WatchlistAddRequest,
     responses(
         (status = 200, body = WatchlistEntryDto),
@@ -94,13 +91,10 @@ pub async fn watchlist_add(
                    `GET /alerts` to see which of these have actually triggered.\n\n\
                    ## Example\n\n\
                    ```bash\n\
-                   curl 'http://localhost:8080/watchlist' \\\n\
-                     -H 'X-API-Version: 1' \\\n\
-                     -H 'X-Admin-Api-Key: <admin-key>'\n\
+                   curl 'http://localhost:8080/watchlist'\n\
                    ```\n\n\
                    ## Notes\n\n\
-                   Requires the `X-Admin-Api-Key` header (or the regular `X-Api-Key` when no \
-                   admin key is configured).",
+                   Requires the `X-Api-Key` shared secret.",
     responses(
         (status = 200, body = [WatchlistEntryDto]),
         (status = 401, body = ErrorResponse),
@@ -143,12 +137,10 @@ pub struct WatchlistRemoveQuery {
                    audit trail (existing alerts) is preserved.\n\n\
                    ## Example\n\n\
                    ```bash\n\
-                   curl -X DELETE 'http://localhost:8080/watchlist?address=0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045&chain_id=1' \\\n\
-                     -H 'X-API-Version: 1' \\\n\
-                     -H 'X-Admin-Api-Key: <admin-key>'\n\
+                   curl -X DELETE 'http://localhost:8080/watchlist?address=0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045&chain_id=1'\n\
                    ```\n\n\
                    ## Notes\n\n\
-                   Requires the `X-Admin-Api-Key` header. Removing an address that is not on \
+                   Requires the `X-Api-Key` shared secret. Removing an address that is not on \
                    the watchlist is not an error — the response indicates whether anything was \
                    actually removed.",
     params(WatchlistRemoveQuery),
@@ -195,12 +187,10 @@ pub struct AlertDto {
                    remove existing alerts — they remain for audit purposes.\n\n\
                    ## Example\n\n\
                    ```bash\n\
-                   curl 'http://localhost:8080/alerts' \\\n\
-                     -H 'X-API-Version: 1' \\\n\
-                     -H 'X-Admin-Api-Key: <admin-key>'\n\
+                   curl 'http://localhost:8080/alerts'\n\
                    ```\n\n\
                    ## Notes\n\n\
-                   Requires the `X-Admin-Api-Key` header. No pagination — the response \
+                   Requires the `X-Api-Key` shared secret. No pagination — the response \
                    includes the full log. If the volume grows large, prune it directly in the \
                    database.",
     responses(

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use axum::{
-    Extension, Json,
+    Json,
     extract::{Query, State},
     response::IntoResponse,
 };
@@ -15,7 +15,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{ApiError, ErrorResponse};
 use crate::format::{confidence_str, parse_address, tag_category_str};
-use crate::middleware::ApiVersion;
 use crate::state::{AppState, resolve_chain_id};
 
 const MAX_NODES_BATCH: usize = 500;
@@ -232,7 +231,7 @@ pub struct NodesBatchResponse {
 #[utoipa::path(
     get, path = "/nodes/batch",
     description = "Batch-enrich a list of addresses with the same `NodeDto` shape `GET /graph` \
-                   returns under `X-API-Version: 2` (ТЗ §6).\n\n\
+                   returns (ТЗ §6).\n\n\
                    ## What this does\n\n\
                    Fills in `kind`, `risk_score` (cache-only, never computes), every active \
                    `tags` entry, and `is_ingest_boundary` for every address in `addresses` \
@@ -245,7 +244,7 @@ pub struct NodesBatchResponse {
                    unlike `/graph`, this endpoint has no bounded edge set/BFS view to derive them \
                    from.\n\n\
                    ## Notes\n\n\
-                   Requires `X-API-Version: 2`. `enrich=minimal` returns only `address` per node, \
+                   `enrich=minimal` returns only `address` per node, \
                    skipping every enrichment query.",
     params(NodesBatchQuery),
     responses(
@@ -257,15 +256,8 @@ pub struct NodesBatchResponse {
 )]
 pub async fn nodes_batch(
     State(state): State<Arc<AppState>>,
-    Extension(version): Extension<ApiVersion>,
     Query(q): Query<NodesBatchQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    if version.0 < 2 {
-        return Err(ApiError::bad_request(
-            "GET /nodes/batch requires X-API-Version: 2".to_string(),
-        ));
-    }
-
     let chain = resolve_chain_id(&state, q.chain_id);
     let addr_strs: Vec<&str> = q
         .addresses

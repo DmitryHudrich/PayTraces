@@ -57,8 +57,7 @@ pub struct EdgeSignificanceResponse {
                    investigation in concrete transactions. Run `POST /jobs/ingest` first.\n\n\
                    ## Example\n\n\
                    ```bash\n\
-                   curl 'http://localhost:8080/edges/significance?address=0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045&chain_id=1&limit=20' \\\n\
-                     -H 'X-API-Version: 1'\n\
+                   curl 'http://localhost:8080/edges/significance?address=0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045&chain_id=1&limit=20'\n\
                    ```\n\n\
                    ## Notes\n\n\
                    The score is heuristic and not directly comparable across different subject \

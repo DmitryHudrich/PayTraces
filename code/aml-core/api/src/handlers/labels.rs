@@ -222,8 +222,6 @@ pub(crate) async fn apply_label(
                    ## Example\n\n\
                    ```bash\n\
                    curl -X POST 'http://localhost:8080/labels' \\\n\
-                     -H 'X-API-Version: 1' \\\n\
-                     -H 'X-Admin-Api-Key: <admin-key>' \\\n\
                      -H 'Content-Type: application/json' \\\n\
                      -d '{\n\
                        \"address\": \"0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045\",\n\
@@ -237,7 +235,7 @@ pub(crate) async fn apply_label(
                      }'\n\
                    ```\n\n\
                    ## Notes\n\n\
-                   Requires the `X-Admin-Api-Key` header. `risk_score` defaults from `category` \
+                   Requires the `X-Api-Key` shared secret. `risk_score` defaults from `category` \
                    when omitted; `confidence` defaults to `medium`, `source` to `internal_analyst`.",
     request_body = LabelRequest,
     responses(
@@ -277,12 +275,10 @@ pub struct PathAddrQuery {
                    This is a DB-only read. No chain RPC is touched.\n\n\
                    ## Example\n\n\
                    ```bash\n\
-                   curl 'http://localhost:8080/labels/0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045?chain_id=1&include_history=true' \\\n\
-                     -H 'X-API-Version: 1' \\\n\
-                     -H 'X-Admin-Api-Key: <admin-key>'\n\
+                   curl 'http://localhost:8080/labels/0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045?chain_id=1&include_history=true'\n\
                    ```\n\n\
                    ## Notes\n\n\
-                   Requires the `X-Admin-Api-Key` header. `chain_id` defaults to 1 (Ethereum \
+                   Requires the `X-Api-Key` shared secret. `chain_id` defaults to 1 (Ethereum \
                    mainnet); pass it explicitly for other chains.",
     params(
         ("addr" = String, Path, description = "Address in hex (EVM) or canonical chain form."),
@@ -337,12 +333,10 @@ pub async fn labels_get(
                    `DELETE /labels/{addr}/tags/{tag_id}`.\n\n\
                    ## Example\n\n\
                    ```bash\n\
-                   curl -X DELETE 'http://localhost:8080/labels/0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045?chain_id=1' \\\n\
-                     -H 'X-API-Version: 1' \\\n\
-                     -H 'X-Admin-Api-Key: <admin-key>'\n\
+                   curl -X DELETE 'http://localhost:8080/labels/0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045?chain_id=1'\n\
                    ```\n\n\
                    ## Notes\n\n\
-                   Requires the `X-Admin-Api-Key` header.",
+                   Requires the `X-Api-Key` shared secret.",
     params(
         ("addr" = String, Path, description = "Address in hex (EVM) or canonical chain form."),
         PathAddrQuery,
@@ -419,7 +413,7 @@ mod option_option_datetime {
                    calls). Writes one history event reflecting the net effect (`reactivated` if \
                    `active` flips false→true, `deactivated` if true→false, `updated` otherwise).\n\n\
                    ## Notes\n\n\
-                   Requires the `X-Admin-Api-Key` header.",
+                   Requires the `X-Api-Key` shared secret.",
     params(
         ("addr" = String, Path, description = "Address in hex (EVM) or canonical chain form."),
         ("tag_id" = String, Path, description = "Tag UUID."),
@@ -485,7 +479,7 @@ pub async fn labels_patch_tag(
                    Sets `active = false` on the specified tag only, leaving any other active tags \
                    on the entity untouched, and records a `Deactivated` history event.\n\n\
                    ## Notes\n\n\
-                   Requires the `X-Admin-Api-Key` header.",
+                   Requires the `X-Api-Key` shared secret.",
     params(
         ("addr" = String, Path, description = "Address in hex (EVM) or canonical chain form."),
         ("tag_id" = String, Path, description = "Tag UUID."),

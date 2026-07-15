@@ -45,8 +45,7 @@ pub struct AddressKindResponse {
                    for EOAs.\n\n\
                    ## Example\n\n\
                    ```bash\n\
-                   curl 'http://localhost:8080/address/0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045/kind' \\\n\
-                     -H 'X-API-Version: 1'\n\
+                   curl 'http://localhost:8080/address/0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045/kind'\n\
                    ```\n\n\
                    ## Notes\n\n\
                    `chain_id` defaults to the server-wide `api.default_chain_id` (typically 1 = \
@@ -97,13 +96,11 @@ pub async fn get_address_kind(
                    ## Example\n\n\
                    ```bash\n\
                    curl -X POST 'http://localhost:8080/address/0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045/kind' \\\n\
-                     -H 'X-API-Version: 1' \\\n\
-                     -H 'X-Admin-Api-Key: <admin-key>' \\\n\
                      -H 'Content-Type: application/json' \\\n\
                      -d '{\"kind\": \"known_service\", \"service_name\": \"Binance hot wallet\", \"chain_id\": 1}'\n\
                    ```\n\n\
                    ## Notes\n\n\
-                   Requires the `X-Admin-Api-Key` header. `kind` must be one of `eoa`, \
+                   Requires the `X-Api-Key` shared secret. `kind` must be one of `eoa`, \
                    `contract`, `known_service`, `unknown` — anything else triggers a 400.",
     params(("addr" = String, Path, description = "Address in hex (EVM) or canonical chain form.")),
     request_body = AddressKindRequest,

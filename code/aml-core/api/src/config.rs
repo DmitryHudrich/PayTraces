@@ -52,10 +52,17 @@ impl LogConfig {
 pub struct ServerConfig {
     host: String,
     port: u16,
+    /// Shared secret the Ledgerscope.Accounts (C#) facade presents on every
+    /// internal call (`X-Api-Key` or `Authorization: Bearer`). When unset the
+    /// check is skipped — dev only; production should set this and/or `tls`.
     #[serde(default, rename = "api_key")]
     api_key: Option<String>,
+    /// Optional TLS / mutual-TLS termination for the internal C# ↔ Rust
+    /// boundary. Absent → plain HTTP (terminate TLS at a sidecar/ingress
+    /// instead). Present with `require_client_auth = true` → mTLS: only
+    /// callers holding a cert signed by `client_ca_path` may connect.
     #[serde(default)]
-    admin_api_key: Option<String>,
+    tls: Option<TlsConfig>,
 }
 
 impl ServerConfig {
@@ -71,8 +78,42 @@ impl ServerConfig {
         self.api_key.as_deref().filter(|s| !s.is_empty())
     }
 
-    pub fn admin_api_key(&self) -> Option<&str> {
-        self.admin_api_key.as_deref().filter(|s| !s.is_empty())
+    pub fn tls(&self) -> Option<&TlsConfig> {
+        self.tls.as_ref()
+    }
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct TlsConfig {
+    /// PEM server certificate chain.
+    cert_path: String,
+    /// PEM server private key.
+    key_path: String,
+    /// PEM CA bundle used to verify client certificates. Required when
+    /// `require_client_auth` is true (mTLS).
+    #[serde(default)]
+    client_ca_path: Option<String>,
+    /// Enforce mutual TLS: reject any client that doesn't present a cert
+    /// signed by `client_ca_path`.
+    #[serde(default)]
+    require_client_auth: bool,
+}
+
+impl TlsConfig {
+    pub fn cert_path(&self) -> &str {
+        &self.cert_path
+    }
+
+    pub fn key_path(&self) -> &str {
+        &self.key_path
+    }
+
+    pub fn client_ca_path(&self) -> Option<&str> {
+        self.client_ca_path.as_deref().filter(|s| !s.is_empty())
+    }
+
+    pub fn require_client_auth(&self) -> bool {
+        self.require_client_auth
     }
 }
 

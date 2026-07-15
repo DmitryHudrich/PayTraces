@@ -19,7 +19,6 @@ pub struct AppState {
     chains: ChainRegistry,
     jobs: JobRepository,
     api_key: Option<String>,
-    admin_api_key: Option<String>,
     prices: Arc<StaticPriceProvider>,
     labels: Arc<StaticLabelProvider>,
     address_kinds: Arc<PostgresAddressKinds>,
@@ -40,7 +39,6 @@ impl AppState {
         chains: ChainRegistry,
         jobs: JobRepository,
         api_key: Option<String>,
-        admin_api_key: Option<String>,
         prices: Arc<StaticPriceProvider>,
         labels: Arc<StaticLabelProvider>,
         address_kinds: Arc<PostgresAddressKinds>,
@@ -58,7 +56,6 @@ impl AppState {
             chains,
             jobs,
             api_key,
-            admin_api_key,
             prices,
             labels,
             address_kinds,
@@ -82,10 +79,6 @@ impl AppState {
 
     pub fn tag_aggregation(&self) -> TagAggregationStrategy {
         self.tag_aggregation
-    }
-
-    pub fn admin_api_key(&self) -> Option<&str> {
-        self.admin_api_key.as_deref()
     }
 
     pub fn ingestion(&self) -> &IngestionService<ChainSources, PostgresTransferRepository> {

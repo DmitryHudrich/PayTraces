@@ -17,6 +17,10 @@ utoipa = { version = "5", features = ["axum_extras"] }
 utoipa-scalar = { version = "0.3", features = ["axum"] }
 
 axum = "0"
+axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
+rustls-pki-types = "1"
 tower = { version = "0" }
 tower-http = { version = "0", features = ["trace", "cors"] }
 

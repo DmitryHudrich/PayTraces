@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::{
     Router,
-    middleware::{from_fn, from_fn_with_state},
+    middleware::from_fn_with_state,
     response::Redirect,
     routing::{get, patch, post},
 };
@@ -29,6 +29,7 @@ mod handlers;
 mod middleware;
 mod openapi;
 mod state;
+mod tls;
 
 use crate::bootstrap::{build_cors_layer, build_sources_from_chains, build_sources_legacy, init_tracer};
 use crate::error::ApiError;
@@ -50,7 +51,7 @@ use crate::handlers::sanctions::check_sanctions;
 use crate::handlers::score::score_address;
 use crate::handlers::trace::trace_funds;
 use crate::handlers::watchlist::{list_alerts, watchlist_add, watchlist_list, watchlist_remove};
-use crate::middleware::{admin_auth_middleware, auth_middleware, version_middleware};
+use crate::middleware::auth_middleware;
 use crate::openapi::ApiDoc;
 use crate::state::AppState;
 
@@ -124,7 +125,6 @@ async fn main() -> anyhow::Result<()> {
     let chain_registry = ChainRegistry::default_registry();
 
     let api_key = cfg.server().api_key().map(str::to_owned);
-    let admin_api_key = cfg.server().admin_api_key().map(str::to_owned);
     let transfers_repo: Arc<PostgresTransferRepository> =
         Arc::new(PostgresTransferRepository::new(pool.clone()));
     let entities_repo: Arc<PostgresEntityRepository> =
@@ -247,7 +247,6 @@ async fn main() -> anyhow::Result<()> {
         chain_registry,
         JobRepository::new(pool.clone()),
         api_key,
-        admin_api_key,
         prices_for_state,
         labels,
         kinds_for_state,
@@ -291,23 +290,11 @@ async fn main() -> anyhow::Result<()> {
 
     let addr = format!("{}:{}", cfg.server().host(), cfg.server().port());
 
-    let admin_routes = Router::<Arc<AppState>>::new()
-        .route("/labels", post(labels_set))
-        .route("/labels/bulk", post(labels_bulk))
-        .route("/labels/{addr}", get(labels_get).delete(labels_delete))
-        .route(
-            "/labels/{addr}/tags/{tag_id}",
-            patch(labels_patch_tag).delete(labels_delete_tag),
-        )
-        .route("/watchlist", get(watchlist_list).post(watchlist_add).delete(watchlist_remove))
-        .route("/alerts", get(list_alerts))
-        .route("/address/{addr}/kind", post(set_address_kind))
-        .layer(from_fn_with_state(
-            Arc::clone(&state),
-            admin_auth_middleware,
-        ));
-
-    let public_routes = Router::<Arc<AppState>>::new()
+    // Single trust tier: every route sits behind the shared-secret check.
+    // Role-level authorization (who may mutate labels/watchlist vs. only
+    // read graph/score) now lives entirely in the Ledgerscope.Accounts (C#)
+    // facade — Rust only distinguishes "trusted caller" from "not".
+    let api = Router::<Arc<AppState>>::new()
         .route("/chains", get(list_chains))
         .route("/graph", get(get_graph))
         .route("/nodes/batch", get(nodes_batch))
@@ -320,18 +307,19 @@ async fn main() -> anyhow::Result<()> {
         .route("/path", get(shortest_path))
         .route("/cluster", get(cluster_address))
         .route("/edges/significance", get(edge_significance_endpoint))
-        .route("/address/{addr}/kind", get(get_address_kind))
+        .route("/address/{addr}/kind", get(get_address_kind).post(set_address_kind))
         .route("/jobs/ingest", post(create_ingest_job))
         .route("/jobs/{id}", get(get_job_status))
-        .layer(from_fn_with_state(
-            Arc::clone(&state),
-            auth_middleware,
-        ));
-
-    let api = Router::<Arc<AppState>>::new()
-        .merge(public_routes)
-        .merge(admin_routes)
-        .layer(from_fn(version_middleware));
+        .route("/labels", post(labels_set))
+        .route("/labels/bulk", post(labels_bulk))
+        .route("/labels/{addr}", get(labels_get).delete(labels_delete))
+        .route(
+            "/labels/{addr}/tags/{tag_id}",
+            patch(labels_patch_tag).delete(labels_delete_tag),
+        )
+        .route("/watchlist", get(watchlist_list).post(watchlist_add).delete(watchlist_remove))
+        .route("/alerts", get(list_alerts))
+        .layer(from_fn_with_state(Arc::clone(&state), auth_middleware));
 
     let app = Router::new()
         .merge(Scalar::with_url("/scalar", ApiDoc::openapi()))
@@ -360,11 +348,34 @@ async fn main() -> anyhow::Result<()> {
             },
         ));
 
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    tracing::info!(addr, "listening");
-    tokio::select! {
-        result = axum::serve(listener, app) => { result?; }
-        _ = shutdown_signal() => {}
+    match cfg.server().tls() {
+        Some(tls_cfg) => {
+            let rustls_config = tls::build_rustls_config(tls_cfg)?;
+            let socket: std::net::SocketAddr = addr.parse()?;
+            tracing::info!(
+                addr,
+                mtls = tls_cfg.require_client_auth(),
+                "listening (TLS)"
+            );
+            let handle = axum_server::Handle::new();
+            let shutdown_handle = handle.clone();
+            tokio::spawn(async move {
+                shutdown_signal().await;
+                shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
+            });
+            axum_server::bind_rustls(socket, rustls_config)
+                .handle(handle)
+                .serve(app.into_make_service())
+                .await?;
+        }
+        None => {
+            let listener = tokio::net::TcpListener::bind(&addr).await?;
+            tracing::info!(addr, "listening");
+            tokio::select! {
+                result = axum::serve(listener, app) => { result?; }
+                _ = shutdown_signal() => {}
+            }
+        }
     }
 
     if let Some(p) = provider {

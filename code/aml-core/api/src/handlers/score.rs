@@ -61,8 +61,7 @@ pub struct ScoreQuery {
                    array verbatim in your UI so investigators can audit each contributor.\n\n\
                    ## Example\n\n\
                    ```bash\n\
-                   curl 'http://localhost:8080/score?address=0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045&chain_id=1' \\\n\
-                     -H 'X-API-Version: 1'\n\
+                   curl 'http://localhost:8080/score?address=0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045&chain_id=1'\n\
                    ```\n\n\
                    ## Notes\n\n\
                    The score is cached for a short, configurable TTL (`risk_cache:` block in \

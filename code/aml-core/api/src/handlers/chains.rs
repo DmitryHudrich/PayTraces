@@ -42,8 +42,7 @@ pub struct ChainsResponse {
                    data — calls passing its `chain_id` will fail.\n\n\
                    ## Example\n\n\
                    ```bash\n\
-                   curl 'http://localhost:8080/chains' \\\n\
-                     -H 'X-API-Version: 1'\n\
+                   curl 'http://localhost:8080/chains'\n\
                    ```\n\n\
                    ## Notes\n\n\
                    The set of registered chains is fixed for the lifetime of the server \

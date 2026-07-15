@@ -75,8 +75,7 @@ fn edge_dto(t: &domain::transfer::Transfer) -> PathEdgeDto {
                    `max_depth` / `max_nodes`.\n\n\
                    ## Example\n\n\
                    ```bash\n\
-                   curl 'http://localhost:8080/path?from=0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045&to=0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1&chain_id=1&max_depth=4' \\\n\
-                     -H 'X-API-Version: 1'\n\
+                   curl 'http://localhost:8080/path?from=0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045&to=0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1&chain_id=1&max_depth=4'\n\
                    ```\n\n\
                    ## Notes\n\n\
                    A `not_found: true` response does NOT prove the addresses are disconnected on \

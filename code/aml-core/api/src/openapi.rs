@@ -13,7 +13,7 @@ use crate::handlers::cluster::{ClusterResponse, __path_cluster_address};
 use crate::handlers::edges::{
     EdgeScoreDto, EdgeSignificanceResponse, __path_edge_significance_endpoint,
 };
-use crate::handlers::graph::{EdgeDto, GraphPageV1, GraphPageV2, __path_get_graph};
+use crate::handlers::graph::{EdgeDto, GraphPage, __path_get_graph};
 use crate::handlers::heuristics::{
     HeuristicEvidenceDto, HeuristicsResponse, __path_detect_heuristics,
 };
@@ -47,19 +47,11 @@ impl utoipa::Modify for ApiSecurity {
             .components
             .get_or_insert_with(utoipa::openapi::Components::new);
         components.add_security_scheme(
-            "api_version",
-            SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::with_description(
-                "X-API-Version",
-                "Required for every request. Supported values: `1`, `2`. `2` changes \
-                 `GET /graph`'s `nodes` field to enriched objects and unlocks \
-                 `GET /nodes/batch`; `1` keeps every response byte-for-byte as before.",
-            ))),
-        );
-        components.add_security_scheme(
             "api_key",
             SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::with_description(
                 "X-Api-Key",
-                "Required only when server.api_key is configured. Bearer-token form \
+                "Shared secret presented by the Ledgerscope.Accounts facade. Required \
+                 only when server.api_key is configured. Bearer-token form \
                  (Authorization: Bearer <key>) is also accepted.",
             ))),
         );
@@ -101,28 +93,18 @@ impl utoipa::Modify for ApiSecurity {
                          attribution data.\n\n\
                        ---\n\n\
                        ## Authentication\n\n\
-                       Two independent headers protect different parts of the API:\n\n\
+                       This is an **internal API**. Its only intended caller is the \
+                       Ledgerscope.Accounts (C#) facade, which authenticates and authorizes \
+                       end users (roles, case access) before ever calling here. This service \
+                       trusts a single shared secret on a private network:\n\n\
                        | Header | When required | Endpoints |\n\
                        |--------|---------------|-----------|\n\
-                       | `X-Api-Key` | Set on the server (optional) | All `/graph`, `/score`, `/sanctions`, `/trace`, `/heuristics`, ... |\n\
-                       | `X-Admin-Api-Key` | Set on the server (optional) | Mutation endpoints: `POST /labels`, `POST /labels/bulk`, `DELETE /labels/{addr}`, `POST /watchlist`, `POST /address/.../kind` |\n\
-                       | `Authorization: Bearer <key>` | Alternative to `X-Api-Key` | Same as above |\n\n\
-                       If the server has no API key configured, the corresponding headers \
-                       are NOT required. The Scalar \"Authentication\" panel (top-right \
-                       of this UI) lets you set both headers once per session.\n\n\
-                       ---\n\n\
-                       ## API versioning\n\n\
-                       Every request MUST carry an `X-API-Version` header set to `1` or `2`. \
-                       Without it the server returns `HTTP 400 missing required header`. With an \
-                       unsupported value it returns the same status with the supported \
-                       versions listed. Only `/scalar` (this UI) and \
-                       `/api-docs/openapi.json` (the raw spec) are exempt.\n\n\
-                       This is a deliberately strict policy: it makes breaking schema \
-                       changes safe to introduce on a new version while old clients \
-                       keep working on `v1`. Today the only version-dependent behaviour is \
-                       `GET /graph`'s `nodes` field (`GraphPageV1`'s flat `string[]` on `1` vs. \
-                       `GraphPageV2`'s enriched `NodeDto[]` on `2`) and `GET /nodes/batch`, which \
-                       requires `2`. Every other endpoint behaves identically on both.\n\n\
+                       | `X-Api-Key` | Set on the server (optional) | All endpoints |\n\
+                       | `Authorization: Bearer <key>` | Alternative to `X-Api-Key` | All endpoints |\n\n\
+                       If `server.api_key` is unset the header is NOT required (dev only). \
+                       For production the boundary can additionally be secured with mutual \
+                       TLS via the `server.tls` config block. There is no per-role tier here — \
+                       role-based access control lives entirely in Ledgerscope.Accounts.\n\n\
                        ---\n\n\
                        ## End-to-end workflow\n\n\
                        Most use cases follow the same shape: ingest first, then read.\n\n\
@@ -131,7 +113,6 @@ impl utoipa::Modify for ApiSecurity {
                        on-chain history and writes counterparty transfers to PostgreSQL.\n\
                        ```bash\n\
                        curl -X POST http://localhost:8080/jobs/ingest \\\n\
-                         -H 'X-API-Version: 1' \\\n\
                          -H 'Content-Type: application/json' \\\n\
                          -d '{\n\
                            \"address\": \"0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045\",\n\
@@ -143,34 +124,28 @@ impl utoipa::Modify for ApiSecurity {
                        ```\n\n\
                        **Step 2.** Poll job status until it succeeds.\n\
                        ```bash\n\
-                       curl 'http://localhost:8080/jobs/01HX...' \\\n\
-                         -H 'X-API-Version: 1'\n\
+                       curl 'http://localhost:8080/jobs/01HX...'\n\
                        # → { \"status\": \"succeeded\", \"finished_at\": ... }\n\
                        ```\n\n\
                        **Step 3.** Read the transfer graph from the DB (this never \
                        touches a chain source — pure read).\n\
                        ```bash\n\
-                       curl 'http://localhost:8080/graph?address=0xd8dA...&chain_id=1&max_depth=2&page=0&page_size=100' \\\n\
-                         -H 'X-API-Version: 1'\n\
+                       curl 'http://localhost:8080/graph?address=0xd8dA...&chain_id=1&max_depth=2&page=0&page_size=100'\n\
                        ```\n\n\
                        **Step 4.** Score and screen.\n\
                        ```bash\n\
-                       curl 'http://localhost:8080/score?address=0xd8dA...&chain_id=1' \\\n\
-                         -H 'X-API-Version: 1'\n\
+                       curl 'http://localhost:8080/score?address=0xd8dA...&chain_id=1'\n\
                        # → { \"score\": 42, \"signals\": [...] }\n\
-                       curl 'http://localhost:8080/sanctions?address=0xd8dA...&chain_id=1' \\\n\
-                         -H 'X-API-Version: 1'\n\
+                       curl 'http://localhost:8080/sanctions?address=0xd8dA...&chain_id=1'\n\
                        ```\n\n\
                        **Step 5.** Inspect behavioural heuristics — fan-in, fan-out, \
                        smurfing, peeling, etc.\n\
                        ```bash\n\
-                       curl 'http://localhost:8080/heuristics?address=0xd8dA...&chain_id=1' \\\n\
-                         -H 'X-API-Version: 1'\n\
+                       curl 'http://localhost:8080/heuristics?address=0xd8dA...&chain_id=1'\n\
                        ```\n\n\
                        Or follow the money:\n\
                        ```bash\n\
-                       curl 'http://localhost:8080/trace?address=0xd8dA...&chain_id=1&direction=forward&strategy=haircut&max_hops=5' \\\n\
-                         -H 'X-API-Version: 1'\n\
+                       curl 'http://localhost:8080/trace?address=0xd8dA...&chain_id=1&direction=forward&strategy=haircut&max_hops=5'\n\
                        ```\n\n\
                        ---\n\n\
                        ## Architecture\n\n\
@@ -208,8 +183,8 @@ impl utoipa::Modify for ApiSecurity {
                        ## Common errors\n\n\
                        | Status | Meaning |\n\
                        |--------|---------|\n\
-                       | `400 Bad Request` | Missing/invalid `X-API-Version`, malformed body, unknown chain id, address that doesn't parse for the chain family. |\n\
-                       | `401 Unauthorized` | `X-Api-Key` or `X-Admin-Api-Key` missing or wrong. |\n\
+                       | `400 Bad Request` | Malformed body, unknown chain id, address that doesn't parse for the chain family. |\n\
+                       | `401 Unauthorized` | `X-Api-Key` (or `Authorization: Bearer`) missing or wrong. |\n\
                        | `404 Not Found` | Job id / entity id / label / watchlist entry not found. |\n\
                        | `409 Conflict` | Duplicate label or duplicate watchlist entry. |\n\
                        | `500 Internal Server Error` | Database, chain source, or internal bug. Response body carries the message. |\n\n\
@@ -246,7 +221,6 @@ impl utoipa::Modify for ApiSecurity {
     ),
     modifiers(&ApiSecurity),
     security(
-        ("api_version" = []),
         ("api_key" = []),
     ),
     paths(
@@ -263,7 +237,7 @@ impl utoipa::Modify for ApiSecurity {
         labels_set, labels_get, labels_delete, labels_bulk, labels_patch_tag, labels_delete_tag,
     ),
     components(schemas(
-        GraphPageV1, GraphPageV2, EdgeDto, NodeDto, TagDto, NodesBatchResponse,
+        GraphPage, EdgeDto, NodeDto, TagDto, NodesBatchResponse,
         ScoreResponse, SignalDto,
         SanctionsResponse, SanctionTagDto,
         TraceResponse, TraceStatsDto, SinkDto, PathDto,

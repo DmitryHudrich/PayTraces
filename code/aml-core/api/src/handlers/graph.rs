@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use axum::{
-    Extension, Json,
+    Json,
     extract::{Query, State},
-    response::{IntoResponse, Response},
+    response::IntoResponse,
 };
 use domain::graph::GraphRequest;
 use domain::ports::BlockRange;
@@ -15,7 +15,6 @@ use crate::format::{
     transfer_kind_str,
 };
 use crate::handlers::nodes::{GraphViewContext, NodeDto, enrich_nodes, parse_minimal};
-use crate::middleware::ApiVersion;
 use crate::state::{AppState, resolve_chain_id};
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -39,26 +38,11 @@ pub struct EdgeDto {
     chain_id: u32,
 }
 
-/// `nodes` shape returned under `X-API-Version: 1` — a flat address list,
-/// unchanged since before the ТЗ enrichment work. Kept forever (or until
-/// v1's deprecation) so existing clients never see a breaking change.
-#[derive(Serialize, utoipa::ToSchema)]
-pub struct GraphPageV1 {
-    total_nodes: usize,
-    total_edges: usize,
-    page: u32,
-    page_size: usize,
-    total_pages: u32,
-    has_next: bool,
-    nodes: Vec<String>,
-    edges: Vec<EdgeDto>,
-}
-
-/// `nodes` shape returned under `X-API-Version: 2` — each node carries
+/// One page of the persisted transfer graph. Each node carries
 /// `kind`/`risk_score`/`tags`/degree/boundary-flags so callers don't need
 /// N+1 follow-up requests (ТЗ §3).
 #[derive(Serialize, utoipa::ToSchema)]
-pub struct GraphPageV2 {
+pub struct GraphPage {
     total_nodes: usize,
     total_edges: usize,
     page: u32,
@@ -67,23 +51,6 @@ pub struct GraphPageV2 {
     has_next: bool,
     nodes: Vec<NodeDto>,
     edges: Vec<EdgeDto>,
-}
-
-/// Dispatches to whichever schema matches the request's `X-API-Version` —
-/// the two `GraphPage*` types are otherwise identical, differing only in
-/// `nodes`' element type.
-pub enum GraphPageResponse {
-    V1(GraphPageV1),
-    V2(GraphPageV2),
-}
-
-impl IntoResponse for GraphPageResponse {
-    fn into_response(self) -> Response {
-        match self {
-            Self::V1(p) => Json(p).into_response(),
-            Self::V2(p) => Json(p).into_response(),
-        }
-    }
 }
 
 #[derive(Deserialize, utoipa::IntoParams)]
@@ -113,9 +80,8 @@ pub struct GraphQuery {
     page: Option<u32>,
     #[param(example = 100)]
     page_size: Option<usize>,
-    /// Under `X-API-Version: 2` only: `full` (default) populates every
-    /// `NodeDto` field; `minimal` returns just `address`, skipping the
-    /// enrichment queries entirely. Ignored under `X-API-Version: 1`.
+    /// `full` (default) populates every `NodeDto` field; `minimal` returns
+    /// just `address`, skipping the enrichment queries entirely.
     #[param(example = "full")]
     enrich: Option<String>,
 }
@@ -137,31 +103,26 @@ pub struct GraphQuery {
                    ingestion, you will get an empty graph rather than an error.\n\n\
                    ## Example\n\n\
                    ```bash\n\
-                   curl 'http://localhost:8080/graph?address=0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045&chain_id=1&max_depth=2&page=0&page_size=100' \\\n\
-                     -H 'X-API-Version: 1'\n\
+                   curl 'http://localhost:8080/graph?address=0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045&chain_id=1&max_depth=2&page=0&page_size=100'\n\
                    ```\n\n\
                    ## Notes\n\n\
                    The `nodes` array is only returned on `page == 0` because the node set is \
                    global per request; subsequent pages send an empty `nodes` array to save \
                    bandwidth. `page_size` is clamped to `[1, 1000]`. The `from_block` / \
                    `to_block` filters apply to the persisted edges only.\n\n\
-                   ## Versioning\n\n\
-                   Under `X-API-Version: 1`, `nodes` is a flat `string[]` of addresses \
-                   (`GraphPageV1`) — unchanged, forever. Under `X-API-Version: 2`, `nodes` is \
-                   `NodeDto[]` (`GraphPageV2`): each entry carries `kind`, `risk_score` (cache-only, \
+                   ## Node enrichment\n\n\
+                   Each `nodes` entry (`NodeDto`) carries `kind`, `risk_score` (cache-only, \
                    never computed inline — `null` on a cache miss), every active `tags` entry (not \
                    just the top one), `in_degree`/`out_degree`/`tx_count`, and two boundary flags — \
                    `is_view_boundary` (this node exists in the DB with more edges than shown here; \
                    BFS just didn't expand it — re-query, don't re-ingest) and `is_ingest_boundary` \
                    (nothing has ever been persisted for this address — `POST /jobs/ingest` first). \
                    Closes the `/graph` + N×`/address/.../kind` + N×`/score` + N×`/labels/{addr}` \
-                   round-trip. Pass `?enrich=minimal` under v2 to get only `address` per node (skips \
+                   round-trip. Pass `?enrich=minimal` to get only `address` per node (skips \
                    every enrichment query, including the boundary flags).",
     params(GraphQuery),
     responses(
-        (status = 200, body = GraphPageV2, description = "Shown for `X-API-Version: 2`. Under \
-                   `X-API-Version: 1` the body is `GraphPageV1` instead — same fields except \
-                   `nodes` is a flat `string[]`."),
+        (status = 200, body = GraphPage),
         (status = 400, body = ErrorResponse),
         (status = 500, body = ErrorResponse),
     ),
@@ -169,7 +130,6 @@ pub struct GraphQuery {
 )]
 pub async fn get_graph(
     State(state): State<Arc<AppState>>,
-    Extension(version): Extension<ApiVersion>,
     Query(q): Query<GraphQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let chain = resolve_chain_id(&state, q.chain_id);
@@ -229,24 +189,6 @@ pub async fn get_graph(
         })
         .collect();
 
-    if version.0 == 1 {
-        let nodes: Vec<String> = if page == 0 {
-            graph.nodes().iter().map(|a| a.canonical()).collect()
-        } else {
-            Vec::new()
-        };
-        return Ok(GraphPageResponse::V1(GraphPageV1 {
-            total_nodes,
-            total_edges,
-            page: page as u32,
-            page_size,
-            total_pages,
-            has_next: page as u32 + 1 < total_pages,
-            nodes,
-            edges,
-        }));
-    }
-
     let minimal = parse_minimal(q.enrich.as_deref())?;
     let nodes: Vec<NodeDto> = if page == 0 {
         let node_addrs: Vec<_> = graph.nodes().iter().cloned().collect();
@@ -260,7 +202,7 @@ pub async fn get_graph(
         Vec::new()
     };
 
-    Ok(GraphPageResponse::V2(GraphPageV2 {
+    Ok(Json(GraphPage {
         total_nodes,
         total_edges,
         page: page as u32,

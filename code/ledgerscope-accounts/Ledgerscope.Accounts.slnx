@@ -1,0 +1,12 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Ledgerscope.Accounts.Api/Ledgerscope.Accounts.Api.csproj" />
+    <Project Path="src/Ledgerscope.Accounts.Application/Ledgerscope.Accounts.Application.csproj" />
+    <Project Path="src/Ledgerscope.Accounts.Domain/Ledgerscope.Accounts.Domain.csproj" />
+    <Project Path="src/Ledgerscope.Accounts.Infrastructure/Ledgerscope.Accounts.Infrastructure.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Ledgerscope.Accounts.Application.Tests/Ledgerscope.Accounts.Application.Tests.csproj" />
+    <Project Path="tests/Ledgerscope.Accounts.Domain.Tests/Ledgerscope.Accounts.Domain.Tests.csproj" />
+  </Folder>
+</Solution>

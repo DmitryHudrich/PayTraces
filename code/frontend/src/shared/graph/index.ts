@@ -6,4 +6,5 @@ export type {
   GraphEdge,
   GraphLayoutMode,
   GraphNode,
+  XY,
 } from '@/shared/graph/contract/graph'

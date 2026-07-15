@@ -1,17 +1,28 @@
 import { createBrowserRouter } from 'react-router-dom'
 
-import { ErrorBoundary } from '@/app/ui/ErrorBoundary'
+import { RequireAuth } from '@/app/ui/RequireAuth'
 import { RouteErrorPage } from '@/app/ui/RouteErrorPage'
-import { TransactionGraphPage } from '@/pages/transaction-graph'
+import { LoginPage } from '@/pages/login'
+import { CasesPage } from '@/pages/cases'
+import { CaseWorkspacePage } from '@/pages/case-workspace'
+import { AppShell } from '@/widgets/app-shell/ui/AppShell'
 
 export const router = createBrowserRouter([
   {
-    path: '/',
-    element: (
-      <ErrorBoundary>
-        <TransactionGraphPage />
-      </ErrorBoundary>
-    ),
+    path: '/login',
+    element: <LoginPage />,
+  },
+  {
+    element: <RequireAuth />,
     errorElement: <RouteErrorPage />,
+    children: [
+      {
+        element: <AppShell />,
+        children: [
+          { index: true, element: <CasesPage /> },
+          { path: 'cases/:caseId', element: <CaseWorkspacePage /> },
+        ],
+      },
+    ],
   },
 ])

@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <ItemGroup>
+    <ProjectReference Include="..\Ledgerscope.Accounts.Infrastructure\Ledgerscope.Accounts.Infrastructure.csproj" />
+    <ProjectReference Include="..\Ledgerscope.Accounts.Application\Ledgerscope.Accounts.Application.csproj" />
+    <ProjectReference Include="..\Ledgerscope.Accounts.Domain\Ledgerscope.Accounts.Domain.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Update="authorization.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="10.0.0" />
+    <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.0" />
+    <PackageReference Include="Scalar.AspNetCore" Version="2.16.11" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+</Project>

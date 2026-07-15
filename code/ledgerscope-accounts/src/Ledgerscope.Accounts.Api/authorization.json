@@ -1,0 +1,35 @@
+{
+  "Authorization": {
+    "Roles": {
+      "OrgAdmin": {
+        "Scope": "Global",
+        "Permissions": [ "*" ]
+      },
+      "Investigator": {
+        "Scope": "Global",
+        "Permissions": [ "CaseCreate", "CaseRead" ]
+      },
+      "Viewer": {
+        "Scope": "Global",
+        "Permissions": [ "CaseRead" ]
+      },
+      "Lead": {
+        "Scope": "Case",
+        "Permissions": [
+          "CaseRead", "CaseUpdate", "CaseClose", "CaseAssign",
+          "CaseAddressAdd", "CaseAddressRemove", "CaseNoteAdd",
+          "ViewCreate", "ViewRead", "ViewUpdate", "ViewDelete", "ViewManageSharing",
+          "LabelCreate", "LabelApply", "GroupCreate", "GroupUpdate", "GroupDelete"
+        ]
+      },
+      "Collaborator": {
+        "Scope": "Case",
+        "Permissions": [
+          "CaseRead", "CaseAddressAdd", "CaseNoteAdd",
+          "ViewCreate", "ViewRead", "ViewUpdate",
+          "LabelCreate", "LabelApply", "GroupCreate"
+        ]
+      }
+    }
+  }
+}
